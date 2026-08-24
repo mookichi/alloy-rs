@@ -6,4 +6,8 @@
 -buildpath: \
 	org.alloytools.pardinus.core,\
 	biz.aQute.bnd.annotation
-	
+
+-testpath: \
+	biz.aQute.wrapper.junit,\
+	biz.aQute.wrapper.hamcrest,\
+	slf4j.api

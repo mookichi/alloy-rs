@@ -1,6 +1,7 @@
 
 Main-Class: org.alloytools.alloy.core.infra.Alloy
 JPM-Command: alloy
+Enable-Native-Access: ALL-UNNAMED
 -buildpath: \
 	org.alloytools.alloy.application,\
 	org.alloytools.alloy.core,\

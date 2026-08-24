@@ -225,7 +225,7 @@ public final class Sudoku {
 	private void solve(TupleSet clues, SudokuCoreExtractor extractor) { 
 		final Solver solver = new Solver();
 		
-		solver.options().setSolver(SATFactory.get("minisatp"));
+		solver.options().setSolver(SATFactory.get("minisat.prover"));
 		solver.options().setLogTranslation(1);
 		
 				

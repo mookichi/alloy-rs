@@ -17,6 +17,6 @@ jobs:
           ref: release
       - uses: actions/setup-java@v4
         with:
-          java-version: 23
+          java-version: 25
           distribution: temurin
       - run: ./gradlew release
