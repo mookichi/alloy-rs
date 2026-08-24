@@ -1,0 +1,16 @@
+[package]
+name = "alloy-kodkod-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "1"
+alloy-ipasir = { path = "../alloy-ipasir", optional = true }
+
+[features]
+ipasir = ["dep:alloy-ipasir"]
+
+[[example]]
+name = "fol_demo"
+required-features = ["ipasir"]
