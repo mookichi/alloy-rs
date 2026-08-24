@@ -186,6 +186,13 @@ public final class A4Solution {
     private final A4Options         originalOptions;
 
     /**
+     * When the Rust engine extracted an UNSAT core
+     * ({@link A4Options#extractCore}), the culprit top-level conjuncts of the
+     * goal; null when the problem was satisfiable or no core was requested.
+     */
+    public volatile List<Formula>   rustCore;
+
+    /**
      * The original Alloy command that generated this solution; can be "" if
      * unknown.
      */
@@ -1755,21 +1762,23 @@ public final class A4Solution {
                 "'cargo build --release -p alloy-engine-rs --features jni' and point " +
                 "-Dalloy.native.lib.alloy_engine=<path> at the .so");
         final long t0 = System.nanoTime();
-        byte[] problem = RustSerializer.serialize(fgoal, bounds, bitwidth,
-            opt.skolemDepth, opt.decompose_mode, opt.decompose_threads);
+        RustSerializer.Serialized problem = RustSerializer.serialize(fgoal, bounds, bitwidth,
+            opt.skolemDepth, opt.decompose_mode, opt.decompose_threads, opt.extractCore);
         if (System.getProperty("alloy.rust.dump") != null) {
             try (java.io.FileOutputStream fos = new java.io.FileOutputStream(
                     System.getProperty("alloy.rust.dump"))) {
-                fos.write(problem);
+                fos.write(problem.bytes);
             } catch (java.io.IOException e) {
                 throw new ErrorFatal("dump failed", e);
             }
         }
         final long t1 = System.nanoTime();
-        byte[] answer = RustEngineProxy.solve(problem);
+        byte[] answer = RustEngineProxy.solve(problem.bytes);
         final long t2 = System.nanoTime();
-        rep.debug("engine rust: problem=" + problem.length + "B answer=" +
+        rep.debug("engine rust: problem=" + problem.bytes.length + "B answer=" +
             (answer == null ? -1 : answer.length) + "B\n");
+        List<Formula> core = problem.coreOf(answer);
+        rustCore = core;
         return RustSerializer.readAnswer(answer, bounds, t1 - t0, t2 - t1);
     }
 

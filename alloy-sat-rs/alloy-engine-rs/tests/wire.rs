@@ -70,6 +70,44 @@ fn sat_problem_roundtrip() {
     assert!(answer.len() > 5);
 }
 
+/// ARE2 with the want_core flag: UNSAT answers list culprit conjunct node
+/// positions ("AUNC" magic).
+#[test]
+fn are2_unsat_core() {
+    let mut w = W::v2();
+    w.b(4); // bitwidth
+    w.b(8); // options: want_core(bit3), mode=none
+    w.var(1); // max_threads
+    w.var(2).s("a").s("b");
+    w.var(1).s("p").b(1).var(0).var(2).sv(0).sv(1);
+    w.var(0);
+    // nodes: 0=Rel p; 1=some p; 2=not(some p); 3=and[1,2]
+    w.var(4)
+        .var(32)
+        .id(0)
+        .var(6)
+        .b(0)
+        .id(0) // some p
+        .var(1)
+        .id(1) // not (some p)
+        .var(2)
+        .b(0)
+        .var(2)
+        .id(1)
+        .id(2); // and of 2 children
+    w.id(3);
+
+    let decoded = decode_problem(&w.0).expect("decode");
+    assert!(decoded.options.want_core);
+
+    let answer = solve_wire(&w.0);
+    assert_eq!(&answer[..4], ANSWER_UNSAT_CORE);
+    // Minimal core = both conjuncts: each one alone is satisfiable
+    // (`some p` vs `not (some p)`), only their conjunction conflicts.
+    assert_eq!(answer[4], 2); // two culprits
+    assert_eq!(&answer[5..7], &[1, 2]); // nodes of `some p` and `not (some p)`
+}
+
 /// some p ∧ no p must be UNSAT.
 #[test]
 fn unsat_problem_roundtrip() {

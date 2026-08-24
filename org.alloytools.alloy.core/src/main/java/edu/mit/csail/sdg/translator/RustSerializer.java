@@ -2,6 +2,7 @@ package edu.mit.csail.sdg.translator;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -70,12 +71,61 @@ import edu.mit.csail.sdg.alloy4.ErrorAPI;
  *   vars   := n:var (len:u16 utf8 arity:u8)*             // VarId = index
  *   nodes  := n:var node*                                // children first
  *   ts     := n:var zigzag-tuple-index*
- * answer  := "ASAT" (n:var idx*)*per-relation | "AUNS" | "AERR" len:u16 msg
+ *
+ *   opts bit0: skolemize  bits1-2: decompose mode (0=none 1=static
+ *   2=parallel 3=dynamic)  bit3: want core ("AUNC" answer on UNSAT)
+ *
+ * answer  := "ASAT" (n:var idx*)*per-relation | "AUNS"
+ *          | "AUNC" n:var node-pos:var* | "AERR" len:u16 msg
  * </pre>
  */
 public final class RustSerializer {
 
     private RustSerializer() {}
+
+    /**
+     * A serialized problem buffer plus the metadata needed to interpret
+     * engine answers that refer back to problem nodes (currently the UNSAT
+     * core, which lists DAG node positions).
+     */
+    public static final class Serialized {
+        /** The raw ARE2 problem buffer handed to the native engine. */
+        public final byte[]                     bytes;
+        /** DAG node position -&gt; formula (core culprits resolution). */
+        final Map<Integer,Formula>              formulaById;
+
+        Serialized(byte[] bytes, Map<Integer,Formula> formulaById) {
+            this.bytes = bytes;
+            this.formulaById = formulaById;
+        }
+
+        /**
+         * If {@code answer} is an UNSAT-core answer ("AUNC"), resolves its
+         * node positions against this serialization and returns the culprit
+         * formulas; returns null for any other answer magic.
+         *
+         * @throws ErrorAPI on malformed core answers or unknown node positions
+         */
+        public List<Formula> coreOf(byte[] answer) throws ErrorAPI {
+            if (answer == null || answer.length < 4)
+                return null;
+            String magic = new String(answer, 0, 4, java.nio.charset.StandardCharsets.US_ASCII);
+            if (!magic.equals("AUNC"))
+                return null;
+            R r = new R(answer);
+            r.magic(); // skip
+            int n = (int) r.var();
+            List<Formula> out = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) {
+                int pos = (int) r.var();
+                Formula f = formulaById.get(pos);
+                if (f == null)
+                    throw new ErrorAPI("engine rust: core references unknown node " + pos);
+                out.add(f);
+            }
+            return out;
+        }
+    }
 
     // ======================================================================
     // Serialization
@@ -91,12 +141,15 @@ public final class RustSerializer {
      *            decomposition whose stage-1 relations are all variable
      *            relations of these bounds
      * @param decomposeThreads worker cap for the parallel mode
+     * @param wantCore request an UNSAT core ("AUNC" answer listing culprit
+     *            top-level conjuncts as DAG node positions)
      * @throws ErrorAPI if the formula/bounds use constructs the Rust engine
      *             does not support yet (temporal operators, iff/implies,
      *             lone/no/one quantifiers, exotic int operators, ...)
      */
-    public static byte[] serialize(Formula goal, Bounds bounds, int bitwidth,
-            int skolemDepth, int decomposeMode, int decomposeThreads) throws ErrorAPI {
+    public static Serialized serialize(Formula goal, Bounds bounds, int bitwidth,
+            int skolemDepth, int decomposeMode, int decomposeThreads,
+            boolean wantCore) throws ErrorAPI {
         if (bitwidth < 1 || bitwidth > 30)
             throw new ErrorAPI("engine rust: bitwidth " + bitwidth + " out of range 1..=30");
 
@@ -134,7 +187,7 @@ public final class RustSerializer {
         W w = new W();
         w.raw("ARE2");
         w.u8(bitwidth);
-        w.u8(((skolemDepth > 0 ? 1 : 0) | (wireMode << 1)) & 0xff);
+        w.u8(((skolemDepth > 0 ? 1 : 0) | (wireMode << 1) | (wantCore ? 8 : 0)) & 0xff);
         w.var(Math.max(decomposeThreads, 1));
 
         Universe uni = bounds.universe();
@@ -173,7 +226,7 @@ public final class RustSerializer {
                 w.var(ctx.relIdx.get(r));
             w.var(0);
         }
-        return w.toBytes();
+        return new Serialized(w.toBytes(), ctx.formulaById);
     }
 
     /**
@@ -257,6 +310,8 @@ public final class RustSerializer {
         final Map<Expression,Integer>       memoE    = new IdentityHashMap<>();
         final Map<IntExpression,Integer>    memoI    = new IdentityHashMap<>();
         final Map<Decls,Integer>            memoD    = new IdentityHashMap<>();
+        /** DAG node position -&gt; formula (UNSAT core resolution). */
+        final Map<Integer,Formula>          formulaById = new HashMap<>();
         int                                 count;
 
         Ctx(Bounds bounds) {
@@ -302,10 +357,8 @@ public final class RustSerializer {
             collectDecls(q.decls(), ctx);
             collectFormula(q.formula(), ctx);
         } else if (f instanceof MultiplicityFormula) {
-            MultiplicityFormula m = (MultiplicityFormula) f;
-            if (m.multiplicity() == Multiplicity.NO)
-                throw unsupported("no-expression formula");
-            collectExpr(m.expression(), ctx);
+            // `no e` is desugared to `not (some e)` at emission time.
+            collectExpr(((MultiplicityFormula) f).expression(), ctx);
         } else {
             throw unsupported("formula construct " + f.getClass().getSimpleName());
         }
@@ -501,17 +554,27 @@ public final class RustSerializer {
         } else if (f instanceof MultiplicityFormula) {
             MultiplicityFormula mf = (MultiplicityFormula) f;
             Multiplicity mult = mf.multiplicity();
-            if (mult == Multiplicity.NO)
-                throw unsupported("no-expression formula");
             int e = emitExpr(mf.expression(), ctx, w);
-            id = ctx.count++;
-            w.var(6L);
-            w.u8((byte) (mult == Multiplicity.SOME ? 0 : mult == Multiplicity.LONE ? 1 : 2));
-            w.var(e);
+            if (mult == Multiplicity.NO) {
+                // `no e`  ==  not (some e)
+                int some = ctx.count++;
+                w.var(6L);
+                w.u8(0); // SOME
+                w.var(e);
+                id = ctx.count++;
+                w.var(1L); // NOT
+                w.var(some);
+            } else {
+                id = ctx.count++;
+                w.var(6L);
+                w.u8((byte) (mult == Multiplicity.SOME ? 0 : mult == Multiplicity.LONE ? 1 : 2));
+                w.var(e);
+            }
         } else {
             throw unsupported("formula construct " + f.getClass().getSimpleName());
         }
         ctx.memoF.put(f, id);
+        ctx.formulaById.put(id, f);
         return id;
     }
 
@@ -795,6 +858,7 @@ public final class RustSerializer {
         String magic = r.magic();
         switch (magic) {
             case "AUNS":
+            case "AUNC": // core payload is resolved separately via Serialized.coreOf
                 return Solution.unsatisfiable(stats, null);
             case "AERR":
                 throw new ErrorAPI("engine rust: " + r.str16());

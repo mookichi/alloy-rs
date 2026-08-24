@@ -47,6 +47,7 @@ import edu.mit.csail.sdg.translator.A4Options;
 import edu.mit.csail.sdg.translator.A4Solution;
 import edu.mit.csail.sdg.translator.A4SolutionWriter;
 import edu.mit.csail.sdg.translator.TranslateAlloyToKodkod;
+import kodkod.ast.Formula;
 import kodkod.engine.satlab.SATFactory;
 
 /**
@@ -130,6 +131,9 @@ public class CLI extends Env {
 		@Description("Decomposition strategy for the 'rust' engine: off (default), hybrid (two-stage dynamic decomposition) or parallel (static components on a worker pool).")
 		String decompose(String decompose);
 
+		@Description("Extract an UNSAT core with the 'rust' engine on unsatisfiable commands and print the culprit constraints.")
+		boolean core();
+
 		@Description("Be quiet with progress information")
 		boolean quiet();
 
@@ -166,6 +170,11 @@ public class CLI extends Env {
 		}
 		opt.solver = solver.get();
 		opt.engine = options.engine("java");
+		opt.extractCore = options.core();
+		if (opt.extractCore && !"rust".equals(opt.engine)) {
+			error("--core currently requires --engine rust");
+			return;
+		}
 		String decompose = options.decompose("off");
 		switch (decompose) {
 			case "off":
@@ -286,6 +295,12 @@ public class CLI extends Env {
 						commandReceipt.transformPath = path;
 					} else {
 						trace.format("    0       UNSAT", options.repeat(1));
+						if (opt.extractCore && solution.rustCore != null) {
+							trace.format("\n       unsat core (%d):", solution.rustCore.size());
+							int ci = 0;
+							for (Formula culprit : solution.rustCore)
+								trace.format("\n       [%d] %s", ci++, culprit.toString().replace('\n', ' '));
+						}
 						if (c.expects == 1) {
 							trace.format(" expects=%s", c.expects);
 							error("'%s' was not satisfied against expectation",c);

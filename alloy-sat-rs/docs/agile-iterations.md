@@ -211,6 +211,47 @@
 - 既知の v0 制限: 記式境界の wire 直送(実体化せず Rust 側評価)は未対応、
   temporal コマンドは引続き明示拒否
 
+### Iter 12: UNSAT Core の Java 統合(--core)✅ 完了(2026-08-25)
+- **Wire**: ARE2 options byte に bit3 = want_core を追加。回答マジック
+  `AUNC` = varint(件数) + 犯者トップレベル連言の DAG ノード位置列。
+  `Problem` に `formula_pos_by_id`(FormulaId→ノード位置)を追加
+- **Rust**: `solve_problem_inner` で want_core 時は分解より優先して
+  `Solver::solve_core`(選択子仮定 + RCE 最小化)を実行。SAT 時は
+  CoreSolution.instance から通常 ASAT を生成
+- **Java**: `RustSerializer.serialize` が `Serialized`(bytes +
+  formulaById 逆引き)を返すように変更。`coreOf(answer)` が AUNC を
+  `List<Formula>` へ解決。`readAnswer` は AUNC を AUNS 扱い(後方互換)。
+  `A4Solution.rustCore` フィールド + doRust() で代入。
+  A4Options.extractCore(dup() 対応)
+- **CLI**: `exec --core`(rust エンジン専用ガード付き)。UNSAT 時に
+  「unsat core (N): [i] 式...」を表示
+- 受け入れ: unsat.als(#A=1 ∧ #A>1)で core=[#A=1, #A>1] を表示、SAT モデル
+  では通常動作、--core 无しでは従来表示。wire.rs に are2_unsat_core 追加
+  (some p ∧ ¬some p → 最小コア=両方)。workspace 全テスト green、
+  clippy 0 警告、gradle test 成功
+
+### 発見事項(Iter 12 作業中)
+
+1. **sweep スクリプトが出力ディレクトリを作っていなかった**ため、
+   Iter 10/11 の「83モデル 100% パリティ」記録は実質無意味(全行
+   Error/Error の空一致)だったことが発覚。`scripts/sweep-engines.sh`
+   に mkdir を追加し再計測した結果:
+   - 実パリティ 34/83(SAT/SAT 25 + UNSAT/UNSAT 9)
+   - rust 側未対応構文による Error 46(rust Error vs java SAT/UNSAT)
+   - 双方エラー 2、タイムアウト 1
+   - **真のミスマッチ 2**(addressBook2e.als / mediaAssets.als:
+     rust SAT vs java UNSAT)
+2. **`no` 式フォーミュラのデシュガー対応**(Iter 12 の副次修正):
+   Java シリアライザが `no e` を `¬some e` として wire 生成するように
+   変更(m15 最小ケースでの切り分け過程で no 自体は正しいことを確認)
+3. **既知バグ(未修復)**: 「量化子内の含意 + 関係差分・和集合」パターンで
+   偽 SAT。最小再現 m15.als(sig Book { addr: Book->Book } の delUndoesAdd
+   型アサーション)。ワイヤ AST は正しいことを検証済みのため fol.rs の
+   CNF 生成側の問題と推定。孤立プローブ(mult_dense.rs)では発現せず、
+   wire デコード文脈でのみ発現。`#[ignore]` テスト
+   `quantified_implication_validity` と debug 用 examples
+   (wire_dump / subset_debug / m15_debug)を残置
+
 ## バックログ(未確定・優先度順)
 1. ~~Simplifier/最適化パス~~ ✅ 完了(2026-08-24): Comparison を疎キー
    ユニオンで生成(容量全走査を撤去)、BoolFactory fold に補文リテラル

@@ -197,6 +197,17 @@ cargo test -p alloy-kodkod-rs --features ipasir   # +2 tests(fuzz 30 cases)
 - CLI: `exec --engine rust --decompose hybrid|parallel`
 - 受け入れ: ring.als 全モード SAT 一致、83 例題パリティ維持
 
+### Iter 12 完了: UNSAT Core の Java 統合(--core)
+- Wire ARE2 に want_core ビット + `AUNC` 回答(犯者連言のノード位置列)
+- Java: `Serialized.coreOf()`、`A4Solution.rustCore`、CLI `exec --core`
+  で UNSAT 時の犯者制約を表示
+- `no e` フォーミュラのデシュガー(¬some)対応
+- **sweep 実測修正**: Iter 10/11 の sweep は出力ディレクトリ未作成で全行
+  Error/Error の空一致だったことが発覚 → スクリプト修正し再計測。
+  実パリティ 34/83 + rust 未対応構文 Error 46。真のミスマッチ 2件
+  (addressBook2e / mediaAssets: 偽 SAT)は既知バグとして登録
+  (`docs/agile-iterations.md` 発見事項参照、再現テストは `#[ignore]` で残置)
+
 ```bash
 cargo build --release -p alloy-engine-rs --features jni   # liballoy_engine.so
 JAVA_HOME=~/.sdkman/candidates/java/25-amzn ./gradlew :org.alloytools.alloy.dist:build -x test

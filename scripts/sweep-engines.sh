@@ -9,6 +9,7 @@ DIST=org.alloytools.alloy.dist/target/org.alloytools.alloy.dist.jar
 JAVA25="${JAVA_HOME:-$HOME/.sdkman/candidates/java/25-amzn}/bin/java"
 SO=${ALLOY_ENGINE_SO:-/run/media/mookichi/ssd2/dev/alloy-rs/alloy-sat-rs/target/release/liballoy_engine.so}
 OUT=alloy-sat-rs/docs/engine-sweep-results.txt
+mkdir -p /tmp/opencode/sweep/rust /tmp/opencode/sweep/java
 : > "$OUT"
 
 for f in $(find org.alloytools.alloy.extra/extra/models -name "*.als" | sort); do

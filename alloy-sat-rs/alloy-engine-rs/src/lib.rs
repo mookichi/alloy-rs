@@ -88,6 +88,8 @@ pub const PROBLEM_MAGIC: &[u8; 4] = b"ARE1";
 pub const PROBLEM_MAGIC_V2: &[u8; 4] = b"ARE2";
 pub const ANSWER_SAT: &[u8; 4] = b"ASAT";
 pub const ANSWER_UNSAT: &[u8; 4] = b"AUNS";
+/// UNSAT with a minimized core: node positions of culprit conjuncts.
+pub const ANSWER_UNSAT_CORE: &[u8; 4] = b"AUNC";
 pub const ANSWER_ERR: &[u8; 4] = b"AERR";
 
 /// Decomposition mode carried by ARE2 options (bits 1..2).
@@ -117,6 +119,9 @@ pub struct WireOptions {
     pub skolemize: bool,
     pub decompose: Decompose,
     pub max_threads: usize,
+    /// Request an UNSAT core (`AUNC` answer listing culprit top-level
+    /// conjuncts as DAG node positions) instead of bare `AUNS`.
+    pub want_core: bool,
 }
 
 impl Default for WireOptions {
@@ -125,6 +130,7 @@ impl Default for WireOptions {
             skolemize: false,
             decompose: Decompose::None,
             max_threads: 1,
+            want_core: false,
         }
     }
 }
@@ -245,6 +251,9 @@ pub struct Problem {
     /// Node position -> arena [`alloy_kodkod_rs::ast::ExprId`] for every
     /// expression node of the DAG (used to resolve symbolic bounds).
     pub expr_by_node: std::collections::HashMap<u32, alloy_kodkod_rs::ast::ExprId>,
+    /// arena [`alloy_kodkod_rs::ast::FormulaId`] -> DAG node position (used
+    /// to report UNSAT cores as node positions).
+    pub formula_pos_by_id: std::collections::HashMap<alloy_kodkod_rs::ast::FormulaId, u32>,
 }
 
 fn op_err(tag: &'static str, got: u8) -> String {
@@ -270,6 +279,7 @@ pub fn decode_problem(input: &[u8]) -> Result<Problem, String> {
         options.skolemize = flags & 1 != 0;
         options.decompose = Decompose::from_u8((flags >> 1) & 0b11)?;
         options.max_threads = r.var()? as usize;
+        options.want_core = flags & 0b1000 != 0;
     }
 
     // Universe atoms (order defines tuple indices).
@@ -695,6 +705,12 @@ pub fn decode_problem(input: &[u8]) -> Result<Problem, String> {
         .filter_map(|(i, e)| e.map(|eid| (i as u32, eid)))
         .collect();
 
+    let formula_pos_by_id = formulas
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| f.map(|fid| (fid, i as u32)))
+        .collect();
+
     Ok(Problem {
         arena,
         bounds,
@@ -706,13 +722,14 @@ pub fn decode_problem(input: &[u8]) -> Result<Problem, String> {
         partials,
         symbounds,
         expr_by_node,
+        formula_pos_by_id,
     })
 }
 
 /// Solve a decoded problem; returns the wire-format answer buffer.
 pub fn solve_problem(problem: &mut Problem) -> Vec<u8> {
     match solve_problem_inner(problem) {
-        Ok(Some(per_rel)) => {
+        Ok(Outcome::Sat(per_rel)) => {
             let mut w = Writer::default();
             w.bytes(ANSWER_SAT);
             for ts in per_rel {
@@ -723,7 +740,17 @@ pub fn solve_problem(problem: &mut Problem) -> Vec<u8> {
             }
             w.0
         }
-        Ok(None) => ANSWER_UNSAT.to_vec(),
+        Ok(Outcome::Unsat) => ANSWER_UNSAT.to_vec(),
+        Ok(Outcome::UnsatCore(culprits)) => {
+            // "AUNC": node positions of the culprit top-level conjuncts.
+            let mut w = Writer::default();
+            w.bytes(ANSWER_UNSAT_CORE);
+            w.var(culprits.len() as u64);
+            for pos in culprits {
+                w.var(pos as u64);
+            }
+            w.0
+        }
         Err(msg) => {
             let mut w = Writer::default();
             w.bytes(ANSWER_ERR);
@@ -733,13 +760,50 @@ pub fn solve_problem(problem: &mut Problem) -> Vec<u8> {
     }
 }
 
-fn solve_problem_inner(problem: &mut Problem) -> Result<Option<Vec<TupleSet>>, String> {
+/// Outcome of solving one wire problem.
+enum Outcome {
+    /// Satisfiable: one tupleset per request relation.
+    Sat(Vec<TupleSet>),
+    /// Unsatisfiable without core information.
+    Unsat,
+    /// Unsatisfiable with a minimized core, as DAG node positions of the
+    /// culprit top-level conjuncts.
+    UnsatCore(Vec<u32>),
+}
+
+fn solve_problem_inner(problem: &mut Problem) -> Result<Outcome, String> {
     let options = SolverOptions {
         bitwidth: problem.bitwidth,
         skolemize: problem.options.skolemize,
         ..SolverOptions::default()
     };
     let solver = Solver::with_options(options);
+
+    // Core-extraction pipeline (Iter 12): every top-level conjunct is
+    // assumed through a selector literal; failed assumptions form the
+    // RCE-minimized core. Cores are inherently global, so this takes
+    // precedence over any decomposition strategy.
+    if problem.options.want_core {
+        let cs = solver
+            .solve_core(&problem.arena, problem.formula, &problem.bounds)
+            .map_err(|e| format!("core solve: {e}"))?;
+        if !cs.satisfiable {
+            let mut culprits = Vec::with_capacity(cs.core.len());
+            for &i in &cs.core {
+                let fid = cs
+                    .conjuncts
+                    .get(i)
+                    .ok_or_else(|| format!("core index {i} out of range"))?;
+                match problem.formula_pos_by_id.get(fid) {
+                    Some(&pos) => culprits.push(pos),
+                    None => return Err("core conjunct missing from node table".into()),
+                }
+            }
+            return Ok(Outcome::UnsatCore(culprits));
+        }
+        let inst = cs.instance.ok_or("core SAT without instance")?;
+        return Ok(Outcome::Sat(answer_tuplesets(problem, &inst)));
+    }
 
     let solution = match problem.options.decompose {
         Decompose::None => solver
@@ -762,7 +826,33 @@ fn solve_problem_inner(problem: &mut Problem) -> Result<Option<Vec<TupleSet>>, S
         Decompose::Dynamic => solve_dynamic_problem(&solver, problem)?,
     };
 
-    extract_answer_instances(problem, solution)
+    if !solution.satisfiable {
+        return Ok(Outcome::Unsat);
+    }
+    let inst = solution.instance.ok_or("SAT without instance")?;
+    Ok(Outcome::Sat(answer_tuplesets(problem, &inst)))
+}
+
+/// Per-request-relation tuplesets of an instance (answer payload order).
+fn answer_tuplesets(
+    problem: &Problem,
+    inst: &alloy_kodkod_rs::instance::Instance,
+) -> Vec<TupleSet> {
+    problem
+        .relation_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| match inst.find_relation_by_name(name) {
+            Some(rid) => inst.tuples(rid).cloned().unwrap_or_else(|| {
+                TupleSet::new(
+                    inst.universe(),
+                    problem.arena.relation_arity(problem.relation_ids[i]),
+                )
+                .expect("valid arity")
+            }),
+            None => TupleSet::new(inst.universe(), 1).expect("valid arity"),
+        })
+        .collect()
 }
 
 /// Dynamic two-stage decomposition over a wire problem (Iter 11): the ARE2
@@ -798,30 +888,6 @@ fn solve_dynamic_problem(
     solver
         .solve_dynamic(&mut problem.arena, problem.formula, &pb, 1)
         .map_err(|e| format!("dynamic solve: {e}"))
-}
-
-fn extract_answer_instances(
-    problem: &Problem,
-    solution: alloy_kodkod_rs::solver::Solution,
-) -> Result<Option<Vec<TupleSet>>, String> {
-    if !solution.satisfiable {
-        return Ok(None);
-    }
-    let inst = solution.instance.as_ref().ok_or("SAT without instance")?;
-    let mut out = Vec::with_capacity(problem.relation_names.len());
-    for (i, name) in problem.relation_names.iter().enumerate() {
-        match inst.find_relation_by_name(name) {
-            Some(rid) => out.push(inst.tuples(rid).cloned().unwrap_or_else(|| {
-                TupleSet::new(
-                    inst.universe(),
-                    problem.arena.relation_arity(problem.relation_ids[i]),
-                )
-                .expect("valid arity")
-            })),
-            None => out.push(TupleSet::new(inst.universe(), 1).expect("valid arity")),
-        }
-    }
-    Ok(Some(out))
 }
 
 /// Solve a wire-format problem buffer; returns the wire-format answer.

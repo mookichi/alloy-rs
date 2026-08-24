@@ -153,6 +153,15 @@ public final class A4Options implements Serializable {
      */
     public int        decompose_threads    = 4;
 
+    /**
+     * When using the Rust engine, request an UNSAT core on unsatisfiable
+     * problems; the culprits are surfaced via
+     * {@link A4Solution#rustCore}.
+     * <p>
+     * Default value is false.
+     */
+    public boolean    extractCore          = false;
+
     /** This method makes a copy of this Options object. */
     public A4Options dup() {
         A4Options x = new A4Options();
@@ -171,6 +180,7 @@ public final class A4Options implements Serializable {
         x.coreGranularity = coreGranularity;
         x.decompose_mode = decompose_mode;
         x.decompose_threads = decompose_threads;
+        x.extractCore = extractCore;
         return x;
     }
 
