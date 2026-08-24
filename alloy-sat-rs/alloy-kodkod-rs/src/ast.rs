@@ -258,7 +258,7 @@ pub struct Decl {
     pub expr: ExprId,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct VariableData {
     pub name: Arc<str>,
     pub arity: u32,
@@ -363,7 +363,7 @@ pub enum FormulaNode {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ExprSlot {
     node: ExprNode,
     arity: u32,
@@ -378,6 +378,22 @@ pub struct AstArena {
     ints: Vec<IntNode>,
     formulas: Vec<FormulaNode>,
     decls_list: Vec<Vec<Decl>>,
+}
+
+impl Clone for AstArena {
+    /// Clones arena contents; the relation pool is shared via `Arc`, so
+    /// interning from a cloned arena stays consistent with the original.
+    fn clone(&self) -> Self {
+        AstArena {
+            pool: self.pool.clone(),
+            variables: self.variables.clone(),
+            variable_index: self.variable_index.clone(),
+            exprs: self.exprs.clone(),
+            ints: self.ints.clone(),
+            formulas: self.formulas.clone(),
+            decls_list: self.decls_list.clone(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

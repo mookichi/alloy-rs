@@ -245,8 +245,160 @@ fn demo_dynamic(solver: &Solver) {
     }
 }
 
+fn demo_parallel(solver: &Solver) {
+    println!("\n=== PARALLEL static decomposition (backlog 3) ===");
+    let n_atoms = 12usize;
+    let atoms: Vec<String> = (0..n_atoms).map(|i| format!("a{i}")).collect();
+    let refs: Vec<&str> = atoms.iter().map(|s| s.as_str()).collect();
+    let u = Universe::new(refs).unwrap();
+    let pool = Arc::new(RelationPool::new());
+    let mut bounds = Bounds::new(&u, &pool);
+    let mut arena = AstArena::with_pool(Arc::clone(&pool));
+    let sz = u.size() as i64;
+
+    // independent part A: pigeonhole 2x3
+    let pig = {
+        let r = arena.relation("Pig", 1);
+        let mut s = TupleSet::new(&u, 1).unwrap();
+        s.insert_index(0);
+        s.insert_index(1);
+        bounds.bound_exactly(r, &s).unwrap();
+        r
+    };
+    let inr = {
+        let r = arena.relation("IN", 2);
+        let mut s = TupleSet::new(&u, 2).unwrap();
+        for p in [0i64, 1] {
+            for h in 3..6i64 {
+                s.insert_index(p * sz + h);
+            }
+        }
+        bounds.bound_upper(r, &s).unwrap();
+        r
+    };
+    let pv = arena.variable("p");
+    let pig_e = arena.expr_relation(pig);
+    let d_p = arena.decl(pv, Multiplicity::One, pig_e).unwrap();
+    let pve = arena.expr_variable(pv);
+    let inr_e = arena.expr_relation(inr);
+    let pin = arena.binary_expr(BinaryOp::Join, pve, inr_e).unwrap();
+    let one_pin = arena.multiplicity_formula(Multiplicity::One, pin).unwrap();
+    let ds_p = arena.add_decls(vec![d_p]);
+    let part_a = arena.quantified(Quantifier::All, ds_p, one_pin);
+
+    // independent part B: triangle with three colors (SAT)
+    let node = {
+        let r = arena.relation("N", 1);
+        let mut s = TupleSet::new(&u, 1).unwrap();
+        for i in 6..9 {
+            s.insert_index(i as i64);
+        }
+        bounds.bound_exactly(r, &s).unwrap();
+        r
+    };
+    let color = {
+        let r = arena.relation("C", 1);
+        let mut s = TupleSet::new(&u, 1).unwrap();
+        for i in 9..12 {
+            s.insert_index(i as i64);
+        }
+        bounds.bound_exactly(r, &s).unwrap();
+        r
+    };
+    let edge = {
+        let r = arena.relation("Ed", 2);
+        let mut s = TupleSet::new(&u, 2).unwrap();
+        for &(a, b) in &[(6i64, 7i64), (7, 8), (6, 8)] {
+            s.insert_index(a * sz + b);
+        }
+        bounds.bound_exactly(r, &s).unwrap();
+        r
+    };
+    let assign = {
+        let r = arena.relation("COL", 2);
+        let mut s = TupleSet::new(&u, 2).unwrap();
+        for v in 6..9i64 {
+            for c in 9..12i64 {
+                s.insert_index(v * sz + c);
+            }
+        }
+        bounds.bound_upper(r, &s).unwrap();
+        r
+    };
+    let vv = arena.variable("v");
+    let node_e0 = arena.expr_relation(node);
+    let d_v = arena.decl(vv, Multiplicity::Some, node_e0).unwrap();
+    let vve = arena.expr_variable(vv);
+    let assign_e = arena.expr_relation(assign);
+    let vcol = arena.binary_expr(BinaryOp::Join, vve, assign_e).unwrap();
+    let some_body = arena
+        .multiplicity_formula(Multiplicity::Some, vcol)
+        .unwrap();
+    let ds_v = arena.add_decls(vec![d_v]);
+    let total_b = arena.quantified(Quantifier::All, ds_v, some_body);
+
+    let m1 = arena.variable("m1");
+    let m2 = arena.variable("m2");
+    let cc = arena.variable("cc");
+    let e1 = arena.expr_variable(m1);
+    let e2 = arena.expr_variable(m2);
+    let ec = arena.expr_variable(cc);
+    let edge_e = arena.expr_relation(edge);
+    let pair = arena.binary_expr(BinaryOp::Product, e1, e2).unwrap();
+    let col_e = arena.expr_relation(assign);
+    let in_edge = arena.comparison(ExprCompOp::Subset, pair, edge_e).unwrap();
+    let c1 = arena.binary_expr(BinaryOp::Join, e1, col_e).unwrap();
+    let c2j = arena.binary_expr(BinaryOp::Join, e2, col_e).unwrap();
+    let has1 = arena.comparison(ExprCompOp::Subset, ec, c1).unwrap();
+    let has2 = arena.comparison(ExprCompOp::Subset, ec, c2j).unwrap();
+    let bad = arena.and(&[in_edge, has1, has2]);
+    let node_e = arena.expr_relation(node);
+    let color_e = arena.expr_relation(color);
+    let d_m1 = arena.decl(m1, Multiplicity::One, node_e).unwrap();
+    let d_m2 = arena.decl(m2, Multiplicity::One, node_e).unwrap();
+    let d_cc = arena.decl(cc, Multiplicity::One, color_e).unwrap();
+    let ds_d = arena.add_decls(vec![d_m1, d_m2, d_cc]);
+    let no_bad = arena.not(bad);
+    let diff = arena.quantified(Quantifier::All, ds_d, no_bad);
+    let tri_sat = arena.and(&[total_b, diff]);
+
+    let full = arena.and(&[part_a, tri_sat]);
+
+    let t0 = Instant::now();
+    let ser = solver.solve_decomposed(&mut arena, full, &bounds).unwrap();
+    let serial_t = t0.elapsed();
+
+    let t1 = Instant::now();
+    let par = solver
+        .solve_decomposed_parallel(&mut arena, full, &bounds, 4)
+        .unwrap();
+    let par_t = t1.elapsed();
+
+    println!(
+        "serial: {} ({:?}) | parallel(4): {} ({:?}) backend={}",
+        if ser.satisfiable { "SAT" } else { "UNSAT" },
+        serial_t,
+        if par.satisfiable { "SAT" } else { "UNSAT" },
+        par_t,
+        par.backend
+    );
+    if par.satisfiable {
+        let inst = par.instance.expect("SAT");
+        let ev = alloy_kodkod_rs::eval::Evaluator::new(&inst);
+        println!(
+            "verify : {}",
+            if ev.formula_bool(&arena, full, &Vec::new()).unwrap_or(false) {
+                "merged instance satisfies the full formula"
+            } else {
+                "MISMATCH"
+            }
+        );
+    }
+}
+
 fn main() {
     let solver = Solver::new();
     demo_static(&solver);
+    demo_parallel(&solver);
     demo_dynamic(&solver);
 }

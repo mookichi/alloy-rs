@@ -148,7 +148,12 @@
    temporal 拡張(時間列付き証人関係、`all s:STATE | sk⋈s⊆D@s` 制約)。
    `SolverOptions::skolemize`(既定 OFF)。等充足性の注意書きは
    モジュールドキュメント参照
-3. PARALLEL 分解モデル(スレッドプール)— Iter 8 再評価待ち
+3. ~~PARALLEL 分解モデル(スレッドプール)~~ ✅ 完了(2026-08-24):
+   `solve_static_components_parallel` — std::thread::scope + アトミック
+   ワークプル(依存ゼロの軽量プール)。ワーカー毎に AstArena をクローン
+   (RelationPool は Arc 共有でインターニング整合)、max_threads で上限制御。
+   マージはコンポーネント所有関係でゲートし未使用関係の空上書きを防止
+   (直列版にも同修正)。パリティテスト(並列/直列/単体+マージインスタンス検証)追加
 4. ~~cargo-fuzz による cnf/bool 層の堅牢化~~ ✅ セットアップ完了
    (2026-08-24): `alloy-kodkod-rs/fuzz/` に 3 ターゲット
    (bool_circuit_cnf / closure_warshall / intset_ops)。実行:

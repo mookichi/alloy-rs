@@ -256,6 +256,25 @@ mod ipasir_impl {
             crate::pardinus::solve_static_components(self, arena, formula, bounds)
         }
 
+        /// Parallel variant of [`Self::solve_decomposed`] (backlog 3):
+        /// component groups are solved on a bounded worker pool. Requires
+        /// `AstArena: Clone` (each worker gets its own copy).
+        pub fn solve_decomposed_parallel(
+            &self,
+            arena: &mut AstArena,
+            formula: FormulaId,
+            bounds: &Bounds,
+            max_threads: usize,
+        ) -> Result<Solution, TranslateError> {
+            crate::pardinus::solve_static_components_parallel(
+                self,
+                arena,
+                formula,
+                bounds,
+                max_threads,
+            )
+        }
+
         /// Dynamic two-stage decomposition (Iter 8): slice the formula by the
         /// partial relations of a [`crate::pardinus::PardinusBounds`], solve
         /// the partial problem, anchor it, and complete.

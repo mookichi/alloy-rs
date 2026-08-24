@@ -194,6 +194,9 @@ usize は添字とカウンタのみに限定。
       動的2段階(blocking 探索つき・時制は展開宇宙アンカー方式)、
       静的連結成分分解+マージ。非対応: PARALLEL/amalgamated 自動統合/
       多段探索の完全版
+- [x] PARALLEL 分解(バックログ3)— thread::scope ワークプル、
+      AstArena Clone 化(プール Arc 共有)、所有関係ゲート付きマージ。
+      `Solver::solve_decomposed_parallel(arena,f,bounds,max_threads)`
 
 ## 6. リスク・論点
 

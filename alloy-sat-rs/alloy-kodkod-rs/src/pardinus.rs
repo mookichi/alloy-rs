@@ -438,44 +438,7 @@ pub fn solve_static_components(
 ) -> Result<crate::solver::Solution, crate::fol::TranslateError> {
     use crate::solver::Solution;
 
-    let mut conjuncts = Vec::new();
-    flatten_ands_pub(arena, formula, &mut conjuncts);
-
-    // union-find over conjunct indices via shared relations
-    let rels_per: Vec<BTreeSet<RelationId>> = conjuncts
-        .iter()
-        .map(|&c| {
-            let mut s = BTreeSet::new();
-            collect_formula_relations(arena, c, &mut s);
-            s
-        })
-        .collect();
-    let mut parent: Vec<usize> = (0..conjuncts.len()).collect();
-    fn find(p: &mut Vec<usize>, x: usize) -> usize {
-        if p[x] != x {
-            let root = find(p, p[x]);
-            p[x] = root;
-        }
-        p[x]
-    }
-    let mut owner: HashMap<RelationId, usize> = HashMap::new();
-    for (i, rels) in rels_per.iter().enumerate() {
-        for &r in rels {
-            match owner.get(&r) {
-                Some(&j) => {
-                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
-                    parent[a] = b;
-                }
-                None => {
-                    owner.insert(r, i);
-                }
-            }
-        }
-    }
-    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..conjuncts.len() {
-        groups.entry(find(&mut parent, i)).or_default().push(i);
-    }
+    let groups = component_groups(arena, formula);
 
     if groups.len() <= 1 {
         // nothing to decompose
@@ -484,30 +447,12 @@ pub fn solve_static_components(
         return solver.solve_with(&mut si, arena, formula, bounds);
     }
 
-    if std::env::var_os("DBG_DECOMP").is_some() {
-        eprintln!(
-            "[decomp] groups={} conjuncts={}",
-            groups.len(),
-            conjuncts.len()
-        );
-        for (root, members) in &groups {
-            let rels: Vec<String> = rels_per[members[0]]
-                .iter()
-                .map(|r| bounds.pool().name(*r).to_string())
-                .collect();
-            eprintln!("  group root={root} members={members:?} rels={rels:?}");
-        }
-    }
     let mut merged = Instance::new(bounds.universe(), bounds.pool());
-    for (_, members) in groups {
-        let parts: Vec<FormulaId> = members.iter().map(|&i| conjuncts[i]).collect();
-        let gformula = arena.and(&parts);
+    for group in &groups {
+        let gformula = arena.and(&group.formulas);
         let mut si = crate::ipasir_bridge::IpasirSolver::new()
             .map_err(crate::fol::TranslateError::Solver)?;
         let sol = solver.solve_with(&mut si, arena, gformula, bounds)?;
-        if std::env::var_os("DBG_DECOMP").is_some() {
-            eprintln!("[decomp] group {:?} sat={}", members, sol.satisfiable);
-        }
         if !sol.satisfiable {
             return Ok(Solution {
                 satisfiable: false,
@@ -520,6 +465,9 @@ pub fn solve_static_components(
         }
         let inst = sol.instance.expect("SAT implies instance");
         for r in inst.relations().collect::<Vec<_>>() {
+            if !group.relations.contains(&r) {
+                continue; // unrelated filler from shared base bounds
+            }
             let ts = inst.tuples(r).expect("relation present");
             merged
                 .add(r, ts)
@@ -537,6 +485,189 @@ pub fn solve_static_components(
     })
 }
 
-pub(crate) fn flatten_ands_pub(arena: &AstArena, f: FormulaId, out: &mut Vec<FormulaId>) {
-    flatten_ands(arena, f, out)
+/// Parallel variant of [`solve_static_components`] (backlog 3): component
+/// groups are solved on a bounded worker pool (work-pulling over an atomic
+/// counter; no external scheduler dependency). Each worker gets its own
+/// clone of the arena — relation interning stays consistent because the
+/// pool is shared through `Arc`. Any UNSAT component makes the whole
+/// problem UNSAT.
+///
+/// `max_threads` caps the worker count (`0` = one worker per group).
+#[cfg(feature = "ipasir")]
+pub fn solve_static_components_parallel(
+    solver: &crate::Solver,
+    arena: &mut AstArena,
+    formula: FormulaId,
+    bounds: &Bounds,
+    max_threads: usize,
+) -> Result<crate::solver::Solution, crate::fol::TranslateError> {
+    use crate::solver::Solution;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let groups = component_groups(arena, formula);
+    if groups.len() <= 1 {
+        let mut si = crate::ipasir_bridge::IpasirSolver::new()
+            .map_err(crate::fol::TranslateError::Solver)?;
+        return solver.solve_with(&mut si, arena, formula, bounds);
+    }
+
+    let nworkers = if max_threads == 0 {
+        groups.len()
+    } else {
+        max_threads.min(groups.len())
+    };
+    let next = AtomicUsize::new(0);
+    let results: Vec<Mutex<Option<Result<Solution, String>>>> =
+        (0..groups.len()).map(|_| Mutex::new(None)).collect();
+
+    std::thread::scope(|scope| {
+        for _w in 0..nworkers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= groups.len() {
+                    break;
+                }
+                // own arena clone per task: translation is thread-local
+                let mut a2 = arena.clone();
+                let gformula = a2.and(&groups[i].formulas);
+                let out = (|| -> Result<Solution, crate::fol::TranslateError> {
+                    let mut si = crate::ipasir_bridge::IpasirSolver::new()
+                        .map_err(crate::fol::TranslateError::Solver)?;
+                    let r = solver.solve_with(&mut si, &a2, gformula, bounds);
+                    if std::env::var_os("DBG_PAR").is_some() {
+                        if let Ok(sol) = &r {
+                            if let Some(inst) = &sol.instance {
+                                let names: Vec<String> = inst
+                                    .relations()
+                                    .map(|rr| {
+                                        format!(
+                                            "{}:{}",
+                                            bounds.pool().name(rr),
+                                            inst.tuples(rr).map(|t| t.len()).unwrap_or(0)
+                                        )
+                                    })
+                                    .collect();
+                                eprintln!(
+                                    "[par] group{i} sat={} rels={:?}",
+                                    sol.satisfiable, names
+                                );
+                            }
+                        }
+                    }
+                    r
+                })();
+                let mut slot = results[i].lock().unwrap();
+                *slot = Some(out.map_err(|e| e.to_string()));
+            });
+        }
+    });
+
+    let mut merged = Instance::new(bounds.universe(), bounds.pool());
+    let mut num_primary = 0usize;
+    for (idx_out, r) in results.into_iter().enumerate() {
+        let sol = r
+            .into_inner()
+            .unwrap()
+            .expect("worker panicked")
+            .map_err(|e| crate::fol::TranslateError::Pardinus(PardinusError::Eval(e)))?;
+        num_primary += sol.num_primary_variables;
+        if !sol.satisfiable {
+            return Ok(Solution {
+                satisfiable: false,
+                instance: None,
+                temporal: None,
+                witness_slots: Vec::new(),
+                num_primary_variables: sol.num_primary_variables,
+                backend: "decomposed-parallel",
+            });
+        }
+        let owned = &groups[idx_out].relations;
+        let inst = sol.instance.expect("SAT implies instance");
+        for rel in inst.relations().collect::<Vec<_>>() {
+            if !owned.contains(&rel) {
+                continue; // unrelated filler from shared base bounds
+            }
+            let ts = inst.tuples(rel).expect("relation present");
+            merged
+                .add(rel, ts)
+                .map_err(|e| crate::fol::TranslateError::Pardinus(PardinusError::Instance(e)))?;
+        }
+    }
+
+    Ok(Solution {
+        satisfiable: true,
+        instance: Some(merged),
+        temporal: None,
+        witness_slots: Vec::new(),
+        num_primary_variables: num_primary,
+        backend: "decomposed-parallel",
+    })
+}
+
+/// One decomposition component: its formulas plus every relation the
+/// component owns (used to merge instances unambiguously).
+#[derive(Debug, Clone)]
+pub struct ComponentGroup {
+    pub formulas: Vec<FormulaId>,
+    pub relations: BTreeSet<RelationId>,
+}
+
+/// Splits top-level conjuncts into connected components over shared
+/// relations. Returns the groups (order-stable by first appearance).
+pub fn component_groups(arena: &AstArena, formula: FormulaId) -> Vec<ComponentGroup> {
+    let mut conjuncts = Vec::new();
+    flatten_ands(arena, formula, &mut conjuncts);
+
+    let rels_per: Vec<BTreeSet<RelationId>> = conjuncts
+        .iter()
+        .map(|&c| {
+            let mut s = BTreeSet::new();
+            collect_formula_relations(arena, c, &mut s);
+            s
+        })
+        .collect();
+
+    let mut parent: Vec<usize> = (0..conjuncts.len()).collect();
+    fn find(p: &mut [usize], x: usize) -> usize {
+        if p[x] != x {
+            p[x] = find(p, p[x]);
+        }
+        p[x]
+    }
+    let mut owner: HashMap<RelationId, usize> = HashMap::new();
+    for (i, rels) in rels_per.iter().enumerate() {
+        for &r in rels {
+            match owner.get(&r) {
+                Some(&j) => {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    parent[a] = b;
+                }
+                None => {
+                    owner.insert(r, i);
+                }
+            }
+        }
+    }
+    let mut order: Vec<usize> = Vec::new();
+    let mut groups_formulas: HashMap<usize, Vec<FormulaId>> = HashMap::new();
+    let mut groups_rels: HashMap<usize, BTreeSet<RelationId>> = HashMap::new();
+    for (i, c) in conjuncts.iter().enumerate() {
+        let root = find(&mut parent, i);
+        if !groups_formulas.contains_key(&root) {
+            order.push(root);
+        }
+        groups_formulas.entry(root).or_default().push(*c);
+        groups_rels
+            .entry(root)
+            .or_default()
+            .extend(rels_per[i].iter().copied());
+    }
+    order
+        .into_iter()
+        .map(|root| ComponentGroup {
+            formulas: groups_formulas.remove(&root).unwrap_or_default(),
+            relations: groups_rels.remove(&root).unwrap_or_default(),
+        })
+        .collect()
 }
