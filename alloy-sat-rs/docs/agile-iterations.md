@@ -125,12 +125,37 @@
 - 受け入れテスト(tests/decomp.rs): 動的パリティ(plain==dynamic)、
   UNSAT 伝播、静的成分の独立判定 ✓
 
-### Iter 9: UNSAT コア / prover 機能
-- alloy-ipasir へ failed assumptions(CaDiCaL `failed()`)露出を追加
-  ※ minisatp 代替要件(ListDebug/Sudoku 例題で裏付け済み)
-- RCEStrategy 相当のコア最小化、Proof/ResolutionTrace の Rust 版設計
-- デモ: Sudoku -core=rce 相当のコア抽出
-- 受け入れ: ListDebug の Rust 版がコア縮小に成功
+### Iter 9: UNSAT コア / prover 機能 ✅ 完了(2026-08-24、テスト+11)
+- `ipasir_failed` 実装(user指示どおり **failed assumptions 前提**の設計):
+  - alloy-ipasir: `Backend::failed`(CaDiCaL `failed()` を委譲)、worker が
+    UNSAT 後の失敗仮定スナップショット(`failed_of`/`failed_core`)、
+    `Session::failed`、C ABI `ipasir_failed` + 非同期ABI
+    `alloy_worker_assume`/`alloy_worker_failed`(仮定は solve で drain)
+  - kodkod: `SatSolver` に assume/failed/failed_core/supports_assumptions
+    追加。RecordingSolver は全列挙+削除フィルタで**厳密最小コア**
+  - cnf.rs: `translate_conjunct_def` — 各連言項を**単位節なしで定義のみ**
+    翻訳し符号付き根リテラルを返す(kodkod の selector axiom の仮定版)。
+    極性最適化を無効化し全ゲートに完全定義(共有ゲートの意味論保護)
+- `ucore.rs` 新設:
+  - `conjuncts_of`(Nodes.conjuncts 相当の連言フラット化)
+  - `solve_core_with` / `Solver::solve_core`: 各トップレベル連言を selector
+    仮定として解き、UNSAT 時は失敗仮定→**RCE相当の削除フィルタ最小化**
+    (各メンバー1回の除去試行=RCEStrategy の root 当たり1試行と同等)。
+    定数 false 連言は即自明コア、恒真連言は最初から除外
+  - CNFレベル API: `SoftGroup` + `extract_cnf_core`(hard節+softグループ、
+    selector 変数エンコード)。AST翻訳なしで使える
+- デモ: `cargo run --release --example sudoku_core --features ipasir`
+  - 可解 4x4 数独 → SAT 盤面表示
+  - 矛盤(同値2ヒントが同一行)+無関係ヒント → UNSAT、初期 failed=
+    最小コア={r0c0=1, r0c2=1} を 3 ソルブで特定
+- 受け入れテスト(tests/ucore.rs、計9): ListDebug 的縮小シナリオ
+  (独立矛盾2組+恒真フィラー7連言 → コア縮小・各メンバー必要性検証)、
+  culprit 連言への逆引き、SAT時コア空+Evaluator再検証、
+  自明 false 連言、CNFレベル4件(RecordingSolver で ipasir 不要)。
+  alloy-ipasir 側 +2(session/非同期ABIの failed テスト)
+- 設計記録: Proof/ResolutionTrace の Rust 版設計を
+  `docs/pardinus-core-survey.md` §7 に記載(仮定ベースでは不要だが
+  minisatprover 完全互換に必要になる場合の設計)
 
 ### Iter 10: Java 逆統合 — Rust エンジンの JNI 公開
 - C ABI(`alloy_engine_*`)+ JNI ラッパ、`SATFactory` ではなく

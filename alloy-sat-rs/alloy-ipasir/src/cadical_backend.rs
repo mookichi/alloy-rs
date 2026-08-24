@@ -57,6 +57,10 @@ impl Backend for CadicalBackend {
         self.inner.value(lit)
     }
 
+    fn failed(&self, lit: i32) -> bool {
+        self.inner.failed(lit)
+    }
+
     fn max_var(&self) -> i32 {
         self.inner.max_variable()
     }

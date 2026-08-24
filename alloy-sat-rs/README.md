@@ -56,7 +56,7 @@ cargo test --no-default-features --features splr
 | | cadical | splr |
 |---|---|---|
 | 増分解決 | ◎ | △(毎solve再構築) |
-| assumptions | ○ | ✗ |
+| assumptions / UNSATコア(`failed`) | ○ | ✗ |
 | 実装 | C++(cargoがビルド) | 純Rust |
 | ライセンス | MIT | MPL-2.0 |
 
@@ -68,6 +68,10 @@ void *s = ipasir_init();
 ipasir_add(s, 1); ipasir_add(s, 2); ipasir_add(s, 0); /* x1 ∨ x2 */
 int r = ipasir_solve(s);            /* 10=SAT, 20=UNSAT, 0=中断/不明 */
 if (r == 10) { int v = ipasir_val(s, 1); }
+ipasir_assume(s, -3);               /* 次のsolveへの仮定 */
+if (ipasir_solve(s) == 20 && ipasir_failed(s, -3)) {
+    /* -3 は UNSAT コアに参加(失敗仮定) */
+}
 ipasir_set_terminate(s, state, my_abort_cb); /* solve中の割り込み */
 ipasir_release(s);
 ```
@@ -78,10 +82,12 @@ ipasir_release(s);
 void *w = alloy_worker_init();
 int32_t c[2] = {1, 2};
 alloy_worker_add(w, c, 2);
+alloy_worker_assume(w, 5);          /* 次のsolveへの仮定(solveで消費) */
 alloy_worker_solve(w);              /* ノンブロッキング */
 while (alloy_worker_status(w) == -1) { /* 他の処理 */ }
 int r = alloy_worker_wait(w);       /* 最終値で確定待ち */
 if (r == 10) int v = alloy_worker_val(w, 1);
+else if (r == 20 && alloy_worker_failed(w, 5)) { /* 失敗仮定 */ }
 alloy_worker_cancel(w);             /* 実行中断(任意スレッドから) */
 alloy_worker_release(w);
 ```
@@ -89,9 +95,7 @@ alloy_worker_release(w);
 ## 既知の制約(v0)
 
 - `ipasir_set_learn` は no-op(オプション機能)
-- UNSAT コア(failed assumption 取得)未対応 — CaDiCaL の `failed()` を
-  将来露出予定
-- splr バックエンドは solve ごとに全節をリプレイする(純Rust検証用)
+- splr バックエンドは assumptions 非対応(失敗仮定も取得不可)
 
 ## Java 統合(実装済み)
 
@@ -165,3 +169,12 @@ cargo test -p alloy-kodkod-rs --features ipasir   # +2 tests(fuzz 30 cases)
 - FolTranslator 統合: #基数・sum(int境界)・int比較6種・FromInt
 - BoolFactory::ite に定数簡約8則(ConstantInside 問題解消)
 - テスト計72(ipasir時74)
+
+### Iter 9 完了: UNSAT コア(`-core=rce` 相当)
+- `ipasir_failed` / `alloy_worker_failed` + `alloy_worker_assume`(失敗仮定)
+- `SatSolver` 拡張(assume/failed)、RecordingSolver は厳密最小コアを全列挙で算出
+- `ucore`: 連言フラット化→各項を selector **assumption** 化(定義のみ翻訳)
+  → failed から初期コア → RCE相当の削除フィルタ最小化
+- CNFレベル `SoftGroup`+`extract_cnf_core`、デモ
+  `cargo run --release --example sudoku_core --features ipasir`
+  (矛盾ヒント2つを3ソルブで特定)。設計記録は survey doc §7

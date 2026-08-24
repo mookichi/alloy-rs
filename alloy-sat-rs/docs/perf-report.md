@@ -18,6 +18,14 @@ CaDiCaL(IPASIR 経由)。criterion 10 サンプル。
 最適化内容: (1) Comparison の疎キーユニオン生成(容量全走査廃止)、
 (2) BoolFactory fold へ補文リテラル打ち切り+吸收則追加。
 
+## Iter 9(2026-08-24)
+
+- 例題実行で回帰確認: `--example solve -- queens10` → **0.64 s**
+  (Iter 6 最適化後 0.72 s に対し微改善)。ucore 追加は既存
+  `translate_to_cnf` 経路に触れないため翻訳性能は影響なし
+- コア抽出のソルブ回数: sudoku_core デモで初期 solve + 削除フィルタ
+  = グループ数に対し線形(3 soft groups → 3 solves)
+
 ## 観察
 
 - n-queens は 4 項 ATK 関係の量化子展開が支配的で、翻訳時間が

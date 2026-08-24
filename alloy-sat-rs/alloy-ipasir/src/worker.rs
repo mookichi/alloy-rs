@@ -20,6 +20,9 @@ enum Command {
 #[derive(Default)]
 struct Slot(Mutex<c_int>, Condvar);
 
+const SAT: c_int = 10;
+const UNSAT: c_int = 20;
+
 impl Slot {
     fn set(&self, v: c_int) {
         let mut guard = self.0.lock().unwrap();
@@ -48,6 +51,11 @@ pub struct Worker {
     status: Arc<Slot>,
     /// Assignment snapshot (index = var-1) filled after each SAT result.
     model: Arc<Mutex<Vec<bool>>>,
+    /// Failed assumptions of the last UNSAT solve (subset of the solve's
+    /// assumptions, in the order they were passed).
+    failed: Arc<Mutex<Vec<i32>>>,
+    /// Assumptions accumulated via the async ABI for the next solve.
+    pending_assumptions: Mutex<Vec<c_int>>,
     join: Mutex<Option<JoinHandle<()>>>,
     name: &'static str,
     supports_assumptions: bool,
@@ -62,18 +70,16 @@ impl Worker {
         let cancel = CancelToken::default();
         let status = Arc::new(Slot(Mutex::new(-1), Condvar::new()));
         let model = Arc::new(Mutex::new(Vec::new()));
+        let failed = Arc::new(Mutex::new(Vec::new()));
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(&'static str, bool), String>>();
-
-        // Slot values are plain i32 codes; see constants in lib.rs.
-        const SAT: c_int = 10;
-        const UNSAT: c_int = 20;
 
         let join = std::thread::Builder::new()
             .name("alloy-sat-worker".into())
             .spawn({
                 let status = Arc::clone(&status);
                 let model = Arc::clone(&model);
+                let failed = Arc::clone(&failed);
                 let cancel = cancel.clone();
                 move || {
                     let body = || -> Result<(), String> {
@@ -89,14 +95,18 @@ impl Worker {
                                         Outcome::Sat => {
                                             *model.lock().unwrap() =
                                                 snapshot_model(backend.as_ref());
+                                            failed.lock().unwrap().clear();
                                             status.set(SAT);
                                         }
                                         Outcome::Unsat => {
+                                            *failed.lock().unwrap() =
+                                                snapshot_failed(backend.as_ref(), &assumptions);
                                             model.lock().unwrap().clear();
                                             status.set(UNSAT);
                                         }
                                         Outcome::Unknown => {
                                             model.lock().unwrap().clear();
+                                            failed.lock().unwrap().clear();
                                             status.set(0);
                                         }
                                     }
@@ -123,6 +133,8 @@ impl Worker {
             cancel,
             status,
             model,
+            failed,
+            pending_assumptions: Mutex::new(Vec::new()),
             join: Mutex::new(Some(join)),
             name,
             supports_assumptions,
@@ -149,6 +161,19 @@ impl Worker {
         self.send(Command::Solve(assumptions));
     }
 
+    /// Accumulate an assumption for the next async-ABI solve
+    /// (`alloy_worker_solve` drains this list).
+    pub fn assume(&self, lit: c_int) {
+        if lit != 0 && lit != i32::MIN {
+            self.pending_assumptions.lock().unwrap().push(lit);
+        }
+    }
+
+    /// Take the assumptions accumulated via [`Worker::assume`].
+    pub fn take_pending_assumptions(&self) -> Vec<c_int> {
+        std::mem::take(&mut self.pending_assumptions.lock().unwrap())
+    }
+
     /// Current solve status: [`STATUS_RUNNING`], 10, 20 or 0.
     pub fn status(&self) -> c_int {
         self.status.get()
@@ -166,7 +191,7 @@ impl Worker {
 
     /// Value of `lit` after a SAT result: `lit` / `-lit` / 0.
     pub fn value_of(&self, lit: c_int) -> c_int {
-        if lit == 0 || lit == i32::MIN || self.status() != 10 {
+        if lit == 0 || lit == i32::MIN || self.status() != SAT {
             return 0;
         }
         let var = lit.unsigned_abs() as usize;
@@ -174,6 +199,25 @@ impl Worker {
             Some(true) => lit.abs(),
             _ => -lit.abs(),
         }
+    }
+
+    /// Whether `lit` was a *failed* assumption in the last UNSAT solve.
+    /// Always `false` outside an UNSAT result (SAT / running / unknown).
+    pub fn failed_of(&self, lit: c_int) -> bool {
+        if lit == 0 || lit == i32::MIN || self.status() != UNSAT {
+            return false;
+        }
+        self.failed.lock().unwrap().contains(&lit)
+    }
+
+    /// The failed assumptions of the last UNSAT solve (subset of the
+    /// assumptions used by that solve). Empty unless the last result was
+    /// UNSAT under assumptions.
+    pub fn failed_core(&self) -> Vec<c_int> {
+        if self.status() != UNSAT {
+            return Vec::new();
+        }
+        self.failed.lock().unwrap().clone()
     }
 
     fn send(&self, cmd: Command) {
@@ -199,5 +243,16 @@ fn snapshot_model(backend: &dyn Backend) -> Vec<bool> {
     let max_var = backend.max_var();
     (1..=max_var)
         .map(|v| backend.value(v).unwrap_or(false))
+        .collect()
+}
+
+/// Subset of `assumptions` that the backend reports as failed after an UNSAT
+/// solve. Preserves assumption order; empty when the backend has no notion of
+/// failed assumptions (then no core information is available).
+fn snapshot_failed(backend: &dyn Backend, assumptions: &[c_int]) -> Vec<c_int> {
+    assumptions
+        .iter()
+        .copied()
+        .filter(|&l| backend.failed(l))
         .collect()
 }

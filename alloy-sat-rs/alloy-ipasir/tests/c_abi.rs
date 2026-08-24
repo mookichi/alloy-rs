@@ -12,6 +12,7 @@ type AddFn = unsafe extern "C" fn(*mut c_void, c_int);
 type SolveFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type ValFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type AssumeFn = unsafe extern "C" fn(*mut c_void, c_int);
+type FailedFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type SetTerminateFn = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
@@ -39,6 +40,7 @@ struct Api {
     assume: AssumeFn,
     solve: SolveFn,
     val: ValFn,
+    failed: FailedFn,
     set_terminate: SetTerminateFn,
 }
 
@@ -52,6 +54,7 @@ unsafe fn api() -> Api {
         assume: *lib.get(b"ipasir_assume").unwrap(),
         solve: *lib.get(b"ipasir_solve").unwrap(),
         val: *lib.get(b"ipasir_val").unwrap(),
+        failed: *lib.get(b"ipasir_failed").unwrap(),
         set_terminate: *lib.get(b"ipasir_set_terminate").unwrap(),
         _lib: lib,
     };
@@ -115,8 +118,12 @@ fn assumptions_through_c_abi() {
         (api.add)(s, 0);
         (api.assume)(s, -7);
         assert_eq!((api.solve)(s), 20);
-        // Assumptions reset after solve.
+        // ipasir_failed reports the conflicting assumption.
+        assert_eq!((api.failed)(s, -7), 1);
+        assert_eq!((api.failed)(s, 7), 0);
+        // Assumptions reset after solve; failed state is gone too.
         assert_eq!((api.solve)(s), 10);
+        assert_eq!((api.failed)(s, -7), 0);
         (api.release)(s);
     }
 }

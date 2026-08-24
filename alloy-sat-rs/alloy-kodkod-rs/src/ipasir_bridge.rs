@@ -34,8 +34,28 @@ impl SatSolver for IpasirSolver {
         true
     }
 
+    fn assume(&mut self, lit: i64) {
+        self.session.assume(lit as i32);
+    }
+
     fn solve(&mut self) -> bool {
         self.session.solve() == IPASIR_SAT
+    }
+
+    fn failed(&self, lit: i64) -> bool {
+        self.session.failed(lit as i32)
+    }
+
+    fn failed_core(&self) -> Vec<i64> {
+        self.session
+            .failed_core()
+            .into_iter()
+            .map(|l| l as i64)
+            .collect()
+    }
+
+    fn supports_assumptions(&self) -> bool {
+        self.session.supports_assumptions()
     }
 
     fn value_of(&self, var: i64) -> bool {

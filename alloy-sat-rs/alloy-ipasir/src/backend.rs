@@ -48,6 +48,14 @@ pub trait Backend {
     fn supports_assumptions(&self) -> bool {
         true
     }
+
+    /// Whether the assumption literal was *failed* in the last UNSAT solve
+    /// (i.e. it participates in the final conflict). Only meaningful after an
+    /// UNSAT result obtained under assumptions; backends without assumption
+    /// support always report `false`.
+    fn failed(&self, _lit: i32) -> bool {
+        false
+    }
 }
 
 /// Create the backend named by `ALLOY_SAT_BACKEND`, or the first available

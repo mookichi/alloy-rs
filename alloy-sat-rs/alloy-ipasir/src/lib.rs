@@ -119,6 +119,18 @@ impl Session {
         self.worker.value_of(lit)
     }
 
+    /// Whether `lit` was a *failed* assumption in the last UNSAT solve, i.e.
+    /// whether it belongs to the (not necessarily minimal) unsatisfiable core
+    /// reported by the backend. `false` unless the last result was UNSAT.
+    pub fn failed(&self, lit: c_int) -> bool {
+        self.worker.failed_of(lit)
+    }
+
+    /// The failed assumptions of the last UNSAT solve as a literal list.
+    pub fn failed_core(&self) -> Vec<c_int> {
+        self.worker.failed_core()
+    }
+
     pub fn set_terminate(&mut self, terminate: TerminateFn, state: *mut c_void) {
         self.terminate = Some((terminate, state));
     }
@@ -225,6 +237,16 @@ pub unsafe extern "C" fn ipasir_val(solver: *mut Session, lit: c_int) -> c_int {
     })
 }
 
+/// Returns 1 if the assumption literal was *failed* in the last UNSAT solve
+/// (it belongs to the reported unsatisfiable core), 0 otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn ipasir_failed(solver: *mut Session, lit: c_int) -> c_int {
+    guard(|| match solver.as_ref() {
+        Some(session) if session.last_result_was_unsat() && session.failed(lit) => 1,
+        _ => 0,
+    })
+}
+
 /// Registers a termination callback polled during `ipasir_solve`.
 #[no_mangle]
 pub unsafe extern "C" fn ipasir_set_terminate(
@@ -258,6 +280,10 @@ pub unsafe extern "C" fn ipasir_set_learn(
 impl Session {
     fn last_result_was_sat(&self) -> bool {
         self.worker.status() == IPASIR_SAT
+    }
+
+    fn last_result_was_unsat(&self) -> bool {
+        self.worker.status() == IPASIR_UNSAT
     }
 }
 
@@ -310,7 +336,18 @@ pub unsafe extern "C" fn alloy_worker_solve(worker: *mut Worker) {
         let Some(worker) = worker.as_ref() else {
             return;
         };
-        worker.start_solve(Vec::new());
+        let assumptions = worker.take_pending_assumptions();
+        worker.start_solve(assumptions);
+    })
+}
+
+/// Adds the literal as an assumption for the next [`alloy_worker_solve`].
+#[no_mangle]
+pub unsafe extern "C" fn alloy_worker_assume(worker: *mut Worker, lit: c_int) {
+    guard(|| {
+        if let Some(worker) = worker.as_ref() {
+            worker.assume(lit);
+        }
     })
 }
 
@@ -350,6 +387,15 @@ pub unsafe extern "C" fn alloy_worker_val(worker: *mut Worker, lit: c_int) -> c_
     guard(|| match worker.as_ref() {
         Some(worker) => worker.value_of(lit),
         None => 0,
+    })
+}
+
+/// 1 if `lit` was a failed assumption in the last UNSAT solve, else 0.
+#[no_mangle]
+pub unsafe extern "C" fn alloy_worker_failed(worker: *mut Worker, lit: c_int) -> c_int {
+    guard(|| match worker.as_ref() {
+        Some(worker) if worker.failed_of(lit) => 1,
+        _ => 0,
     })
 }
 

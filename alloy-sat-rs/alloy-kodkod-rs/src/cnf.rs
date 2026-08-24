@@ -255,3 +255,93 @@ pub fn translate_into_solver<S: SatSolver>(
     }
     Ok(())
 }
+
+/// Outcome of translating one top-level conjunct without asserting it
+/// ([`translate_conjunct_def`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootCnf {
+    /// Conjunct simplified to constant true; nothing to assert or assume.
+    TriviallyTrue,
+    /// Conjunct simplified to constant false; the empty clause was emitted,
+    /// so the problem is unconditionally UNSAT.
+    TriviallyFalse,
+    /// *Signed* root literal of the conjunct (e.g. `-7` for `not(f)` whose
+    /// circuit root is gate 7). Its definitional clauses were emitted (both
+    /// polarities); forcing it is up to the caller via a unit clause or —
+    /// for core extraction — a SAT assumption.
+    Lit(i64),
+}
+
+/// Translate `root` into `solver` as *definitions only*: every non-variable
+/// gate gets its full Tseitin definition, but the root literal is neither
+/// asserted nor returned as a clause. The caller decides how to force it
+/// (unit axiom à la kodkod's selector axioms, or an assumption).
+///
+/// Polarity optimization is disabled on this path so that each gate is fully
+/// defined regardless of where else it may be reused across conjuncts.
+pub fn translate_conjunct_def<S: SatSolver>(
+    solver: &mut S,
+    factory: &BoolFactory,
+    root: BoolRef,
+    max_primary_var: usize,
+) -> Result<RootCnf, CnfError> {
+    if root.is_const() {
+        return Ok(if root.const_value() {
+            RootCnf::TriviallyTrue
+        } else {
+            solver.add_clause(&[]);
+            RootCnf::TriviallyFalse
+        });
+    }
+    let mut t = Translator {
+        factory,
+        visited: IntSet::new(),
+        polarity: Polarity::new(),
+        clauses: Vec::new(),
+        // Full definitions: shared gates must behave identically in every
+        // conjunct, and an assumed selector needs both definition directions.
+        optimize_polarity: false,
+    };
+    let lit = t.emit_definitions(root)?;
+    let num_vars = num_vars_of(root.slot(), max_primary_var);
+    if num_vars > solver.num_variables() {
+        solver.add_variables(num_vars - solver.num_variables());
+    }
+    for clause in &t.clauses {
+        solver.add_clause(clause);
+    }
+    Ok(RootCnf::Lit(lit))
+}
+
+fn num_vars_of(root_slot: u32, max_primary_var: usize) -> usize {
+    (root_slot as usize).max(max_primary_var)
+}
+
+impl<'a> Translator<'a> {
+    /// Definitions-only traversal returning the signed root literal.
+    fn emit_definitions(&mut self, root: BoolRef) -> Result<i64, CnfError> {
+        let o = root.slot() as i64;
+        match self.factory.node(root).ok_or(CnfError::DanglingRef)? {
+            BoolNode::Var => Ok(if root.sign() { o } else { -o }),
+            BoolNode::And(kids) => {
+                // o <-> AND(kids), both directions, regardless of root sign:
+                // an assumed selector needs a fully defined gate.
+                let mut last: Vec<i64> = Vec::with_capacity(kids.len() + 1);
+                for &k in kids {
+                    let il = self.visit(k)?;
+                    self.emit(vec![il, -o]);
+                    last.push(-il);
+                }
+                last.push(o);
+                self.emit(last);
+                Ok(if root.sign() { o } else { -o })
+            }
+            _ => {
+                // Or / Ite: visit already emits definitions; polarity flags
+                // default to (true, true) because optimize_polarity is off.
+                let lit = self.visit(root)?;
+                Ok(lit)
+            }
+        }
+    }
+}

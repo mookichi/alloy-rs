@@ -111,6 +111,21 @@ impl Solver {
             backend: "ipasir",
         })
     }
+
+    /// Core-extraction solve (Iter 9) with a caller-provided SAT solver.
+    ///
+    /// Each top-level conjunct becomes an assumed selector; on UNSAT the
+    /// minimized failed set identifies the culprit constraints. See
+    /// [`crate::ucore`].
+    pub fn solve_core_with<S: SatSolver>(
+        &self,
+        solver: &mut S,
+        arena: &AstArena,
+        formula: FormulaId,
+        bounds: &Bounds,
+    ) -> Result<crate::ucore::CoreSolution, TranslateError> {
+        crate::ucore::solve_core_with(solver, self.options.bitwidth, arena, formula, bounds)
+    }
 }
 
 #[cfg(feature = "ipasir")]
@@ -286,6 +301,20 @@ mod ipasir_impl {
             steps: usize,
         ) -> Result<Solution, TranslateError> {
             crate::pardinus::solve_dynamic(self, arena, formula, pb, steps)
+        }
+
+        /// Core-extraction solve (Iter 9) using the default IPASIR
+        /// (CaDiCaL) backend. `-core=rce` 相当: on UNSAT the returned
+        /// [`crate::ucore::CoreSolution::core`] lists the minimized culprit
+        /// top-level conjuncts.
+        pub fn solve_core(
+            &self,
+            arena: &AstArena,
+            formula: FormulaId,
+            bounds: &Bounds,
+        ) -> Result<crate::ucore::CoreSolution, TranslateError> {
+            let mut solver = IpasirSolver::new().map_err(TranslateError::Solver)?;
+            self.solve_core_with(&mut solver, arena, formula, bounds)
         }
     }
 }

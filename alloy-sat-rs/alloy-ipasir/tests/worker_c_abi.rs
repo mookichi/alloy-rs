@@ -13,6 +13,7 @@ type SolveFn = unsafe extern "C" fn(*mut c_void);
 type CancelFn = unsafe extern "C" fn(*mut c_void);
 type StatusFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type ValFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+type AssumeFn = unsafe extern "C" fn(*mut c_void, c_int);
 type BackendFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 
 struct Api {
@@ -25,8 +26,12 @@ struct Api {
     status: StatusFn,
     wait: StatusFn,
     val: ValFn,
+    assume: AssumeFn,
+    failed: FailedFn,
     backend: BackendFn,
 }
+
+type FailedFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 
 unsafe fn api() -> Api {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -47,6 +52,8 @@ unsafe fn api() -> Api {
         status: *lib.get(b"alloy_worker_status").unwrap(),
         wait: *lib.get(b"alloy_worker_wait").unwrap(),
         val: *lib.get(b"alloy_worker_val").unwrap(),
+        assume: *lib.get(b"alloy_worker_assume").unwrap(),
+        failed: *lib.get(b"alloy_worker_failed").unwrap(),
         backend: *lib.get(b"alloy_worker_backend").unwrap(),
         _lib: lib,
     }
@@ -99,6 +106,32 @@ fn empty_clause_reports_unsat() {
         clause(&api, s, &[]);
         (api.solve)(s);
         assert_eq!((api.wait)(s), 20);
+        (api.release)(s);
+    }
+}
+
+#[test]
+fn failed_assumptions_through_async_abi() {
+    if std::env::var("ALLOY_SAT_BACKEND").as_deref() == Ok("splr") {
+        return; // splr does not support assumptions
+    }
+    unsafe {
+        let api = api();
+        let s = (api.init)();
+        // (x1) and assuming ¬x1 must fail the assumption.
+        clause(&api, s, &[1]);
+        (api.assume)(s, -1);
+        (api.assume)(s, 2); // irrelevant, satisfiable
+        (api.solve)(s);
+        assert_eq!((api.wait)(s), 20);
+        assert_eq!((api.failed)(s, -1), 1);
+        assert_eq!((api.failed)(s, 2), 0);
+
+        // Assumptions are drained by solve: a re-solve is SAT and the
+        // failed state is cleared.
+        (api.solve)(s);
+        assert_eq!((api.wait)(s), 10);
+        assert_eq!((api.failed)(s, -1), 0);
         (api.release)(s);
     }
 }

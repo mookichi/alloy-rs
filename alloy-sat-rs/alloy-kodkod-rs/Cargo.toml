@@ -39,3 +39,7 @@ required-features = ["ipasir"]
 [[example]]
 name = "decomp"
 required-features = ["ipasir"]
+
+[[example]]
+name = "sudoku_core"
+required-features = ["ipasir"]

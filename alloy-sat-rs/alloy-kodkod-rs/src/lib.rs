@@ -19,6 +19,7 @@ pub mod solver;
 pub mod temporal;
 pub mod tuple;
 pub mod tupleset;
+pub mod ucore;
 pub mod universe;
 
 pub use ast::AstArena;

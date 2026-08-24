@@ -22,6 +22,10 @@ int ipasir_solve(void *solver);
 
 int ipasir_val(void *solver, int lit);
 
+/* Returns 1 if the assumption literal was failed in the last UNSAT solve
+ * (it belongs to the reported unsatisfiable core), 0 otherwise. */
+int ipasir_failed(void *solver, int lit);
+
 void ipasir_set_terminate(void *solver, void *state,
                           int (*terminate)(void *state));
 

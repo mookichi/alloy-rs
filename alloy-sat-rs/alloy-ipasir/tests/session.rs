@@ -64,7 +64,47 @@ fn assumptions_with_cadical() {
     s.add_clause(&[1]);
     s.assume(-1);
     assert_eq!(s.solve(), IPASIR_UNSAT);
+    // The assumption is in the core: it conflicts with the unit clause.
+    assert!(s.failed(-1));
+    assert_eq!(s.failed_core(), vec![-1]);
     // Assumptions are reset after solve.
+    assert_eq!(s.solve(), IPASIR_SAT);
+    assert!(!s.failed(-1));
+    assert!(s.failed_core().is_empty());
+}
+
+#[test]
+fn failed_assumptions_form_a_core() {
+    // Clauses: (1) (2) (3). Assuming -1, -2 and 4 is UNSAT. The backend's
+    // failed set must be a genuine unsatisfiable core: a subset of the
+    // assumptions which is UNSAT on its own (it need not contain every
+    // logically conflicting assumption).
+    if std::env::var("ALLOY_SAT_BACKEND").as_deref() == Ok("splr") {
+        return;
+    }
+    let mut s = sat_session();
+    if !s.supports_assumptions() {
+        return;
+    }
+    s.add_clause(&[1]);
+    s.add_clause(&[2]);
+    s.add_clause(&[3]);
+    s.assume(-1);
+    s.assume(-2);
+    s.assume(4);
+    assert_eq!(s.solve(), IPASIR_UNSAT);
+    let core = s.failed_core();
+    assert!(!core.is_empty(), "expected a non-empty core");
+    assert!(core.iter().all(|&l| l == -1 || l == -2 || l == 4));
+    assert!(!s.failed(4));
+    // Re-solving under exactly the reported core must still be UNSAT.
+    for &l in &core {
+        s.assume(l);
+    }
+    assert_eq!(s.solve(), IPASIR_UNSAT);
+    // Here every member of {-1,-2} conflicts on its own, so assuming only
+    // the non-failed literal 4 restores satisfiability.
+    s.assume(4);
     assert_eq!(s.solve(), IPASIR_SAT);
 }
 

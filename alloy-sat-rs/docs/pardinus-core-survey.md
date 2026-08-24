@@ -197,6 +197,16 @@ usize は添字とカウンタのみに限定。
 - [x] PARALLEL 分解(バックログ3)— thread::scope ワークプル、
       AstArena Clone 化(プール Arc 共有)、所有関係ゲート付きマージ。
       `Solver::solve_decomposed_parallel(arena,f,bounds,max_threads)`
+- [x] `ucore`(Iter9)— UNSAT コア抽出(`-core=rce` 相当)。
+      **仮定ベース**: 各トップレベル連言を定義のみ翻訳
+      (`translate_conjunct_def`、極性最適化 OFF で全ゲート完全定義、
+      符号付き根リテラル返却)し selector を SAT assumption 化。
+      UNSAT 後の failed assumptions(CaDiCaL `failed()` /
+      `ipasir_failed`)で初期コア→削除フィルタ最小化(各メンバー1試行 =
+      RCEStrategy 相当)。CNFレベルは `SoftGroup`+selector 変数エンコード。
+      Java の unit-clause selector + resolution proof 方式との差異:
+      proof トレース不要の代わりに assumptions 対応ソルバが前提
+      (CaDiCaL ○ / Splr ✗ / RecordingSolver 全列挙)
 
 ## 6. リスク・論点
 
@@ -210,3 +220,38 @@ usize は添字とカウンタのみに限定。
 4. **PardinusBounds の synchronized/integrated(Solution)**:
    分割統合はミュータブルな状態機械であり、Rust では builder/イベント列へ
    再設計が必要(API 単純移植不可)
+
+## 7. Proof / ResolutionTrace の Rust 版設計(Iter9 記録・未実装)
+
+Java(minisatprover + RCEStrategy)は解像度証跡を前提とする:
+
+- `ResolutionTrace`: 学習節を `(clause, antecedents)` 付きで保持し、
+  `learnable(A)`/`directlyLearnable(A)` で仮定節集合 A から導出可能な
+  resolvent 集合を計算。`LazyTrace` が縮小試行の結果を遅延合成する。
+- RCEStrategy は「根 selector 変数のうち現在コア末尾の unit に接続される
+  ものを1つ除去した CNF 部分集合」を `StrategyUtils.clausesFor` の逆連鎖
+  (maxVariable 到達可能性)で切り出し、ドライバ(MiniSatProver.reduce)が
+  新しいソルバで再 UNSAT を確認して置換する。
+
+Rust 版を将来実装する場合の設計(本イテレーションでは見送り):
+
+```
+struct ResolutionTrace {
+    // axioms: 入力節(翻訳ログの root 割当て付き)
+    axioms: Vec<(Clause, Option<ConjunctId>)>,
+    // learned: 導出順に (resolvent, antecedent pair)
+    learned: Vec<(Clause, [u32; 2])>,
+}
+impl ResolutionTrace {
+    fn learnable(&self, subset: &[usize]) -> Vec<usize>;   // 逆連鎖到達
+    fn core_units(&self, subset: &[usize]) -> Vec<i64>;     // tail units
+}
+```
+
+- 取得経路は2案: (a) CaDiCaL の proof log(DRAT)をパースして再構築、
+  (b) `ipasir_set_learn`(学習節コールバック)で antecedent 無しの近似
+  トレースを蓄積。(a) が完全互換だが DRAT パーサが必要。
+- 仮定ベース(現 ucore.rs)との使い分け: 高レベル制約粒度のコア抽出だけ
+  なら assumption 方式で十分。**節粒度**の最小化や proof 出力を要する場合
+  (minisatprover 完全互換、Sudoku `-core=oce`)に ResolutionTrace を
+  追加する。incremental 翻訳では Java 同様 logging を禁止する。
