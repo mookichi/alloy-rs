@@ -1,0 +1,20 @@
+[package]
+name = "alloy-engine-rs"
+description = "Rust Alloy engine: serialized problem (formula DAG + bounds) -> model, C ABI + JNI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "alloy_engine"
+
+[features]
+default = ["cadical"]
+cadical = ["alloy-ipasir/cadical"]
+jni = ["dep:jni"]
+
+[dependencies]
+alloy-ipasir = { path = "../alloy-ipasir", default-features = false, features = ["cadical"] }
+alloy-kodkod-rs = { path = "../alloy-kodkod-rs", features = ["ipasir"] }
+jni = { version = "0.22.4", optional = true }

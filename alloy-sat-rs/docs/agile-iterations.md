@@ -164,6 +164,30 @@
 - デモ: `dist.jar exec --engine rust -f ring.als` が Java エンジンと同結果
 - 受け入れ: 全数テスト(69 例題)の Rust エンジン走査レポート
 
+### Iter 10: Java 逆統合 — Rust エンジンの JNI 公開 ✅ 完了(2026-08-24、テスト+2)
+- 新クレート `alloy-engine-rs`(cdylib): 問題直列化フォーマット **ARE1**
+  (bitwidth/atoms/relations+bounds/variables/ノードDAG/root を varint+zigzag
+  でエンコード。ノードタグは kodkod-rs の ast enum と1:1)→ デコードして
+  `Solver::solve` → 答え ASAT(関係毎タプル索引)/AUNS/AERR を返す。
+  C ABI `alloy_engine_solve`/`alloy_engine_free_buffer` + JNI
+  `RustEngineProxy.solveNative(byte[])→byte[]`
+- Java 側(org.alloytools.alloy.core):
+  - `RustSerializer` — kodkod Formula/Expression/IntExpression/Decls/Bounds を
+    子優先+メモ化で ARE1 へ直列化、答えを kodkod Instance/Solution へ復元
+    (TupleFactory.tuple(arity,index))。非対応構文は ErrorAPI で明示拒否
+    (時制/RelationPredicate/lone・one量化子)
+  - `RustEngineProxy` — NativeCode.getLibrary("alloy_engine") でロード
+    (`-Dalloy.native.lib.alloy_engine=<so>` 上書き可)
+  - `A4Options.engine` 新設 + `A4Solution.solve()` 冒頭で分岐(KKTransformer
+    と同型の差し替えポイント)、`CLI exec --engine rust` 配線(CLIのみ=段階導入)
+- デモ: `dist.jar exec --engine rust -f ring.als` → SAT(Javaエンジンと同結果)
+- 受け入れ: 例題スイート走査(`scripts/sweep-engines.sh`)—
+  extra/models 全 **83 モデル**を両エンジンで実行し**結果100%一致**
+  (81モデルのSAT/UNSAT完全一致 + 2モデルは両エンジン同一の型エラー=
+  高階量化でスキョム不可)。詳細は `docs/engine-sweep-results.txt`
+- 既知の v0 制限: UNSATコア/proof 連携なし(Solution.unsatisfiable(stats,null))、
+  skolemDepth は Rust 側設定に未接続、時制コマンドは明示拒否
+
 ## バックログ(未確定・優先度順)
 1. ~~Simplifier/最適化パス~~ ✅ 完了(2026-08-24): Comparison を疎キー
    ユニオンで生成(容量全走査を撤去)、BoolFactory fold に補文リテラル

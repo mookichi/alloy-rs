@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloy-engine-rs"
+version = "0.1.0"
+dependencies = [
+ "alloy-ipasir",
+ "alloy-kodkod-rs",
+ "jni",
+]
+
+[[package]]
 name = "alloy-ipasir"
 version = "0.1.0"
 dependencies = [

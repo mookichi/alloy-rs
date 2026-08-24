@@ -178,3 +178,19 @@ cargo test -p alloy-kodkod-rs --features ipasir   # +2 tests(fuzz 30 cases)
 - CNFレベル `SoftGroup`+`extract_cnf_core`、デモ
   `cargo run --release --example sudoku_core --features ipasir`
   (矛盾ヒント2つを3ソルブで特定)。設計記録は survey doc §7
+
+### Iter 10 完了: Java 逆統合(`--engine rust`)
+- 新クレート `alloy-engine-rs`: 問題直列化(ARE1)→ Rust パイプライン →
+  モデル復元。C ABI + JNI(`RustEngineProxy.solveNative`)
+- Java: `RustSerializer`(kodkod AST/Bounds ⇄ ARE1)、`A4Solution.solve()` の
+  エンジン分岐、CLI `exec --engine rust`
+- 受け入れ: extra/models 全83例題を両エンジン走査 → **結果100%一致**
+  (`scripts/sweep-engines.sh`、結果は docs/engine-sweep-results.txt)
+
+```bash
+cargo build --release -p alloy-engine-rs --features jni   # liballoy_engine.so
+JAVA_HOME=~/.sdkman/candidates/java/25-amzn ./gradlew :org.alloytools.alloy.dist:build -x test
+java -Dalloy.native.lib.alloy_engine=$PWD/alloy-sat-rs/target/release/liballoy_engine.so \
+  -jar org.alloytools.alloy.dist/target/org.alloytools.alloy.dist.jar \
+  exec --engine rust -f org.alloytools.alloy.extra/extra/models/book/appendixA/ring.als
+```

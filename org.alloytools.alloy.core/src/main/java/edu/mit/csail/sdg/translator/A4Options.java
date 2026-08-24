@@ -91,6 +91,13 @@ public final class A4Options implements Serializable {
     public SATFactory solver               = SATFactory.DEFAULT;
 
     /**
+     * When set to "rust", the whole translation+solve pipeline is delegated
+     * to the native Rust engine (liballoy_engine) instead of the Java
+     * kodkod pipeline. Empty string (default) means the regular engine.
+     */
+    public String     engine                = "";
+
+    /**
      * When this.solver is external, and the solver filename is a relative filename,
      * then this option specifies the directory that the solver filename is relative
      * to.

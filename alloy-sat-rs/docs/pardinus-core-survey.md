@@ -208,6 +208,12 @@ usize は添字とカウンタのみに限定。
       proof トレース不要の代わりに assumptions 対応ソルバが前提
       (CaDiCaL ○ / Splr ✗ / RecordingSolver 全列挙)
 
+- [x] `engine`(Iter10)— **Java 逆統合**: alloy-engine-rs cdylib(ARE1 ワイヤ
+      フォーマット: formula DAG+bounds 直列化、C ABI + JNI)、Java 側
+      RustSerializer/RustEngineProxy/A4Options.engine/CLI `--engine rust`。
+      例題 83 モデルで両エンジン結果 100% 一致(sweep-engines.sh)。
+      非対応: 時制・RelationPredicate・lone/one 量化子(明示拒否)
+
 ## 6. リスク・論点
 
 1. **アトム型**: Java API は Object を許容するが、Alloy 翻訳器の実使用は

@@ -1626,7 +1626,9 @@ public final class A4Solution {
             b = bounds;
 
         Solution sol;
-        if (opt.solver instanceof KKTransformer) {
+        if ("rust".equals(opt.engine)) {
+            sol = doRust(rep);
+        } else if (opt.solver instanceof KKTransformer) {
             sol = doKK(rep, opt);
         } else if (opt.solver instanceof CNFTransformer) {
             sol = doCNF(rep, opt);
@@ -1740,6 +1742,26 @@ public final class A4Solution {
         Solution solve = solver.solve(fgoal, bounds);
         solve.setOutput(tmpCNF);
         return solve;
+    }
+
+    /**
+     * Delegates the whole problem (formula DAG + bounds) to the native Rust
+     * engine (--engine rust, Iter 10 of alloy-sat-rs). Temporal/decomposed
+     * problems are rejected by the serializer with a clear error.
+     */
+    private Solution doRust(final A4Reporter rep) throws Err {
+        if (!RustEngineProxy.isAvailable())
+            throw new ErrorAPI("engine rust: liballoy_engine not found; build it with " +
+                "'cargo build --release -p alloy-engine-rs --features jni' and point " +
+                "-Dalloy.native.lib.alloy_engine=<path> at the .so");
+        final long t0 = System.nanoTime();
+        byte[] problem = RustSerializer.serialize(fgoal, bounds, bitwidth);
+        final long t1 = System.nanoTime();
+        byte[] answer = RustEngineProxy.solve(problem);
+        final long t2 = System.nanoTime();
+        rep.debug("engine rust: problem=" + problem.length + "B answer=" +
+            (answer == null ? -1 : answer.length) + "B\n");
+        return RustSerializer.readAnswer(answer, bounds, t1 - t0, t2 - t1);
     }
 
     private Solution doKK(final A4Reporter rep, final A4Options opt) throws IOException {

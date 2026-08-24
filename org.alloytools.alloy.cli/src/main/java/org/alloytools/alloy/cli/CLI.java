@@ -124,6 +124,9 @@ public class CLI extends Env {
 		@Description("Set the solver to use. You can get a list of solver names with the 'solvers' command. The default solver is SAT4J.")
 		String solver(String solver);
 
+		@Description("Set the solving engine. 'java' (default) runs the regular Java pipeline; 'rust' delegates the whole translation+solve to the native Rust engine (liballoy_engine).")
+		String engine(String engine);
+
 		@Description("Be quiet with progress information")
 		boolean quiet();
 
@@ -159,6 +162,7 @@ public class CLI extends Env {
 			return;
 		}
 		opt.solver = solver.get();
+		opt.engine = options.engine("java");
 
 		String filename = options._arguments().remove(0);
 		File file = IO.getFile(filename);
