@@ -1,0 +1,37 @@
+[package]
+name = "alloy-kodkod-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.alloy-kodkod-rs]
+path = ".."
+
+[[bin]]
+name = "bool_circuit_cnf"
+path = "fuzz_targets/bool_circuit_cnf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "closure_warshall"
+path = "fuzz_targets/closure_warshall.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "intset_ops"
+path = "fuzz_targets/intset_ops.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

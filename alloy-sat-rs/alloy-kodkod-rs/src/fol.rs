@@ -47,6 +47,16 @@ pub enum TranslateError {
     Eval(#[from] crate::eval::EvalError),
     #[error("quantifier domain must be unary or match variable arity")]
     BadDomain,
+    #[error("sat solver error: {0}")]
+    Solver(String),
+    #[error(transparent)]
+    Temporal(#[from] crate::temporal::TemporalError),
+    #[error(transparent)]
+    Skolem(#[from] crate::skolem::SkolemError),
+    #[error(transparent)]
+    Pardinus(#[from] crate::pardinus::PardinusError),
+    #[error("ast error: {0}")]
+    Ast(#[from] crate::ast::AstError),
 }
 
 type Env = Vec<(VarId, Vec<u32>)>;
@@ -208,8 +218,9 @@ impl<'a> FolTranslator<'a> {
                     crate::ast::UnaryExprOp::Transpose => m.transpose()?,
                     crate::ast::UnaryExprOp::Closure => m.closure_transitive()?,
                     crate::ast::UnaryExprOp::ReflexiveClosure => {
+                        let tc = m.closure_transitive()?;
                         let iden = self.leaf_constant(ConstantExpr::Iden)?;
-                        m.or(&iden)?
+                        tc.or(&iden)?
                     }
                 };
                 Ok(Rc::new(out))
@@ -518,18 +529,40 @@ impl<'a> FolTranslator<'a> {
                         got: r.dims().capacity() as u32,
                     });
                 }
+                // Cells absent from BOTH matrices contribute TRUE, so only the
+                // union of present keys needs a term. For sparse relations this
+                // avoids iterating the full (potentially huge) capacity; for
+                // tiny matrices the direct sweep is cheaper than the sort.
+                const UNION_THRESHOLD: usize = 64;
+                let cap = l.dims().capacity();
+                let use_union = cap > UNION_THRESHOLD;
                 let mut acc = const_true();
-                for i in 0..l.dims().capacity() {
-                    let a = l.get(i).unwrap_or(const_false());
-                    let b = r.get(i).unwrap_or(const_false());
-                    let term = match op {
-                        crate::ast::ExprCompOp::Equals => self.ctx.or(&[
-                            self.ctx.and(&[a, b]),
-                            self.ctx.and(&[self.ctx.not(a), self.ctx.not(b)]),
-                        ]),
-                        crate::ast::ExprCompOp::Subset => self.ctx.or(&[self.ctx.not(a), b]),
-                    };
-                    acc = self.ctx.and(&[acc, term]);
+                let term = |a: BoolRef, b: BoolRef| match op {
+                    crate::ast::ExprCompOp::Equals => self.ctx.or(&[
+                        self.ctx.and(&[a, b]),
+                        self.ctx.and(&[self.ctx.not(a), self.ctx.not(b)]),
+                    ]),
+                    crate::ast::ExprCompOp::Subset => self.ctx.or(&[self.ctx.not(a), b]),
+                };
+                if use_union {
+                    let mut keys: Vec<usize> = l
+                        .iter()
+                        .map(|(i, _)| i)
+                        .chain(r.iter().map(|(i, _)| i))
+                        .collect();
+                    keys.sort_unstable();
+                    keys.dedup();
+                    for i in keys {
+                        let a = l.get(i).unwrap_or_else(const_false);
+                        let b = r.get(i).unwrap_or_else(const_false);
+                        acc = self.ctx.and(&[acc, term(a, b)]);
+                    }
+                } else {
+                    for i in 0..cap {
+                        let a = l.get(i).unwrap_or_else(const_false);
+                        let b = r.get(i).unwrap_or_else(const_false);
+                        acc = self.ctx.and(&[acc, term(a, b)]);
+                    }
                 }
                 Ok(acc)
             }

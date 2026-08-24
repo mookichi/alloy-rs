@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["alloy-ipasir", "alloy-kodkod-rs"]
+exclude = ["alloy-kodkod-rs/fuzz"]
 
 [workspace.package]
 version = "0.1.0"

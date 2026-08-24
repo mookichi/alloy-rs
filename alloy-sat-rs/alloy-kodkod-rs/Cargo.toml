@@ -8,9 +8,34 @@ license.workspace = true
 thiserror = "1"
 alloy-ipasir = { path = "../alloy-ipasir", optional = true }
 
+[dev-dependencies]
+criterion = "0.5"
+
 [features]
 ipasir = ["dep:alloy-ipasir"]
 
+[[bench]]
+name = "nqueens"
+harness = false
+required-features = ["ipasir"]
+
+[[bench]]
+name = "heavy"
+harness = false
+required-features = ["ipasir"]
+
 [[example]]
 name = "fol_demo"
+required-features = ["ipasir"]
+
+[[example]]
+name = "solve"
+required-features = ["ipasir"]
+
+[[example]]
+name = "ringt"
+required-features = ["ipasir"]
+
+[[example]]
+name = "decomp"
 required-features = ["ipasir"]

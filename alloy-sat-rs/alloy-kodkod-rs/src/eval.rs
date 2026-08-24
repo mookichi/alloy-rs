@@ -186,7 +186,8 @@ impl<'a> Evaluator<'a> {
                 let b = self.expr_set(arena, right, env)?;
                 Ok(match op {
                     crate::ast::ExprCompOp::Equals => a == b,
-                    crate::ast::ExprCompOp::Subset => a.covers(&b),
+                    // `a in b` (kodkod Subset): every tuple of `a` must appear in `b`
+                    crate::ast::ExprCompOp::Subset => b.covers(&a),
                 })
             }
             crate::ast::FormulaNode::IntComparison { op, left, right } => {
@@ -355,7 +356,7 @@ fn flat_of(ts: &TupleSet, vec: &[u32]) -> Result<Int, EvalError> {
         .ok_or(EvalError::UnboundVariable)
 }
 
-fn union(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
+pub(crate) fn union(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     TupleSet::from_indices(
         a.universe(),
         a.arity(),
@@ -364,7 +365,7 @@ fn union(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     .map_err(|_| EvalError::UnboundVariable)
 }
 
-fn intersection(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
+pub(crate) fn intersection(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     TupleSet::from_indices(
         a.universe(),
         a.arity(),
@@ -373,7 +374,7 @@ fn intersection(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     .map_err(|_| EvalError::UnboundVariable)
 }
 
-fn difference(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
+pub(crate) fn difference(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     TupleSet::from_indices(
         a.universe(),
         a.arity(),
@@ -382,7 +383,7 @@ fn difference(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     .map_err(|_| EvalError::UnboundVariable)
 }
 
-fn transpose(a: &TupleSet) -> Result<TupleSet, EvalError> {
+pub(crate) fn transpose(a: &TupleSet) -> Result<TupleSet, EvalError> {
     let rows = a.universe().size();
     let mut out = IntSet::new();
     for i in a.index_view().iter() {
@@ -392,7 +393,7 @@ fn transpose(a: &TupleSet) -> Result<TupleSet, EvalError> {
     TupleSet::from_indices(a.universe(), 2, out).map_err(|_| EvalError::UnboundVariable)
 }
 
-fn cross(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
+pub(crate) fn cross(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     let bcap = b.capacity().map_err(|_| EvalError::UnboundVariable)? as usize;
     let mut out = IntSet::new();
     for i in a.index_view().iter() {
@@ -404,7 +405,7 @@ fn cross(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
         .map_err(|_| EvalError::UnboundVariable)
 }
 
-fn join(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
+pub(crate) fn join(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     let l = a.universe().size();
     let b_rest = b.capacity().unwrap_or(0) as usize / l;
     let mut out = IntSet::new();
@@ -421,7 +422,7 @@ fn join(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
         .map_err(|_| EvalError::UnboundVariable)
 }
 
-fn override_sets(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
+pub(crate) fn override_sets(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     let rest = a.capacity().unwrap_or(0) as usize / a.universe().size().max(1);
     let b_prefixes: IntSet = b
         .index_view()
@@ -437,7 +438,7 @@ fn override_sets(a: &TupleSet, b: &TupleSet) -> Result<TupleSet, EvalError> {
     TupleSet::from_indices(a.universe(), a.arity(), out).map_err(|_| EvalError::UnboundVariable)
 }
 
-fn closure(a: &TupleSet, reflexive: bool) -> Result<TupleSet, EvalError> {
+pub(crate) fn closure(a: &TupleSet, reflexive: bool) -> Result<TupleSet, EvalError> {
     let n = a.universe().size();
     let mut adj: Vec<IntSet> = (0..n).map(|_| IntSet::new()).collect();
     for i in a.index_view().iter() {

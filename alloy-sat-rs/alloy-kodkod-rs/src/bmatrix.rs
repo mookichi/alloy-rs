@@ -334,8 +334,11 @@ impl BooleanMatrix {
         let n = self.dims.dimension(0).unwrap_or(1) as usize;
         let mut acc = self.clone();
         let mut cur = self.clone();
+        // linear powering: acc = A ∪ A² … ∪ Aⁿ.
+        // Repeated squaring would skip exponents (e.g. A³ on a 3-cycle),
+        // losing the diagonal of cyclic graphs.
         for _ in 1..n {
-            cur = cur.join(&cur)?;
+            cur = cur.join(self)?;
             acc = acc.or(&cur)?;
         }
         Ok(acc)

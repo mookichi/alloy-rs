@@ -452,6 +452,14 @@ impl AstArena {
         self.pool().is_skolem(id)
     }
 
+    pub fn set_variable(&self, id: RelationId, value: bool) {
+        self.pool().set_variable(id, value);
+    }
+
+    pub fn is_variable(&self, id: RelationId) -> bool {
+        self.pool().is_variable(id)
+    }
+
     pub fn variable(&mut self, name: &str) -> VarId {
         self.variable_nary(name, 1)
     }

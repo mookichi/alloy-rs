@@ -72,6 +72,25 @@ impl BoolFactory {
         BoolRef(slot as i32)
     }
 
+    /// Debug helper: structural description of a slot's node.
+    pub fn debug_node(&self, slot: u32) -> String {
+        match slot.checked_sub(1).and_then(|i| self.nodes.get(i as usize)) {
+            None => format!("#{slot}=<oob>"),
+            Some(BoolNode::Var) => format!("v{slot}"),
+            Some(BoolNode::And(ins)) => {
+                let parts: Vec<String> = ins.iter().map(|r| format!("{}", r.0)).collect();
+                format!("{}=AND{}", slot, parts.join(","))
+            }
+            Some(BoolNode::Or(ins)) => {
+                let parts: Vec<String> = ins.iter().map(|r| format!("{}", r.0)).collect();
+                format!("{}=OR{}", slot, parts.join(","))
+            }
+            Some(BoolNode::Ite { c, t, e }) => {
+                format!("{}=ITE({},{},{})", slot, c.0, t.0, e.0)
+            }
+        }
+    }
+
     pub fn num_slots(&self) -> usize {
         self.nodes.len()
     }
@@ -175,6 +194,44 @@ impl BoolFactory {
         }
         kids.sort_unstable();
         kids.dedup();
+        // complementary literals: AND(x, ¬x) = FALSE / OR(x, ¬x) = TRUE
+        for w in kids.windows(2) {
+            if w[0] < 0 && w[1] == -w[0] {
+                return Folded::Const(is_or);
+            }
+        }
+        // absorption: AND(x, OR(x, …)) = x / OR(x, AND(x, …)) = x
+        // Only worth the snapshot when some kid is actually a compound gate.
+        let absorb_kind_is_and = !is_or; // inside an AND we absorb OR-kids
+        let has_compound = kids.iter().any(|&k| {
+            matches!(
+                self.node(BoolRef(k)),
+                Some(BoolNode::Or(_)) | Some(BoolNode::And(_))
+            )
+        });
+        let before = kids.len();
+        if has_compound {
+            let snapshot = kids.clone();
+            kids.retain(|&k| {
+                let dropped = match self.node(BoolRef(k)) {
+                    Some(BoolNode::Or(cs)) if absorb_kind_is_and => {
+                        cs.iter().any(|c| snapshot.contains(&c.0) && c.0 != k)
+                    }
+                    Some(BoolNode::And(cs)) if is_or => cs.iter().any(|c| snapshot.contains(&c.0)),
+                    _ => false,
+                };
+                !dropped
+            });
+        }
+        if kids.len() != before {
+            kids.sort_unstable();
+            kids.dedup();
+            for w in kids.windows(2) {
+                if w[0] < 0 && w[1] == -w[0] {
+                    return Folded::Const(is_or);
+                }
+            }
+        }
         match kids.len() {
             0 => Folded::Const(!is_or),
             1 => Folded::Single(BoolRef(kids[0])),

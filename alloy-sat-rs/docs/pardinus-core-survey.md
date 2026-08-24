@@ -165,6 +165,35 @@ usize は添字とカウンタのみに限定。
       を実装 — 自由関係上の量化で必須(kodkod Translator 同様)。
       4-queens E2E(tests/solution.rs): solve→materialize→Evaluator 再検証
 - [x] engine.fol2sat 翻訳(関係子セット+int+材料化。残: Project、nooverflow)
+- [x] `solver` — Solver ファサード(SolverOptions/Solution)。solve_with で
+      任意 SatSolver 注入、ipasir 便利コンストラクタ
+- [x] 例題スイート(tests/examples_suite.rs + puzzles.rs): queens/pigeonhole/
+      coloring 11 ケース期待表。criterion ベンチ(benches/nqueens, heavy)
+- [x] **バグ修正(Iter6-7で発見)**:
+      closure_transitive の反復平方→線形累乗(循環時の対角欠落)、
+      FolTranslator ReflexiveClosure が推移閉包を欠く、
+      Evaluator Subset 比較の逆方向 — いずれも temporal 検証で顕在化
+- [x] `temporal` — ltl2fol 移植(未来フラグメント): TemporalBoundsExpander
+      (Time アトム追加・r$t 展開・トレース公理)、LTL2FOL 書き換え
+      (PRIME/always/eventually/until/releases + NNF 極性伝播。upTo 忠実移植)、
+      TemporalInstance(LASSO)抽出、TemporalEval 地平線スキャン検証。
+      過去演算子/unrolls>1 は明示拒否(Java の past_depth=1 相当)
+      既知差異: 宇宙への状態アトムは「追加」(Java は前置)— 挿入順は
+      変数番号の決定性に影響するが内部で一貫
+- [x] `skolem` — 静的 Skolem 化: 正極 ∃ を定数/関数証人関係へ置換、
+      upper_bound_expr によるドメイン上限から自動バウンド、関数は全域性制約
+      (`all u⃗ | $sk(u⃗) ⊆ D`)。非対応ドメイン(join of comprehensions 等)は
+      量化子を保持して安全縮退。時制版は temporal.rs 内(HASLab: 時間列付き)
+- [x] `intset` — ハイブリッド Sparse/Dense 自動切替(DENSE_MAX=2^22、
+      密度しきい値で昇格)。語単位 and/or/not 集合演算。
+      BTreeSet オラクル比較プロパティテスト(tests/intset_hybrid.rs)
+- [x] fuzz — cargo-fuzz 3ターゲット(bool_circuit_cnf / closure_warshall /
+      intset_ops)。実行には nightly 必要。詳細は fuzz/ ディレクトリ
+- [x] `pardinus`(Iter8)— PardinusBounds イミュータブルビルダー(部分/
+      targets/weights/記号境界+resolve)、DecompFormulaSlicer 移植、
+      動的2段階(blocking 探索つき・時制は展開宇宙アンカー方式)、
+      静的連結成分分解+マージ。非対応: PARALLEL/amalgamated 自動統合/
+      多段探索の完全版
 
 ## 6. リスク・論点
 

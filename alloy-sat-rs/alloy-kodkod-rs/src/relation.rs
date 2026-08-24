@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RelationId(pub u32);
 
 #[derive(Debug)]
@@ -10,6 +10,7 @@ struct RelationData {
     name: Arc<str>,
     arity: u32,
     skolem: AtomicBool,
+    variable: AtomicBool,
 }
 
 #[derive(Default, Debug)]
@@ -42,6 +43,7 @@ impl RelationPool {
             name: Arc::from(name),
             arity,
             skolem: AtomicBool::new(false),
+            variable: AtomicBool::new(false),
         });
         inner.index.insert(key, id);
         id
@@ -66,6 +68,20 @@ impl RelationPool {
     pub fn is_skolem(&self, id: RelationId) -> bool {
         self.inner.read().unwrap().relations[id.0 as usize]
             .skolem
+            .load(Ordering::Relaxed)
+    }
+
+    /// Marks the relation as *temporal* (variable): its value changes across
+    /// trace states, so the bounds expander gives it a time-extended expansion.
+    pub fn set_variable(&self, id: RelationId, value: bool) {
+        self.inner.read().unwrap().relations[id.0 as usize]
+            .variable
+            .store(value, Ordering::Relaxed);
+    }
+
+    pub fn is_variable(&self, id: RelationId) -> bool {
+        self.inner.read().unwrap().relations[id.0 as usize]
+            .variable
             .load(Ordering::Relaxed)
     }
 }

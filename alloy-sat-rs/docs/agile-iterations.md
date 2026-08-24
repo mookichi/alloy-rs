@@ -63,28 +63,67 @@
   回帰テスト `all_over_free_relation_gates_body_by_membership` 追加。
 - 受け入れ: 解が制約式を満たすことを Evaluator で再検証 ✓
 
-### Iter 6: Solver ファサード + 実例題スイート
-- `Solver{options,bounds,formula}->Solution` API 統合
-- Java 側 69 例題のうち純粋 kodkod 系(csp/sudoku/tptp 小規模)を
-  Rust 統合テスト化(期待 SAT/UNSAT 表)
-- criterion ベンチ導入(NQueens16 等 5 题)
-- デモ: `cargo run --example solve -- queens16`
-- 受け入れ: Java 同一例題との結果一致+性能レポート初版
+### Iter 6: Solver ファサード + 実例題スイート ✅ 完了(2026-08-24、テスト+1、ベンチ導入)
+- `Solver{SolverOptions}::solve(arena,formula,bounds)->Solution` 統合
+  (`src/solver.rs`。SAT モデルは自動 materialize、`solve_with` で任意
+  SatSolver 注入可)。`TranslateError::Solver` 追加
+- 例題スイート `tests/examples_suite.rs`(11 ケース期待表):
+  queens{2,3,4,6} / pigeonhole{3x2,3x3,4x3} / coloring(triangle2/3,
+  path2color, k4e_3color)。ビルダは `tests/puzzles.rs` 共通化
+- criterion ベンチ(`benches/nqueens.rs`: queens8/10, pigeonhole_5x4,
+  coloring_3col + `benches/heavy.rs`: queens16)
+- デモ: `cargo run --release --example solve -- queens16` → SAT、盤面表示
+  (177s、翻訳支配。12-queens 17.5s)
+- **バグ発見(エンコード側)**: join の向き(`~IN.h` ≠ `h.~IN`)と
+  自由関係の upper bound を universe 全体に取ってしまう誤りを例題表で検出。
+  エンジン本体のバグではなく、例題ビルダの修正で解決
+- 受け入れ: 例題表全一致 ✓ 性能レポート初版は `docs/perf-report.md`
 
-### Iter 7: 時制拡張
-- ltl2fol 方式(TemporalBoundsExpander による unroll)から着手
-- ast の時制ノード(PRIME/always/until…)の翻訳、TemporalInstance/LASSO
-- デモ: RingT 系の小型時制例題を解く
-- 受け入れ: unrolls 変更に対する結果安定性テスト
+### Iter 7: 時制拡張 ✅ 完了(2026-08-24、テスト+6)
+- `temporal.rs` 新設: TemporalBoundsExpander 移植(ExplicitUnrolls=true、
+  未来演算子フラグメント)。Time{i}_0 状態アトムを宇宙へ追加、変数関係に
+  時間拡張関係 `r$t`(アリティ+1)を生成、$t_first/$t_last/$t_next/$t_loop
+  補助関係とトレース公理(全単射な next、FIRST.*PREFIX=STATE、LOOP one)を構築
+- ltl2fol 書き換え: PRIME / always / eventually / until / releases を
+  極性(NNF)伝播つきで純 FOL へ変換。upTo 式は Java 版を忠実移植。
+  過去演算子(historically/once/before/since/triggered)と unrolls>1 は明示拒否
+- TemporalInstance(LASSO: states + loop_state)抽出と
+  TemporalEval(地平線 = steps+cycle の有限スキャン)による検証
+- `Solver::solve_temporal()` ファサード統合
+- **既存バグ3件を発見・修正**:
+  1. `bmatrix::closure_transitive` が反復平方で冪を取りこぼす(循環グラフの
+     対角成分欠落)→ 線形累乗に修正
+  2. `FolTranslator` の ReflexiveClosure が推移閉包を計算していなかった
+     (恒等写像との union のみ)→ closure_transitive+iden に修正
+  3. `Evaluator` の Subset 比較が逆方向(a⊇b)→ a⊆b に修正
+- テスト+6: エキスパンダ構造/unrolls拒否/token-ring SAT安定性(steps=4,5,6)/
+  矛盾仕様 UNSAT 安定性(steps=2,3,5)/until のステップ感受性/静的関係複製
+- デモ: `cargo run --release --example ringt -- 4` → SAT ラッソ表示+検証
+  (≈1ms)。steps=3 は UNSAT(4周期のトークンは3状態で閉じない)= ステップ
+  感受性の実証。受け入れテストは steps 変更に対する結果安定性で代用
+  (未来限定のため unrolls は常に 1 = Java の past_depth 挙動と一致)
 
-### Iter 8: 分解ソルバ — PardinusBounds / decomp 【優先度低下・後回し】
-> ユーザ判断(2026-08-24): Java版並列ソルバはほぼ壊れているため移行優先度低。
-> 本体が完成した後に要否を再評価する。
-- PardinusBounds(記号境界・targets/weights・amalgamated/integrated)の
-  builder 再設計(synchronized 状態機械をイミュータブル化)
-- 静的/動的分解(DProblemExecutor)の直列実装(PARALLEL は後日)
-- デモ: HotelP 分解例題の Rust 実行
-- 受け入れ: 分解=非分解で同一インスタンス集合(小規模)
+### Iter 8: 分解ソルバ — PardinusBounds / decomp ✅ 完了(2026-08-24、テスト+2)
+> 本体(Iter1-7+バックログ)完成を受け、ユーザ指示で着手。
+- `pardinus.rs` 新設:
+  - `PardinusBounds`: **イミュータブルビルダー**(部分関係マーク/targets/
+    weights/記号上下限)。`resolve_symbolic(env)` で Instance 環境から
+    記式評価して具体化 — synchronized 状態機械の代替設計
+  - `slice_formula`: DecompFormulaSlicer 移植(トップレベル連言を
+    部分関係集合で 2 分割)
+  - `solve_dynamic`: 動的2段階の直列実行。ステージ1(部分スライス)→
+    **blocking clause による部分モデル探索(上限16回)** → ステージ2
+    (完全式+部分関係固定)。時制問題は `solve_temporal_with(anchors)`
+    経由で展開宇宙のまま固定する
+  - `solve_static_components`: トップレベル連言を共有関係グラフの
+    連結成分へ分解し独立求解・マージ。どれか UNSAT なら全体 UNSAT
+- PARALLEL 実行と amalgamated/integrated の自動統合は対象外(文書化済み)
+- デモ: `cargo run --release --example decomp`
+  - 静的: 鳩巣(SAT成分)+三角形2彩色(UNSAT成分)→ 全体UNSATを
+    UNSAT成分のみで決定(688µs)
+  - 動的: token-ring 2段階 → SAT ラッソ表示+検証(39ms)
+- 受け入れテスト(tests/decomp.rs): 動的パリティ(plain==dynamic)、
+  UNSAT 伝播、静的成分の独立判定 ✓
 
 ### Iter 9: UNSAT コア / prover 機能
 - alloy-ipasir へ failed assumptions(CaDiCaL `failed()`)露出を追加
@@ -101,11 +140,23 @@
 - 受け入れ: 全数テスト(69 例題)の Rust エンジン走査レポート
 
 ## バックログ(未確定・優先度順)
-1. Simplifier/最適化パス(unit propagation 補強、部分式共有強化)
-2. Skolem 化(HASLab 拡張含む)
-3. PARALLEL 分解モデル(スレッドプール)
-4. cargo-fuzz による cnf/bool 層の堅牢化
-5. IntSet bitset 実装差し替え(criterion 計測後)
+1. ~~Simplifier/最適化パス~~ ✅ 完了(2026-08-24): Comparison を疎キー
+   ユニオンで生成(容量全走査を撤去)、BoolFactory fold に補文リテラル
+   打ち切り+吸收則を追加。queens10 -81% / queens16 -86%
+2. ~~Skolem 化(HASLab 拡張含む)~~ ✅ 完了(2026-08-24): `skolem.rs`
+   (静的: 定数/関数証人、上限境界からの自動バウンド、全域性制約)+
+   temporal 拡張(時間列付き証人関係、`all s:STATE | sk⋈s⊆D@s` 制約)。
+   `SolverOptions::skolemize`(既定 OFF)。等充足性の注意書きは
+   モジュールドキュメント参照
+3. PARALLEL 分解モデル(スレッドプール)— Iter 8 再評価待ち
+4. ~~cargo-fuzz による cnf/bool 層の堅牢化~~ ✅ セットアップ完了
+   (2026-08-24): `alloy-kodkod-rs/fuzz/` に 3 ターゲット
+   (bool_circuit_cnf / closure_warshall / intset_ops)。実行:
+   `cd alloy-kodkod-rs && cargo +nightly fuzz run -O --fuzz-dir fuzz <target>`
+   ※ nightly toolchain 必須。初回実行で CNF 検証ハーネスの過剰制約を検出・修正済み
+5. ~~IntSet bitset 実装差し替え~~ ✅ 完了(2026-08-24): ハイブリッド
+   Sparse(sorted Vec)/Dense(bitset) 自動切替。密な積境界で語単位集合演算。
+   ベンチ回帰なし(pigeonhole 微改善)、BTreeSet オラクル比較テスト追加
 
 ## リスク登録
 | リスク | 影響 | 対策 |
