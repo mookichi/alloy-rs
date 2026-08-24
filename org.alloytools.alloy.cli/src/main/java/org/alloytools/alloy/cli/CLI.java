@@ -127,6 +127,9 @@ public class CLI extends Env {
 		@Description("Set the solving engine. 'java' (default) runs the regular Java pipeline; 'rust' delegates the whole translation+solve to the native Rust engine (liballoy_engine).")
 		String engine(String engine);
 
+		@Description("Decomposition strategy for the 'rust' engine: off (default), hybrid (two-stage dynamic decomposition) or parallel (static components on a worker pool).")
+		String decompose(String decompose);
+
 		@Description("Be quiet with progress information")
 		boolean quiet();
 
@@ -163,6 +166,28 @@ public class CLI extends Env {
 		}
 		opt.solver = solver.get();
 		opt.engine = options.engine("java");
+		String decompose = options.decompose("off");
+		switch (decompose) {
+			case "off":
+				break;
+			case "hybrid":
+				if (!"rust".equals(opt.engine)) {
+					error("--decompose hybrid currently requires --engine rust");
+					return;
+				}
+				opt.decompose_mode = 1;
+				break;
+			case "parallel":
+				if (!"rust".equals(opt.engine)) {
+					error("--decompose parallel currently requires --engine rust");
+					return;
+				}
+				opt.decompose_mode = 2;
+				break;
+			default:
+				error("Unknown decomposition strategy %s (expected off, hybrid or parallel)", decompose);
+				return;
+		}
 
 		String filename = options._arguments().remove(0);
 		File file = IO.getFile(filename);

@@ -155,8 +155,9 @@ usize は添字とカウンタのみに限定。
 - [x] ハッシュ方針: 名前キー(Universe/インターナ)のみ std SipHash。
       数値ID(RelationId等)は全て Vec 直接索引。ゲートキャッシュ
       (GateKey)のみ現状 SipHash — 必要時は依存ゼロのFxHash風実装へ
-- [ ] ast(アリーナ化)
-- [ ] PardinusBounds(記号境界・分解)
+- [x] ast(アリーナ化)— AstArena で実装済み(変数/式/整数/論理式/宣言を
+      フラット Vec+整数 ID で管理、RelationPool は Arc 共有)
+- [x] PardinusBounds(記号境界・分解)(Iter11、上記 engine の項参照)
 - [x] `eval` — Evaluator: Instance 上の AST 再評価(集合演算・量化子・
       comprehension・closure(Warshall)・cardinality/sum/int 演算)
 - [x] `fol` 材料化 — VarOrigin(slot→relation→tuple_index)追跡 +
@@ -213,6 +214,10 @@ usize は添字とカウンタのみに限定。
       RustSerializer/RustEngineProxy/A4Options.engine/CLI `--engine rust`。
       例題 83 モデルで両エンジン結果 100% 一致(sweep-engines.sh)。
       非対応: 時制・RelationPredicate・lone/one 量化子(明示拒否)
+- [x] PardinusBounds(記号境界・分解)(Iter11)— ARE2: options+
+      partials+記号境界 trailer。Java 側の式境界を Evaluator で実体化、
+      dynamic 2段階分解(stage-1 投影→resolve_symbolic→stage-2)を
+      JNI 経由で有効化(`--decompose hybrid`)。静的/並列分解も接続
 
 ## 6. リスク・論点
 

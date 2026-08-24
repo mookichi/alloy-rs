@@ -187,6 +187,16 @@ cargo test -p alloy-kodkod-rs --features ipasir   # +2 tests(fuzz 30 cases)
 - 受け入れ: extra/models 全83例題を両エンジン走査 → **結果100%一致**
   (`scripts/sweep-engines.sh`、結果は docs/engine-sweep-results.txt)
 
+### Iter 11 完了: Wire v2 — 分解とオプションの JNI 有効化
+- **ARE2**: solver options(skolemize / decompose mode / threads)+
+  dynamic 用 trailer(partial 関係 + 記号境界)
+- Java `RustSerializer` が PardinusBounds の**式境界を実体化**(Evaluator
+  固定点評価)。IMPLIES/IFF は脱糖して対応
+- Rust `solve_dynamic` が記号境界を stage-1 モデルから解決し stage-2 へ適用
+  (Pardinus「stage 2 consumes stage 1」)
+- CLI: `exec --engine rust --decompose hybrid|parallel`
+- 受け入れ: ring.als 全モード SAT 一致、83 例題パリティ維持
+
 ```bash
 cargo build --release -p alloy-engine-rs --features jni   # liballoy_engine.so
 JAVA_HOME=~/.sdkman/candidates/java/25-amzn ./gradlew :org.alloytools.alloy.dist:build -x test

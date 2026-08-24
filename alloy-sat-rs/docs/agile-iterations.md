@@ -188,6 +188,29 @@
 - 既知の v0 制限: UNSATコア/proof 連携なし(Solution.unsatisfiable(stats,null))、
   skolemDepth は Rust 側設定に未接続、時制コマンドは明示拒否
 
+### Iter 11: Wire v2 — SolverOptions + 動的分解の JNI 有効化 ✅ 完了(2026-08-25、テスト+2)
+- **ARE2** フォーマット: ヘッダに options byte(skolemize bit + decompose
+  mode 2bit)+ max_threads、dynamic 時は末尾に stage-1 partial 関係マーク +
+  記号境界エントリ(関係, side, expr node id)。ARE1 も引続きデコード可。
+- Java `RustSerializer`: A4Options(skolemDepth / decompose_mode /
+  decompose_threads)を伝播。**記号境界の実体化(materialize)**を実装 —
+  Alloy は sig/フィールド境界を式で格納するため、Evaluator で固定点まで
+  評価し具象タプル集合へ変換してから書き出す。IMPLIES/IFF は脱糖
+  (!l∨r、(!l∨r)∧(!r∨l))して対応。BinaryFormula のみならず NaryFormula
+  の整順も修正(ノード数は子の後に確定するためサイドバッファ方式)
+- Rust `solve_problem_inner`: Decompose::Static/Parallel/Dynamic を
+  facade(solve_decomposed / _parallel / solve_dynamic)へ接続。
+  dynamic は ARE2 trailer から PardinusBounds を構築し、stage-1 インスタンス
+  を投影(universe 再エンコード+時間列除去)した上で `resolve_symbolic` し
+  stage-2 境界へ適用 — Pardinus「stage 2 consumes stage 1」を実装
+- CLI `exec --decompose off|hybrid|parallel`(rust エンジン専用)、
+  A4Options.dup() が engine をコピーしていなかったバグを修正
+- 受け入れ: ring.als が rust/hybrid・parallel・plain の全モードで SAT
+  (Java と一致)。skolem テスト(depth 3)SAT 一致。例題 83 モデル再走査で
+  引続き結果 100% 一致
+- 既知の v0 制限: 記式境界の wire 直送(実体化せず Rust 側評価)は未対応、
+  temporal コマンドは引続き明示拒否
+
 ## バックログ(未確定・優先度順)
 1. ~~Simplifier/最適化パス~~ ✅ 完了(2026-08-24): Comparison を疎キー
    ユニオンで生成(容量全走査を撤去)、BoolFactory fold に補文リテラル

@@ -42,25 +42,29 @@ import kodkod.ast.operator.IntCompOperator;
 import kodkod.ast.operator.IntOperator;
 import kodkod.ast.operator.Multiplicity;
 import kodkod.ast.operator.Quantifier;
+import kodkod.engine.Evaluator;
+import kodkod.engine.config.Options;
 import kodkod.engine.Solution;
 import kodkod.engine.Statistics;
 import kodkod.instance.Bounds;
 import kodkod.instance.Instance;
+import kodkod.instance.PardinusBounds;
 import kodkod.instance.Tuple;
 import kodkod.instance.TupleSet;
 import kodkod.instance.Universe;
 import edu.mit.csail.sdg.alloy4.ErrorAPI;
 
 /**
- * Serializes a kodkod problem (formula + bounds) into the "ARE1" wire format
+ * Serializes a kodkod problem (formula + bounds) into the "ARE2" wire format
  * consumed by liballoy_engine, and decodes the engine's answers back into
  * {@link Solution}s.
  *
- * Wire format v1 (see alloy-sat-rs/alloy-engine-rs/src/lib.rs for the Rust
+ * Wire format v2 (see alloy-sat-rs/alloy-engine-rs/src/lib.rs for the Rust
  * side):
  *
  * <pre>
- * problem := "ARE1" bitwidth:u8 atoms rels vars nodes root:u32var
+ * problem := "ARE2" bitwidth:u8 opts:u8 threads:var atoms rels vars nodes root:u32var
+ *            [partials: var rel-idx* symbounds: var]        // dynamic mode only
  *   atoms  := n:var (len:u16le utf8)*
  *   rels   := n:var (len:u16 utf8 arity:u8 loTs upTs)*   // request order
  *   vars   := n:var (len:u16 utf8 arity:u8)*             // VarId = index
@@ -78,20 +82,60 @@ public final class RustSerializer {
     // ======================================================================
 
     /**
-     * Serializes the goal formula and bounds into an ARE1 problem buffer.
+     * Serializes the goal formula and bounds into an ARE2 problem buffer.
      *
+     * @param skolemDepth Java A4Options.skolemDepth (&gt;0 enables Skolem
+     *            witnesses in the Rust engine)
+     * @param decomposeMode Java A4Options.decompose_mode (0=Off 1=Hybrid
+     *            2=Parallel); Hybrid maps to the Rust two-stage dynamic
+     *            decomposition whose stage-1 relations are all variable
+     *            relations of these bounds
+     * @param decomposeThreads worker cap for the parallel mode
      * @throws ErrorAPI if the formula/bounds use constructs the Rust engine
      *             does not support yet (temporal operators, iff/implies,
      *             lone/no/one quantifiers, exotic int operators, ...)
      */
-    public static byte[] serialize(Formula goal, Bounds bounds, int bitwidth) throws ErrorAPI {
-        Ctx ctx = new Ctx(bounds);
+    public static byte[] serialize(Formula goal, Bounds bounds, int bitwidth,
+            int skolemDepth, int decomposeMode, int decomposeThreads) throws ErrorAPI {
         if (bitwidth < 1 || bitwidth > 30)
             throw new ErrorAPI("engine rust: bitwidth " + bitwidth + " out of range 1..=30");
+
+        // Alloy stores sig/field bounds as EXPRESSIONS (PardinusBounds);
+        // evaluate them into concrete tuple sets before serializing.
+        Map<Relation,TupleSet> los = new LinkedHashMap<>(), ups = new LinkedHashMap<>();
+        materialize(bounds, los, ups);
+
+        Ctx ctx = new Ctx(bounds);
         collectFormula(goal, ctx);
+
+        // Map Java decomposition modes onto the wire codes.
+        int wireMode;
+        List<Relation> partials = new ArrayList<>();
+        switch (decomposeMode) {
+            case 1: { // Hybrid -> dynamic two-stage over the variable relations
+                wireMode = 3;
+                for (Relation r : ctx.relOrder) {
+                    TupleSet lo = los.get(r), up = ups.get(r);
+                    // a relation is variable unless lower==upper
+                    if (!(lo != null && lo.equals(up)))
+                        partials.add(r);
+                }
+                if (partials.isEmpty())
+                    wireMode = 0; // nothing sliceable: plain pipeline
+                break;
+            }
+            case 2:
+                wireMode = 2; // Parallel -> static components on a worker pool
+                break;
+            default:
+                wireMode = 1; // Static serial (unused by the CLI today)
+        }
+
         W w = new W();
-        w.raw("ARE1");
+        w.raw("ARE2");
         w.u8(bitwidth);
+        w.u8(((skolemDepth > 0 ? 1 : 0) | (wireMode << 1)) & 0xff);
+        w.var(Math.max(decomposeThreads, 1));
 
         Universe uni = bounds.universe();
         w.var(uni.size());
@@ -101,11 +145,10 @@ public final class RustSerializer {
         List<Relation> relOrder = ctx.relOrder;
         w.var(relOrder.size());
         for (Relation r : relOrder) {
-            TupleSet lo = bounds.lowerBound(r), up = bounds.upperBound(r);
             w.str16(r.name());
             w.u8(r.arity());
-            writeTupleset(w, lo);
-            writeTupleset(w, up);
+            writeTupleset(w, los.get(r)); // missing -> empty tupleset
+            writeTupleset(w, ups.get(r));
         }
 
         w.var(ctx.vars.size());
@@ -114,10 +157,94 @@ public final class RustSerializer {
             w.u8(v.arity());
         }
 
-        int root = emitFormula(goal, ctx, w);
-        w.var(ctx.count); // number of nodes emitted
+        // Node DAG: emitted into a side buffer because the total count is
+        // only known afterwards; the wire carries the count FIRST.
+        W nw = new W();
+        int root = emitFormula(goal, ctx, nw);
+        w.var(ctx.count);
+        w.out.writeBytes(nw.toBytes());
         w.var(root);
+
+        if (wireMode == 3) {
+            // Trailer: stage-1 relation marks. Symbolic bounds are supported
+            // by the wire format but not produced by this serializer yet.
+            w.var(partials.size());
+            for (Relation r : partials)
+                w.var(ctx.relIdx.get(r));
+            w.var(0);
+        }
         return w.toBytes();
+    }
+
+    /**
+     * Evaluates every symbolic bound of a {@link PardinusBounds} against an
+     * environment seeded with the concrete bounds until a fixed point is
+     * reached, so that {@code los}/{@code ups} hold concrete tuple sets for
+     * every relation. Plain {@link Bounds} pass through unchanged.
+     */
+    private static void materialize(Bounds bounds, Map<Relation,TupleSet> los,
+            Map<Relation,TupleSet> ups) throws ErrorAPI {
+        Universe uni = bounds.universe();
+        Instance env = new Instance(uni);
+        Map<Relation,Expression> symLo, symUp;
+        if (bounds instanceof PardinusBounds) {
+            PardinusBounds pb = (PardinusBounds) bounds;
+            symLo = pb.lowerSymbBounds();
+            symUp = pb.upperSymbBounds();
+        } else {
+            symLo = java.util.Collections.emptyMap();
+            symUp = java.util.Collections.emptyMap();
+        }
+        for (Relation r : bounds.relations()) {
+            TupleSet lo = bounds.lowerBound(r), up = bounds.upperBound(r);
+            if (!symLo.containsKey(r))
+                los.put(r, lo); // may be null until evaluated
+            if (!symUp.containsKey(r))
+                ups.put(r, up);
+            if (up != null)
+                env.add(r, up);
+            else if (lo != null)
+                env.add(r, lo);
+        }
+        Evaluator ev = new Evaluator(env, new Options());
+        boolean progress = true;
+        while (progress && !(symLo.isEmpty() && symUp.isEmpty())) {
+            progress = false;
+            for (Map.Entry<Relation,Expression> en : symUp.entrySet()) {
+                Relation r = en.getKey();
+                if (ups.get(r) != null)
+                    continue;
+                TupleSet ts = tryEval(ev, en.getValue());
+                if (ts != null) {
+                    ups.put(r, ts);
+                    env.add(r, ts); // resolved values feed later evaluations
+                    progress = true;
+                }
+            }
+            for (Map.Entry<Relation,Expression> en : symLo.entrySet()) {
+                Relation r = en.getKey();
+                if (los.get(r) != null)
+                    continue;
+                TupleSet ts = tryEval(ev, en.getValue());
+                if (ts != null) {
+                    los.put(r, ts);
+                    progress = true;
+                }
+            }
+        }
+        for (Relation r : bounds.relations())
+            if (ups.get(r) == null)
+                throw new ErrorAPI("engine rust: cannot materialize bound for relation "
+                        + r.name() + " (unresolved dependencies)");
+    }
+
+    /** Evaluates one expression, returning null instead of throwing. */
+    private static TupleSet tryEval(Evaluator ev, Expression e) {
+        try {
+            return ev.evaluate(e);
+        } catch (RuntimeException | LinkageError ex) {
+            return null;
+        }
     }
 
     /** Shared per-serialization state. */
@@ -247,8 +374,7 @@ public final class RustSerializer {
     }
 
     private static void require(FormulaOperator op) throws ErrorAPI {
-        if (op != FormulaOperator.AND && op != FormulaOperator.OR)
-            throw unsupported(op.toString() + " formula");
+        // AND/OR map to wire nary ops; IMPLIES/IFF are desugared at emission.
     }
 
     private static void require(IntOperator op) throws ErrorAPI {
@@ -269,26 +395,68 @@ public final class RustSerializer {
         int id;
         if (f instanceof ConstantFormula) {
             id = ctx.count++;
-            w.var(id);
             w.var(0L);
             w.u8((byte) (((ConstantFormula) f).booleanValue() ? 1 : 0));
         } else if (f instanceof NotFormula) {
             int c = emitFormula(((NotFormula) f).formula(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(1L);
             w.var(c);
         } else if (f instanceof BinaryFormula) {
             BinaryFormula b = (BinaryFormula) f;
-            require(b.op());
             int l = emitFormula(b.left(), ctx, w), r = emitFormula(b.right(), ctx, w);
-            id = ctx.count++;
-            w.var(id);
-            w.var(2L);
-            w.u8((byte) (b.op() == FormulaOperator.AND ? 0 : 1));
-            w.var(2);
-            w.var(l);
-            w.var(r);
+            switch (b.op()) {
+                case AND:
+                case OR:
+                    id = ctx.count++;
+                    w.var(2L);
+                    w.u8((byte) (b.op() == FormulaOperator.AND ? 0 : 1));
+                    w.var(2);
+                    w.var(l);
+                    w.var(r);
+                    break;
+                case IMPLIES: { // !l || r
+                    int nl = ctx.count++;
+                    w.var(1L); // Not
+                    w.var(l);
+                    id = ctx.count++;
+                    w.var(2L); // OR
+                    w.u8((byte) 1);
+                    w.var(2);
+                    w.var(nl);
+                    w.var(r);
+                    break;
+                }
+                case IFF: { // (!l || r) && (!r || l)
+                    int nl = ctx.count++;
+                    w.var(1L);
+                    w.var(l);
+                    int nr = ctx.count++;
+                    w.var(1L);
+                    w.var(r);
+                    int imp1 = ctx.count++;
+                    w.var(2L);
+                    w.u8((byte) 1);
+                    w.var(2);
+                    w.var(nl);
+                    w.var(r);
+                    int imp2 = ctx.count++;
+                    w.var(2L);
+                    w.u8((byte) 1);
+                    w.var(2);
+                    w.var(nr);
+                    w.var(l);
+                    id = ctx.count++;
+                    w.var(2L);
+                    w.u8((byte) 0); // AND of both implications
+                    w.var(2);
+                    w.var(imp1);
+                    w.var(imp2);
+                    break;
+                }
+                default:
+                    throw unsupported(b.op() + " formula");
+            }
         } else if (f instanceof NaryFormula) {
             NaryFormula n = (NaryFormula) f;
             require(n.op());
@@ -296,7 +464,6 @@ public final class RustSerializer {
             for (int i = 0; i < kids.length; i++)
                 kids[i] = emitFormula(n.child(i), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(2L);
             w.u8((byte) (n.op() == FormulaOperator.AND ? 0 : 1));
             w.var(kids.length);
@@ -309,7 +476,6 @@ public final class RustSerializer {
                 throw unsupported("comparison operator " + c.op());
             int l = emitExpr(c.left(), ctx, w), r = emitExpr(c.right(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(3L);
             w.u8((byte) (eq ? 1 : 0));
             w.var(l);
@@ -318,7 +484,6 @@ public final class RustSerializer {
             IntComparisonFormula c = (IntComparisonFormula) f;
             int l = emitInt(c.left(), ctx, w), r = emitInt(c.right(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(4L);
             w.u8((byte) c.op().ordinal()); // EQ NEQ LT LTE GT GTE
             w.var(l);
@@ -329,7 +494,6 @@ public final class RustSerializer {
                 throw unsupported(q.quantifier() + " quantifier");
             int d = emitDecls(q.decls(), ctx, w), b = emitFormula(q.formula(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(5L);
             w.u8((byte) (q.quantifier() == Quantifier.ALL ? 0 : 1));
             w.var(d);
@@ -341,7 +505,6 @@ public final class RustSerializer {
                 throw unsupported("no-expression formula");
             int e = emitExpr(mf.expression(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(6L);
             w.u8((byte) (mult == Multiplicity.SOME ? 0 : mult == Multiplicity.LONE ? 1 : 2));
             w.var(e);
@@ -362,19 +525,16 @@ public final class RustSerializer {
             if (ri == null)
                 throw unsupported("unbounded relation " + ((Relation) e).name());
             id = ctx.count++;
-            w.var(id);
             w.var(32L);
             w.var(ri);
         } else if (e instanceof Variable) {
             id = ctx.count++;
-            w.var(id);
             w.var(33L);
             w.var(ctx.vars.get(e));
         } else if (e == Expression.UNIV || e == Expression.IDEN || e == Expression.NONE
                 || e == Expression.INTS) {
             int code = e == Expression.UNIV ? 0 : e == Expression.IDEN ? 1 : e == Expression.NONE ? 2 : 3;
             id = ctx.count++;
-            w.var(id);
             w.var(34L);
             w.u8((byte) code);
         } else if (e instanceof UnaryExpression) {
@@ -395,7 +555,6 @@ public final class RustSerializer {
             }
             int c = emitExpr(u.expression(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(35L);
             w.u8((byte) op);
             w.var(c);
@@ -421,7 +580,6 @@ public final class RustSerializer {
             for (int i = 0; i < ks.length; i++)
                 ks[i] = emitExpr(kids[i], ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(36L);
             w.u8((byte) exprOpCode(op)); // UNION..JOIN, explicit (enum order differs)
             w.var(ks.length);
@@ -433,7 +591,6 @@ public final class RustSerializer {
             int t = emitExpr(x.thenExpr(), ctx, w);
             int el = emitExpr(x.elseExpr(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(37L);
             w.var(c);
             w.var(t);
@@ -445,7 +602,6 @@ public final class RustSerializer {
             for (java.util.Iterator<IntExpression> it = p.columns(); it.hasNext();)
                 cols.add(emitInt(it.next(), ctx, w));
             id = ctx.count++;
-            w.var(id);
             w.var(38L);
             w.var(src);
             w.var(cols.size());
@@ -455,14 +611,12 @@ public final class RustSerializer {
             Comprehension c = (Comprehension) e;
             int d = emitDecls(c.decls(), ctx, w), b = emitFormula(c.formula(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(39L);
             w.var(d);
             w.var(b);
         } else if (e instanceof IntToExprCast) {
             int c = emitInt(((IntToExprCast) e).intExpr(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(40L);
             w.var(c);
         } else {
@@ -479,7 +633,6 @@ public final class RustSerializer {
         int id;
         if (x instanceof IntConstant) {
             id = ctx.count++;
-            w.var(id);
             w.var(64L);
             w.svar(((IntConstant) x).value());
         } else if (x instanceof ExprToIntCast) {
@@ -487,7 +640,6 @@ public final class RustSerializer {
             boolean sum = c.op() == ExprCastOperator.SUM;
             int e = emitExpr(c.expression(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(65L);
             w.u8((byte) (sum ? 1 : 0)); // CARDINALITY | SUM
             w.var(e);
@@ -496,7 +648,6 @@ public final class RustSerializer {
             require(b.op());
             int l = emitInt(b.left(), ctx, w), r = emitInt(b.right(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(66L);
             w.u8((byte) intOpCode(b.op()));
             w.var(l);
@@ -507,7 +658,6 @@ public final class RustSerializer {
             int t = emitInt(y.thenExpr(), ctx, w);
             int el = emitInt(y.elseExpr(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(67L);
             w.var(c);
             w.var(t);
@@ -516,7 +666,6 @@ public final class RustSerializer {
             SumExpression s = (SumExpression) x;
             int d = emitDecls(s.decls(), ctx, w), b = emitInt(s.intExpr(), ctx, w);
             id = ctx.count++;
-            w.var(id);
             w.var(68L);
             w.var(d);
             w.var(b);
@@ -598,7 +747,6 @@ public final class RustSerializer {
             entries.add(new int[] { code, vi, e });
         }
         int id = ctx.count++;
-        w.var(id);
         w.var(96L);
         w.var(entries.size());
         for (int[] en : entries) {
@@ -611,6 +759,10 @@ public final class RustSerializer {
     }
 
     private static void writeTupleset(W w, TupleSet ts) {
+        if (ts == null) {
+            w.var(0);
+            return;
+        }
         w.var(ts.size());
         for (Tuple t : ts) {
             long dense = 0;

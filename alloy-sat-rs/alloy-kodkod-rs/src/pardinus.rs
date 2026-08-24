@@ -18,6 +18,7 @@
 //! exploration/backtracking).
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::ast::{AstArena, ExprId, FormulaBinOp, FormulaId, IntId};
 use crate::bounds::Bounds;
@@ -25,6 +26,7 @@ use crate::eval::Evaluator;
 use crate::instance::Instance;
 use crate::relation::RelationId;
 use crate::tupleset::TupleSet;
+use crate::universe::Universe;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PardinusError {
@@ -310,6 +312,32 @@ fn restrict_to_partials(base: &Bounds, partials: &BTreeSet<RelationId>) -> Bound
     out
 }
 
+/// Drops the trailing state column from a temporal expansion tupleset
+/// (steps = 1) and re-encodes the value coordinates into `out_uni`.
+fn strip_state_column(ts: &TupleSet, out_uni: &Arc<Universe>) -> TupleSet {
+    let src_width = ts.universe().size() as i64;
+    let dst_width = out_uni.size() as i64;
+    let a = ts.arity() as usize;
+    if a < 2 {
+        return ts.clone();
+    }
+    let mut out = TupleSet::new(out_uni, (a - 1) as u32).expect("stripped arity is valid");
+    for idx in ts.index_view().iter() {
+        let mut rest = idx;
+        let mut coords = vec![0i64; a];
+        for c in (0..a).rev() {
+            coords[c] = rest % src_width;
+            rest /= src_width;
+        }
+        let mut val = 0i64;
+        for &c in &coords[..a - 1] {
+            val = val * dst_width + c;
+        }
+        out.insert_index(val);
+    }
+    out
+}
+
 /// Two-stage dynamic decomposition:
 ///
 /// 1. slice the formula into (partial-only, rest);
@@ -396,10 +424,46 @@ pub fn solve_dynamic(
         }
 
         // ---- stage 2: full formula anchored to this stage-1 model ----
+        // If the problem carries symbolic bounds (Iter 11), they are
+        // evaluated against a projection of the stage-1 model (original
+        // relation ids + concrete base values) and replace the base entries
+        // for stage 2 — Pardinus "stage 2 consumes stage-1 results".
+        let resolved;
+        let stage2_bounds: &Bounds = if !pb.symb_lower.is_empty() || !pb.symb_upper.is_empty() {
+            let mut proj = Instance::new(pb.base().universe(), inst1.pool());
+            let mut all_rels: BTreeSet<RelationId> = pb.base().relations().collect();
+            for &orig in probe.mapping.keys() {
+                all_rels.insert(orig);
+            }
+            for r in all_rels {
+                // Expanded relations carry an extra trailing state column
+                // (steps=1): project it away and re-encode into the
+                // original universe so symbolic-bound evaluation sees
+                // plain FOL relations.
+                let ts = match inst1.tuples(r) {
+                    Some(ts) => Some(strip_state_column(ts, pb.base().universe())),
+                    None => probe
+                        .mapping
+                        .get(&r)
+                        .and_then(|&e| inst1.tuples(e))
+                        .map(|ts| strip_state_column(ts, pb.base().universe())),
+                };
+                let ts = ts.or_else(|| pb.base().lower_bound(r).cloned());
+                if let Some(ts) = ts {
+                    proj.add(r, &ts).map_err(PardinusError::from)?;
+                }
+            }
+            resolved = pb
+                .resolve_symbolic(arena, &proj)
+                .map_err(crate::fol::TranslateError::Pardinus)?;
+            &resolved
+        } else {
+            pb.base()
+        };
         let final_sol = solver.solve_temporal_with(
             arena,
             formula,
-            pb.base(),
+            stage2_bounds,
             steps,
             skolemize,
             &anchors,

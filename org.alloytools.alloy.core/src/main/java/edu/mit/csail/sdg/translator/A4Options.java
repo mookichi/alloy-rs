@@ -167,6 +167,7 @@ public final class A4Options implements Serializable {
         x.originalFilename = originalFilename;
         x.recordKodkod = recordKodkod;
         x.noOverflow = noOverflow;
+        x.engine = engine;
         x.coreGranularity = coreGranularity;
         x.decompose_mode = decompose_mode;
         x.decompose_threads = decompose_threads;

@@ -1755,7 +1755,16 @@ public final class A4Solution {
                 "'cargo build --release -p alloy-engine-rs --features jni' and point " +
                 "-Dalloy.native.lib.alloy_engine=<path> at the .so");
         final long t0 = System.nanoTime();
-        byte[] problem = RustSerializer.serialize(fgoal, bounds, bitwidth);
+        byte[] problem = RustSerializer.serialize(fgoal, bounds, bitwidth,
+            opt.skolemDepth, opt.decompose_mode, opt.decompose_threads);
+        if (System.getProperty("alloy.rust.dump") != null) {
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(
+                    System.getProperty("alloy.rust.dump"))) {
+                fos.write(problem);
+            } catch (java.io.IOException e) {
+                throw new ErrorFatal("dump failed", e);
+            }
+        }
         final long t1 = System.nanoTime();
         byte[] answer = RustEngineProxy.solve(problem);
         final long t2 = System.nanoTime();

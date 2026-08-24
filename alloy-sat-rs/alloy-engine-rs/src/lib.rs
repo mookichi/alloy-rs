@@ -83,9 +83,51 @@ unsafe fn to_length_prefixed(payload: Vec<u8>) -> *mut u8 {
 }
 
 pub const PROBLEM_MAGIC: &[u8; 4] = b"ARE1";
+/// v2: adds a solver-options byte (+threads) and, for dynamic
+/// decomposition, partial-relation marks + symbolic bound entries.
+pub const PROBLEM_MAGIC_V2: &[u8; 4] = b"ARE2";
 pub const ANSWER_SAT: &[u8; 4] = b"ASAT";
 pub const ANSWER_UNSAT: &[u8; 4] = b"AUNS";
 pub const ANSWER_ERR: &[u8; 4] = b"AERR";
+
+/// Decomposition mode carried by ARE2 options (bits 1..2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decompose {
+    None,
+    Static,
+    Parallel,
+    Dynamic,
+}
+
+impl Decompose {
+    fn from_u8(v: u8) -> Result<Decompose, String> {
+        match v {
+            0 => Ok(Decompose::None),
+            1 => Ok(Decompose::Static),
+            2 => Ok(Decompose::Parallel),
+            3 => Ok(Decompose::Dynamic),
+            x => Err(format!("unknown decompose mode {x}")),
+        }
+    }
+}
+
+/// Solver options transported by ARE2 (Java A4Options mirror).
+#[derive(Clone, Copy, Debug)]
+pub struct WireOptions {
+    pub skolemize: bool,
+    pub decompose: Decompose,
+    pub max_threads: usize,
+}
+
+impl Default for WireOptions {
+    fn default() -> Self {
+        WireOptions {
+            skolemize: false,
+            decompose: Decompose::None,
+            max_threads: 1,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Minimal cursor codec (no external deps)
@@ -191,21 +233,43 @@ pub struct Problem {
     pub formula: FormulaId,
     pub relation_names: Vec<String>,
     pub relation_ids: Vec<alloy_kodkod_rs::RelationId>,
+    /// ARE2 options (defaults for ARE1 inputs).
+    pub options: WireOptions,
+    /// Dynamic decomposition: stage-1 relations (indices into
+    /// `relation_ids`).
+    pub partials: Vec<u32>,
+    /// Dynamic decomposition: symbolic bounds as
+    /// `(relation index, is_upper, expr node id)`. Node ids refer to the
+    /// decoded DAG positions.
+    pub symbounds: Vec<(u32, bool, u32)>,
+    /// Node position -> arena [`alloy_kodkod_rs::ast::ExprId`] for every
+    /// expression node of the DAG (used to resolve symbolic bounds).
+    pub expr_by_node: std::collections::HashMap<u32, alloy_kodkod_rs::ast::ExprId>,
 }
 
 fn op_err(tag: &'static str, got: u8) -> String {
     format!("unsupported {tag} operator code {got}")
 }
 
-/// Decode a wire-format problem buffer.
+/// Decode a wire-format problem buffer (ARE1 or ARE2).
 pub fn decode_problem(input: &[u8]) -> Result<Problem, String> {
     let mut r = Reader::new(input);
-    if r.bytes(4)? != PROBLEM_MAGIC {
-        return Err("bad magic (expected ARE1)".into());
-    }
+    let magic_bytes = r.bytes(4)?;
+    let is_v2 = match magic_bytes {
+        m if m == PROBLEM_MAGIC => false,
+        m if m == PROBLEM_MAGIC_V2 => true,
+        _ => return Err("bad magic (expected ARE1/ARE2)".into()),
+    };
     let bitwidth = r.u8()? as u32;
     if !(1..=30).contains(&bitwidth) {
         return Err(format!("bitwidth {bitwidth} out of range 1..=30"));
+    }
+    let mut options = WireOptions::default();
+    if is_v2 {
+        let flags = r.u8()?;
+        options.skolemize = flags & 1 != 0;
+        options.decompose = Decompose::from_u8((flags >> 1) & 0b11)?;
+        options.max_threads = r.var()? as usize;
     }
 
     // Universe atoms (order defines tuple indices).
@@ -244,6 +308,9 @@ pub fn decode_problem(input: &[u8]) -> Result<Problem, String> {
                 .bound_exactly(rid, &upper)
                 .map_err(|e| format!("bound {name}: {e}"))?;
         } else {
+            // A relation whose value may vary: required by the temporal
+            // expansion / decomposition pipelines.
+            arena.set_variable(rid, true);
             bounds
                 .bound(rid, &lower, &upper)
                 .map_err(|e| format!("bound {name}: {e}"))?;
@@ -584,9 +651,49 @@ pub fn decode_problem(input: &[u8]) -> Result<Problem, String> {
     }
     let root = r.u32v()?;
     let formula = id!(formulas, root);
+
+    // ARE2 trailer: partial marks + symbolic bounds for dynamic decomposition.
+    let mut partials = Vec::new();
+    let mut symbounds = Vec::new();
+    if is_v2 && options.decompose == Decompose::Dynamic {
+        let n_partials = r.u32v()? as usize;
+        for _ in 0..n_partials {
+            let rel = r.u32v()?;
+            if rel as usize >= relation_ids.len() {
+                return Err(format!("partial relation index {rel} out of range"));
+            }
+            partials.push(rel);
+        }
+        let n_symb = r.u32v()? as usize;
+        for _ in 0..n_symb {
+            let rel = r.u32v()?;
+            if rel as usize >= relation_ids.len() {
+                return Err(format!("symbolic-bound relation index {rel} out of range"));
+            }
+            let side = match r.u8()? {
+                0 => false,
+                1 => true,
+                x => return Err(format!("unknown symbolic-bound side {x}")),
+            };
+            let node = r.u32v()?;
+            if node as usize >= n_nodes || exprs.get(node as usize).copied().flatten().is_none() {
+                return Err(format!(
+                    "symbolic bound references non-expression node #{node}"
+                ));
+            }
+            symbounds.push((rel, side, node));
+        }
+    }
+
     if r.pos != input.len() {
         return Err("trailing bytes after problem".into());
     }
+
+    let expr_by_node = exprs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.map(|eid| (i as u32, eid)))
+        .collect();
 
     Ok(Problem {
         arena,
@@ -595,6 +702,10 @@ pub fn decode_problem(input: &[u8]) -> Result<Problem, String> {
         formula,
         relation_names,
         relation_ids,
+        options,
+        partials,
+        symbounds,
+        expr_by_node,
     })
 }
 
@@ -625,11 +736,74 @@ pub fn solve_problem(problem: &mut Problem) -> Vec<u8> {
 fn solve_problem_inner(problem: &mut Problem) -> Result<Option<Vec<TupleSet>>, String> {
     let options = SolverOptions {
         bitwidth: problem.bitwidth,
+        skolemize: problem.options.skolemize,
         ..SolverOptions::default()
     };
-    let solution = Solver::with_options(options)
-        .solve(&mut problem.arena, problem.formula, &problem.bounds)
-        .map_err(|e| format!("translate/solve: {e}"))?;
+    let solver = Solver::with_options(options);
+
+    let solution = match problem.options.decompose {
+        Decompose::None => solver
+            .solve(&mut problem.arena, problem.formula, &problem.bounds)
+            .map_err(|e| format!("translate/solve: {e}"))?,
+        Decompose::Static => solver
+            .solve_decomposed(&mut problem.arena, problem.formula, &problem.bounds)
+            .map_err(|e| format!("decomposed solve: {e}"))?,
+        Decompose::Parallel => {
+            let threads = problem.options.max_threads.max(1);
+            solver
+                .solve_decomposed_parallel(
+                    &mut problem.arena,
+                    problem.formula,
+                    &problem.bounds,
+                    threads,
+                )
+                .map_err(|e| format!("parallel solve: {e}"))?
+        }
+        Decompose::Dynamic => solve_dynamic_problem(&solver, problem)?,
+    };
+
+    extract_answer_instances(problem, solution)
+}
+
+/// Dynamic two-stage decomposition over a wire problem (Iter 11): the ARE2
+/// trailer supplies stage-1 partial marks and optional symbolic bounds.
+fn solve_dynamic_problem(
+    solver: &alloy_kodkod_rs::Solver,
+    problem: &mut Problem,
+) -> Result<alloy_kodkod_rs::solver::Solution, String> {
+    use alloy_kodkod_rs::pardinus::PardinusBounds;
+
+    if problem.partials.is_empty() {
+        // Nothing sliceable: fall back to the plain pipeline.
+        return solver
+            .solve(&mut problem.arena, problem.formula, &problem.bounds)
+            .map_err(|e| format!("translate/solve: {e}"));
+    }
+    // Re-map node ids to ExprIds for symbolic bounds.
+    let expr_by_node = problem.expr_by_node.clone();
+    let mut pb = PardinusBounds::new(problem.bounds.clone());
+    for &rel in &problem.partials {
+        pb = pb.with_partial(problem.relation_ids[rel as usize]);
+    }
+    for &(rel, upper, node) in &problem.symbounds {
+        let eid = *expr_by_node
+            .get(&node)
+            .ok_or_else(|| format!("symbolic bound node #{node} not found in expression table"))?;
+        pb = if upper {
+            pb.with_symb_upper(problem.relation_ids[rel as usize], eid)
+        } else {
+            pb.with_symb_lower(problem.relation_ids[rel as usize], eid)
+        };
+    }
+    solver
+        .solve_dynamic(&mut problem.arena, problem.formula, &pb, 1)
+        .map_err(|e| format!("dynamic solve: {e}"))
+}
+
+fn extract_answer_instances(
+    problem: &Problem,
+    solution: alloy_kodkod_rs::solver::Solution,
+) -> Result<Option<Vec<TupleSet>>, String> {
     if !solution.satisfiable {
         return Ok(None);
     }
