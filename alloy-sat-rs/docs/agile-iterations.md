@@ -244,13 +244,25 @@
 2. **`no` 式フォーミュラのデシュガー対応**(Iter 12 の副次修正):
    Java シリアライザが `no e` を `¬some e` として wire 生成するように
    変更(m15 最小ケースでの切り分け過程で no 自体は正しいことを確認)
-3. **既知バグ(未修復)**: 「量化子内の含意 + 関係差分・和集合」パターンで
-   偽 SAT。最小再現 m15.als(sig Book { addr: Book->Book } の delUndoesAdd
-   型アサーション)。ワイヤ AST は正しいことを検証済みのため fol.rs の
-   CNF 生成側の問題と推定。孤立プローブ(mult_dense.rs)では発現せず、
-   wire デコード文脈でのみ発現。`#[ignore]` テスト
-   `quantified_implication_validity` と debug 用 examples
-   (wire_dump / subset_debug / m15_debug)を残置
+3. **既知バグ(未修復)→ 根因大幅絞り込み(プロパティテスト活用)**:
+   「量化子内の含意 + 関係差分・和集合」パターンで偽 SAT。最小再現
+   m15.als / repro_spurious_sat.rs(5変数量化含意、lo=空 hi=全体)。
+   本日判明したこと:
+   - **オラクル欠陥修正**: RecordingSolver が 22 変数超で総当たり不能の
+     場合、未知を黙って UNSAT と報告していた(sat.rs)。panic で即死する
+     よう改修。これによりユニットテストの期待値自体が汚染されていた
+   - **バックエンド無関係を証明**: 同一 CNF を CaDiCaL と Splr の両方に
+     投入 → どちらも SAT。モデルは全節を充足するが Evaluator による
+     意味論検証で反例になっていない(=CNF が過少制約)
+   - **極性最適化・AST共有・量化子駆動は全て否定的**:
+     optimize_polarity=off でも発現、式ノード非共有でも発現、
+     量子化機械を経由しない手動展開(env付き formula_ref × 32 バインディング
+     を and で結合)でも発現 → fol.rs の env 付き本体翻訳の組合せで
+     制約が失われているのが原因と特定
+   - **差分プロパティテスト追加**(tests/differential.rs): ランダム小型
+     問題を Solver と「全インスタンス列挙 × 独立 Evaluator」オラクルで
+     比較(xorshift 決定論的シード、DIFF_SEEDS で件数制御)。
+     現状 500 シードは通過 — 生成器の偏り改善が次ステップ
 
 ## バックログ(未確定・優先度順)
 1. ~~Simplifier/最適化パス~~ ✅ 完了(2026-08-24): Comparison を疎キー

@@ -14,6 +14,10 @@ criterion = "0.5"
 [features]
 ipasir = ["dep:alloy-ipasir"]
 
+[[test]]
+name = "differential"
+required-features = ["ipasir"]
+
 [[bench]]
 name = "nqueens"
 harness = false

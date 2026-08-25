@@ -53,7 +53,13 @@ impl RecordingSolver {
 
     fn brute_force_under(&self, assumptions: &[i64]) -> Option<Vec<bool>> {
         if self.vars > BRUTE_FORCE_MAX_VARS {
-            return None;
+            // A None here previously flowed into `solve()` as a silent false
+            // UNSAT answer. That is unsound for a test oracle: fail loudly
+            // instead so callers switch to an IPASIR backend.
+            panic!(
+                "RecordingSolver brute force exceeds {BRUTE_FORCE_MAX_VARS} variables                  (got {}); use an IPASIR backend for this formula",
+                self.vars
+            );
         }
         // Assumption literals refer to real formula variables.
         for mask in 0u128..(1u128 << self.vars) {

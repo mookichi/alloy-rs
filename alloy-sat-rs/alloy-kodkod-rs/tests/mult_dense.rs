@@ -91,12 +91,16 @@ fn empty_bounds_make_some_always_false() {
     );
 }
 
-/// Full reproduction of the addressBook2e/m15 spurious-SAT bug (Iter 12
-/// discovery). The assertion
+/// KNOWN-BUG regression test (currently expected to PASS because it uses
+/// RecordingSolver, which bails out on >22 variables; see sat.rs). The real
+/// engine reproduces the bug via the facade: see
+/// alloy-engine-rs/examples/repro_spurious_sat.rs and the differential test.
+///
+/// Original discovery: the assertion
 ///   all b,b',b'',n,t | (noImg /\ addEq /\ delEq) -> concl
 /// is VALID over bounds lo=empty hi=full (kodkod agrees: check reports
-/// UNSAT), so solving it must yield UNSAT. The Rust engine currently
-/// reports SAT with a counterexample whose antecedent is nowhere true.
+/// UNSAT), yet the Rust engine reports SAT with a counterexample whose
+/// antecedent is nowhere true.
 #[test]
 #[ignore = "known bug: spurious SAT for quantified implication over free relations"]
 fn quantified_implication_validity() {

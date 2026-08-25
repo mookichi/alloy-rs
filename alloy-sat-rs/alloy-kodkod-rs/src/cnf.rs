@@ -235,7 +235,7 @@ pub fn translate_to_cnf(
         visited: IntSet::new(),
         polarity: Polarity::new(),
         clauses: Vec::new(),
-        optimize_polarity: true,
+        optimize_polarity: std::env::var("ALLOY_NO_POLARITY_OPT").is_err(),
     };
     t.run(root, max_primary_var)
 }
