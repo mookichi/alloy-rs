@@ -194,9 +194,16 @@ impl BoolFactory {
         }
         kids.sort_unstable();
         kids.dedup();
-        // complementary literals: AND(x, ¬x) = FALSE / OR(x, ¬x) = TRUE
-        for w in kids.windows(2) {
-            if w[0] < 0 && w[1] == -w[0] {
+        // complementary literals: AND(x, ¬x) = FALSE / OR(x, ¬x) = TRUE.
+        // Sorted ascending, negatives precede positives, so a complement
+        // pair (-x, +x) is generally NOT adjacent (any other negative
+        // literal in between breaks the windows(2) check). Probe membership
+        // with binary search instead.
+        for &k in kids.iter() {
+            if k >= 0 {
+                break;
+            }
+            if kids.binary_search(&-k).is_ok() {
                 return Folded::Const(is_or);
             }
         }
@@ -226,8 +233,11 @@ impl BoolFactory {
         if kids.len() != before {
             kids.sort_unstable();
             kids.dedup();
-            for w in kids.windows(2) {
-                if w[0] < 0 && w[1] == -w[0] {
+            for &k in kids.iter() {
+                if k >= 0 {
+                    break;
+                }
+                if kids.binary_search(&-k).is_ok() {
                     return Folded::Const(is_or);
                 }
             }
