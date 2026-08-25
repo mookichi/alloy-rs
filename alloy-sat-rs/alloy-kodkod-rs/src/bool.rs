@@ -249,6 +249,13 @@ impl BoolFactory {
         }
     }
 
+    /// Evaluate a circuit against `model`.
+    ///
+    /// Convention: `model` is indexed 0-based over SAT variables, i.e.
+    /// Var(slot s) reads `model[s - 1]`. Callers building models from
+    /// SAT-solver assignments must map var v -> model[v - 1]; getting
+    /// this wrong shifts every primary literal by one and silently
+    /// inverts diagnostics (this cost a full debugging session).
     pub fn eval(&self, r: BoolRef, model: &[bool]) -> bool {
         let mut memo = Vec::new();
         self.eval_memo(r, model, &mut memo)

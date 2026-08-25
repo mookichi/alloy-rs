@@ -10,6 +10,10 @@
 //! localises the fault to per-env circuit construction in fol.rs, not to
 //! the quantifier driver, AST sharing, polarity optimisation or the SAT
 //! backends (CaDiCaL and Splr agree on the wrong answer).
+// Diagnostic scratchpad example (known-bug investigation).
+#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
+
+#[allow(unused_imports)]
 use alloy_kodkod_rs::ast::*;
 use alloy_kodkod_rs::bounds::Bounds;
 use alloy_kodkod_rs::cnf::translate_into_solver;
