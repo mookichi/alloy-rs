@@ -220,6 +220,13 @@ impl BoolFactory {
         if has_compound {
             let snapshot = kids.clone();
             kids.retain(|&k| {
+                // Absorption identities (x \/ AND(x,..) = x, x /\ OR(x,..) = x)
+                // require the absorbed kid to occur UNNEGATED: dropping
+                // \neg(OR(y, x)) from AND(\neg(OR(y,x)), x) would claim
+                // FALSE == x. Hence only positive handles may match.
+                if k < 0 {
+                    return true;
+                }
                 let dropped = match self.node(BoolRef(k)) {
                     Some(BoolNode::Or(cs)) if absorb_kind_is_and => {
                         cs.iter().any(|c| snapshot.contains(&c.0) && c.0 != k)

@@ -26,7 +26,7 @@ addressBook2a.als|SAT|SAT
 addressBook2b.als|SAT|SAT
 addressBook2c.als|SAT|SAT
 addressBook2d.als|SAT|SAT
-addressBook2e.als|SAT|UNSAT
+addressBook2e.als|UNSAT|UNSAT
 addressBook3a.als|Error|SAT
 addressBook3b.als|Error|UNSAT
 addressBook3c.als|Error|UNSAT
@@ -44,7 +44,7 @@ hotel1.als|Error|SAT
 hotel2.als|Error|UNSAT
 hotel3.als|Error|SAT
 hotel4.als|Error|UNSAT
-mediaAssets.als|SAT|UNSAT
+mediaAssets.als|UNSAT|UNSAT
 abstractMemory.als|UNSAT|UNSAT
 cacheMemory.als|UNSAT|UNSAT
 checkCache.als|Error|UNSAT

@@ -204,9 +204,10 @@ cargo test -p alloy-kodkod-rs --features ipasir   # +2 tests(fuzz 30 cases)
 - `no e` フォーミュラのデシュガー(¬some)対応
 - **sweep 実測修正**: Iter 10/11 の sweep は出力ディレクトリ未作成で全行
   Error/Error の空一致だったことが発覚 → スクリプト修正し再計測。
-  実パリティ 34/83 + rust 未対応構文 Error 46。真のミスマッチ 2件
-  (addressBook2e / mediaAssets: 偽 SAT)は既知バグとして登録
-  (`docs/agile-iterations.md` 発見事項参照、再現テストは `#[ignore]` で残置)
+  実パリティ測定の過程で 2 件の真ミスマッチ(偽 SAT)を検出 →
+  `bool.rs fold()` の吸収則が否定複合キッドを符号無視で吸収する
+  不具合と特定・修正。修正後の再スイープで応答レベル矛盾 0 件
+  (SAT/SAT 25, UNSAT/UNSAT 11, 未対応構文 Error 45, 他 2)
 
 ```bash
 cargo build --release -p alloy-engine-rs --features jni   # liballoy_engine.so
