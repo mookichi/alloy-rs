@@ -7,6 +7,7 @@ pub enum SigMult {
     Abstract,
     Lone,
     One,
+    Some,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,6 +71,8 @@ pub enum Expr {
     LeadMult(Mult3, Box<Expr>),
     /// Prime (next-state): `e'` or `after e`
     Prime(Box<Expr>),
+    /// Let binding in expression position: `let x = expr in expr`
+    LetBind(Vec<(String, Expr)>, Box<Expr>),
 }
 
 /// Three-valued multiplicities used in declarations.
@@ -200,6 +203,9 @@ impl Expr {
             Expr::Call(_, args, _) => args.iter().any(|a| a.has_temporal()),
             Expr::ArrowMult(_, x) | Expr::LeadMult(_, x) => x.has_temporal(),
             Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom => false,
+            Expr::LetBind(binds, body) => {
+                body.has_temporal() || binds.iter().any(|(_, e)| e.has_temporal())
+            }
         }
     }
 }

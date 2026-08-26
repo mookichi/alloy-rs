@@ -904,6 +904,16 @@ impl<'a> Ctx<'a> {
                 let id = arena.prime(ex);
                 (id, ax)
             }
+            Expr::LetBind(binds, body) => {
+                // For each binding, substitute the name with the expression
+                // in the body. This avoids creating kodkod variables that
+                // won't have FOL env bindings.
+                let mut current = (**body).clone();
+                for (name, e) in binds.iter().rev() {
+                    current = replace_var_expr(&current, name, e);
+                }
+                self.lower_expr(arena, &current, env)?
+            }
         };
         Ok(lowered)
     }
@@ -1425,6 +1435,13 @@ fn subst_expr(e: &Expr, from: &str, to: &str) -> Expr {
             *p,
         ),
         Expr::Prime(inner) => Expr::Prime(Box::new(subst_expr(inner, from, to))),
+        Expr::LetBind(binds, body) => Expr::LetBind(
+            binds
+                .iter()
+                .map(|(n, e)| (n.clone(), subst_expr(e, from, to)))
+                .collect(),
+            Box::new(subst_expr(body, from, to)),
+        ),
     }
 }
 
@@ -1655,6 +1672,13 @@ fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
             *p,
         ),
         Expr::Prime(inner) => Expr::Prime(Box::new(replace_var_expr(inner, from, to))),
+        Expr::LetBind(binds, body) => Expr::LetBind(
+            binds
+                .iter()
+                .map(|(n, e)| (n.clone(), replace_var_expr(e, from, to)))
+                .collect(),
+            Box::new(replace_var_expr(body, from, to)),
+        ),
     }
 }
 

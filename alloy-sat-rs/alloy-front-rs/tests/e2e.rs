@@ -271,3 +271,85 @@ fn int_field_declaration() {
     "#;
     assert_eq!(outcome(src, 0), "SAT");
 }
+
+// --- New expression forms ---
+
+/// `some sig` constrains a sig to have at least one atom.
+#[test]
+fn some_sig_basic() {
+    let src = r#"
+        module t
+        some sig A {}
+        run {} for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// `some sig` with exactly 1 scope — must be non-empty → SAT (exactly 1).
+#[test]
+fn some_sig_exactly_one() {
+    let src = r#"
+        module t
+        some sig A {}
+        run {} for exactly 1
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// `some sig` with a fact that forces empty — UNSAT.
+#[test]
+fn some_sig_with_fact_forces_empty() {
+    let src = r#"
+        module t
+        some sig A {}
+        fact { no A }
+        run {} for 3
+    "#;
+    assert_eq!(outcome(src, 0), "UNSAT");
+}
+
+/// Sig fact block: `sig A {} { some A }` is equivalent to a global fact.
+#[test]
+fn sig_fact_block_basic() {
+    let src = r#"
+        module t
+        sig A {} { some A }
+        run {} for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// Sig fact block constrains: `sig A {} { #A > 1 }` with exactly 1 → UNSAT.
+#[test]
+fn sig_fact_block_unsat() {
+    let src = r#"
+        module t
+        sig A {} { #A > 1 }
+        run {} for exactly 1
+    "#;
+    assert_eq!(outcome(src, 0), "UNSAT");
+}
+
+/// Let binding in expression position: `let x = A in some x`.
+#[test]
+fn let_expr_position() {
+    let src = r#"
+        module t
+        sig A {}
+        pred p { some (let x = A in x) }
+        run p for exactly 2
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// Let binding with multiple bindings.
+#[test]
+fn let_expr_multi_bind() {
+    let src = r#"
+        module t
+        sig A {}
+        pred p { some (let x = A, y = A in x + y) }
+        run p for exactly 2
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}

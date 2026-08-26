@@ -153,7 +153,11 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         if !has_children {
             let at = alloc_for(
                 root,
-                total.max(if rmult == SigMult::Lone { 1 } else { 0 }),
+                total.max(if rmult == SigMult::Lone || rmult == SigMult::Some {
+                    1
+                } else {
+                    0
+                }),
                 &mut counter,
             );
             atoms_of.insert(root.clone(), at);
@@ -170,7 +174,11 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         if non_in_kids.is_empty() {
             let at = alloc_for(
                 root,
-                total.max(if rmult == SigMult::Lone { 1 } else { 0 }),
+                total.max(if rmult == SigMult::Lone || rmult == SigMult::Some {
+                    1
+                } else {
+                    0
+                }),
                 &mut counter,
             );
             atoms_of.insert(root.clone(), at);
@@ -355,8 +363,21 @@ pub fn bind_sigs(
         let lo = TupleSet::new(&res.universe, 1).map_err(|e| e.to_string())?;
         let is_exact = *exact.get(name).unwrap_or(&false)
             || (cmd_scope.overall_exact && !cmd_scope.entries.iter().any(|(n, _)| n == name));
+        // `some sig` requires a non-empty lower bound
+        let has_some_mult = module
+            .sigs
+            .iter()
+            .any(|sd| sd.mult == SigMult::Some && sd.names.iter().any(|n| n == name));
         if is_exact {
             b.bound_exactly(rel, &ts).map_err(|e| e.to_string())?;
+        } else if has_some_mult {
+            // lower = first atom, upper = allocated atoms
+            let mut lo_set = TupleSet::new(&res.universe, 1).map_err(|e| e.to_string())?;
+            if let Some(first_a) = atoms.first() {
+                let idx = res.universe.index(first_a).map_err(|e| e.to_string())?;
+                lo_set.insert_index(idx as i64);
+            }
+            b.bound(rel, &lo_set, &ts).map_err(|e| e.to_string())?;
         } else {
             b.bound(rel, &lo, &ts).map_err(|e| e.to_string())?;
         }

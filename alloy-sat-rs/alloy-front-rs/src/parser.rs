@@ -201,7 +201,7 @@ impl Parser {
         loop {
             match self.peek() {
                 Tok::Sig => sigs.push(self.sig_decl()?),
-                Tok::Abstract | Tok::One | Tok::Lone | Tok::Var
+                Tok::Abstract | Tok::One | Tok::Lone | Tok::Some | Tok::Var
                     if matches!(self.peek_at(1), Tok::Sig) =>
                 {
                     sigs.push(self.sig_decl()?);
@@ -285,6 +285,10 @@ impl Parser {
                     mult = SigMult::Lone;
                     self.bump();
                 }
+                Tok::Some => {
+                    mult = SigMult::Some;
+                    self.bump();
+                }
                 _ => break,
             }
         }
@@ -321,6 +325,14 @@ impl Parser {
             }
             self.expect(&Tok::RBrace)?;
         }
+        // Optional sig fact block: `sig A { fields } { formula }`
+        let fact = if self.eat(&Tok::LBrace) {
+            let f = self.formula()?;
+            self.expect(&Tok::RBrace)?;
+            Some(f)
+        } else {
+            None
+        };
         let _ = pos;
         Ok(SigDecl {
             mult,
@@ -328,7 +340,7 @@ impl Parser {
             extends,
             rel,
             fields,
-            fact: None,
+            fact,
             is_var: saw_var,
         })
     }
@@ -766,6 +778,23 @@ impl Parser {
 
     fn parse_primary(&mut self, in_sig: bool) -> PResult<Expr> {
         let pos = self.pos();
+        // let binding in expression context: `let x = expr in expr`
+        if matches!(self.peek(), Tok::Let) {
+            self.bump();
+            let mut binds = Vec::new();
+            loop {
+                let name = self.ident()?;
+                self.expect(&Tok::Eq)?;
+                let e = self.rel_expr_top(in_sig)?;
+                binds.push((name, e));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::In)?;
+            let body = self.rel_expr_top(in_sig)?;
+            return Ok(Expr::LetBind(binds, Box::new(body)));
+        }
         match self.peek().clone() {
             Tok::Univ => {
                 self.bump();
