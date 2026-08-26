@@ -6,7 +6,7 @@
 use alloy_kodkod_rs::ast::*;
 use alloy_kodkod_rs::bounds::Bounds;
 use alloy_kodkod_rs::relation::{RelationId, RelationPool};
-use alloy_kodkod_rs::temporal::{expand_bounds, TemporalError, TemporalEval};
+use alloy_kodkod_rs::temporal::{expand_bounds, TemporalEval};
 use alloy_kodkod_rs::tupleset::TupleSet;
 use alloy_kodkod_rs::universe::Universe;
 use alloy_kodkod_rs::Solver;
@@ -154,10 +154,25 @@ fn expander_structure() {
 }
 
 #[test]
-fn unrolls_gt_1_rejected() {
-    let ring = Ring::new(3);
-    let err = expand_bounds(&ring.arena, &ring.bounds, 4, 2).unwrap_err();
-    assert!(matches!(err, TemporalError::UnrollsWithoutPast));
+fn unrolls_gt_1_expands_prefix_chain() {
+    // multi-unroll traces are supported: PREFIX chains all unrolls together
+    // and only the final unroll gets loop-back candidates.
+    let mut ring = Ring::new(3);
+    let _ = &mut ring.arena;
+    let exp = expand_bounds(&ring.arena, &ring.bounds, 4, 2).unwrap();
+
+    // 3 original atoms + steps * unrolls time atoms
+    assert_eq!(exp.bounds.universe().size(), 3 + 8);
+    assert_eq!(exp.unrolls, 2);
+    let state_ts = exp.bounds.lower_bound(exp.ids.state).unwrap();
+    assert_eq!(state_ts.len(), 8);
+
+    let pl = exp.bounds.lower_bound(exp.ids.prefix).unwrap();
+    let pu = exp.bounds.upper_bound(exp.ids.prefix).unwrap();
+    // two intra-unroll chains (3 edges each) + one cross-unroll edge
+    assert_eq!(pl.len(), 7);
+    // chain edges + loop-backs from LAST of the final unroll (8 candidates)
+    assert_eq!(pu.len(), 7 + 8);
 }
 
 /// The token-ring problem: exactly one token, it moves along the ring, and it

@@ -337,6 +337,33 @@ impl<'a> StaticSkolemizer<'a> {
         Ok(self.arena.quantified(Quantifier::All, ds, subset))
     }
 
+    /// Cardinality constraint mirroring the declared multiplicity: a decl of
+    /// `one x` must yield a singleton witness (`one join($sk, u⃗)`), otherwise
+    /// the witness could be empty/multi-valued and diverge from the quantifier
+    /// semantics. Quantified over enclosing universals when present.
+    fn multiplicity_constraint(
+        &mut self,
+        rel: RelationId,
+        mult: Multiplicity,
+    ) -> Result<FormulaId, SkolemError> {
+        let wexpr = self.witness_expr(rel);
+        let inner = self.arena.multiplicity_formula(mult, wexpr)?;
+        if self.universals.is_empty() {
+            return Ok(inner);
+        }
+        let decls: Vec<Decl> = self
+            .universals
+            .iter()
+            .map(|&(v, _, dom)| Decl {
+                mult: Multiplicity::One,
+                variable: v,
+                expr: dom,
+            })
+            .collect();
+        let ds = self.arena.add_decls(decls);
+        Ok(self.arena.quantified(Quantifier::All, ds, inner))
+    }
+
     fn skolemize_quantifier(
         &mut self,
         decls: &[Decl],
@@ -381,8 +408,11 @@ impl<'a> StaticSkolemizer<'a> {
         // (now positive) context
         let new_body = sk_walk(self, new_body, true)?;
 
-        let mut constraints = Vec::with_capacity(decls.len());
+        let mut constraints = Vec::with_capacity(decls.len() * 2);
         for (d, rel) in decls.iter().zip(&rels) {
+            if d.mult != Multiplicity::Set {
+                constraints.push(self.multiplicity_constraint(*rel, d.mult)?);
+            }
             constraints.push(self.domain_constraint(*rel, d.expr)?);
         }
         self.created.extend_from_slice(&rels);
