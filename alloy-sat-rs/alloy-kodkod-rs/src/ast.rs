@@ -217,6 +217,12 @@ pub enum TemporalFormulaOp {
     Before,
     Historically,
     Once,
+    Keeping,
+    Goal,
+    Restore,
+    Initially,
+    Regularly,
+    Consistently,
 }
 
 impl TemporalFormulaOp {
@@ -228,6 +234,12 @@ impl TemporalFormulaOp {
             TemporalFormulaOp::Before => "before",
             TemporalFormulaOp::Historically => "historically",
             TemporalFormulaOp::Once => "once",
+            TemporalFormulaOp::Keeping => "keeping",
+            TemporalFormulaOp::Goal => "goal",
+            TemporalFormulaOp::Restore => "restore",
+            TemporalFormulaOp::Initially => "initially",
+            TemporalFormulaOp::Regularly => "regularly",
+            TemporalFormulaOp::Consistently => "consistently",
         }
     }
 }

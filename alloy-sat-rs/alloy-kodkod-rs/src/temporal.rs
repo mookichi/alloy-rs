@@ -1,9 +1,9 @@
 //! Temporal extension (Iter 7): ltl2fol-style bounded lasso unrolling.
 //!
 //! Port of Pardinus `TemporalBoundsExpander` + `LTL2FOLTranslator`
-//! (ExplicitUnrolls=true, future-time fragment):
+//! (ExplicitUnrolls=true):
 //!
-//! 1. [`expand_bounds`] appends the trace state atoms `Time{i}_0` to the
+//! 1. [`expand_bounds`] appends the trace state atoms `Time{i}_{j}` to the
 //!    universe, gives every *variable* relation a time-extended expansion
 //!    `r$t` of arity+1 (original tuples x state), and adds the helper
 //!    relations `$t_first`/`$t_last`/`$t_next`/`$t_loop`.
@@ -15,9 +15,10 @@
 //!    into a [`TemporalInstance`] lasso (one [`Instance`] per state + loop
 //!    point).
 //!
-//! Supported: PRIME, ALWAYS, EVENTUALLY, UNTIL, RELEASES (+ NNF polarity
-//! pushing). Past-time operators (HISTORICALLY/ONCE/BEFORE/SINCE/TRIGGERED)
-//! require unrolls > 1 and are rejected.
+//! Supported operators:
+//! - Future-time: ALWAYS, EVENTUALLY, UNTIL, RELEASES, AFTER/PRIME
+//! - Past-time: HISTORICALLY, ONCE, BEFORE, SINCE, TRIGGERED
+//! - Pardinus-specific: INITIALLY, GOAL, RESTORE, KEEPING, CONSISTENTLY, REGULARLY
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -42,10 +43,6 @@ pub const STATE_SEP: &str = "_";
 pub enum TemporalError {
     #[error("steps and unrolls must be >= 1")]
     BadTraceLength,
-    #[error("past-time operator {0} is not supported (requires unrolls > 1)")]
-    UnsupportedPast(&'static str),
-    #[error("unrolls > 1 is only meaningful with past operators; use unrolls = 1")]
-    UnrollsWithoutPast,
     #[error("relation {0} is not bound")]
     UnboundRelation(u32),
     #[error("bounds error: {0}")]
@@ -199,9 +196,6 @@ pub fn expand_bounds(
     if steps < 1 || unrolls < 1 {
         return Err(TemporalError::BadTraceLength);
     }
-    if unrolls > 1 {
-        return Err(TemporalError::UnrollsWithoutPast);
-    }
 
     let orig_universe = bounds.universe().clone();
     let pool = bounds.pool().clone();
@@ -238,19 +232,30 @@ pub fn expand_bounds(
     new_bounds.bound_exactly(first, &single(&uni, base)?)?;
     new_bounds.bound_exactly(last, &single(&uni, base + steps - 1)?)?;
 
-    // PREFIX: lower = unroll-0 chain; upper = chains + all loop-backs from LAST
+    // PREFIX: lower = chains across all unrolls; upper = chains + loop-backs from LAST
     let mut prefix_l = TupleSet::new(&uni, 2)?;
     let mut prefix_u = TupleSet::new(&uni, 2)?;
     let width = uni.size() as i64;
-    for i in 0..steps - 1 {
-        prefix_l.insert_index(((base + i) as i64) * width + (base + i + 1) as i64);
+    for j in 0..unrolls {
+        for i in 0..steps - 1 {
+            prefix_l.insert_index(
+                ((base + j * steps + i) as i64) * width + (base + j * steps + i + 1) as i64,
+            );
+        }
+        // cross-unroll edge: LAST of unroll j -> FIRST of unroll j+1
+        if j + 1 < unrolls {
+            prefix_l.insert_index(
+                ((base + j * steps + steps - 1) as i64) * width + (base + (j + 1) * steps) as i64,
+            );
+        }
     }
     for idx in prefix_l.index_view().iter() {
         prefix_u.insert_index(idx);
     }
-    for k in 0..steps {
-        // LAST -> any k (the actual edge is selected through TRACE = PREFIX ∪ LAST×LOOP)
-        prefix_u.insert_index(((base + steps - 1) as i64) * width + (base + k) as i64);
+    // loop-back edges from LAST of final unroll to any state
+    let last_flat = base + (unrolls - 1) * steps + steps - 1;
+    for k in 0..unrolls * steps {
+        prefix_u.insert_index((last_flat as i64) * width + (base + k) as i64);
     }
     new_bounds.bound(prefix, &prefix_l, &prefix_u)?;
 
@@ -285,23 +290,26 @@ pub fn expand_bounds(
                 new_bounds.bound(r, &lower, &upper)?;
             }
             Some(&exp) => {
-                // product with the first-unroll state column
+                // product with all state columns across all unrolls
                 let mut low_exp = TupleSet::new(&uni, lower.arity() + 1)?;
                 let mut up_exp = TupleSet::new(&uni, upper.arity() + 1)?;
                 let width = uni.size() as i64;
-                let base_i = base as i64;
                 let old_size = orig_universe.size();
                 let exp_arity = lower.arity() + 1;
                 for idx in lower.index_view().iter() {
-                    for s in 0..steps as i64 {
-                        let row = reencode(idx, old_size, uni.size(), exp_arity - 1, 0);
-                        low_exp.insert_index(row * width + base_i + s);
+                    for j in 0..unrolls as i64 {
+                        for s in 0..steps as i64 {
+                            let row = reencode(idx, old_size, uni.size(), exp_arity - 1, 0);
+                            low_exp.insert_index(row * width + base as i64 + j * steps as i64 + s);
+                        }
                     }
                 }
                 for idx in upper.index_view().iter() {
-                    for s in 0..steps as i64 {
-                        let row = reencode(idx, old_size, uni.size(), exp_arity - 1, 0);
-                        up_exp.insert_index(row * width + base_i + s);
+                    for j in 0..unrolls as i64 {
+                        for s in 0..steps as i64 {
+                            let row = reencode(idx, old_size, uni.size(), exp_arity - 1, 0);
+                            up_exp.insert_index(row * width + base as i64 + j * steps as i64 + s);
+                        }
                     }
                 }
                 new_bounds.bound(exp, &low_exp, &up_exp)?;
@@ -492,6 +500,7 @@ type DeclsIdT = crate::ast::DeclsId;
 enum T {
     Init,
     Next(Box<T>),
+    Prev(Box<T>),
     At(VarId),
 }
 
@@ -516,6 +525,21 @@ impl<'a> Ltl2Fol<'a> {
         self.arena.binary_expr(BinaryOp::Union, p, ll).unwrap()
     }
 
+    /// ~TRACE = ~PREFIX ∪ (LOOP × LAST)  (backward trace)
+    fn rev_trace_expr(&mut self) -> ExprId {
+        let p = self.arena.expr_relation(self.ids.prefix);
+        let p_t = self
+            .arena
+            .unary_expr(crate::ast::UnaryExprOp::Transpose, p)
+            .unwrap();
+        let lo = self.arena.expr_relation(self.ids.loop_);
+        let l = self.arena.expr_relation(self.ids.last);
+        let lo_x_l = self.arena.binary_expr(BinaryOp::Product, lo, l).unwrap();
+        self.arena
+            .binary_expr(BinaryOp::Union, p_t, lo_x_l)
+            .unwrap()
+    }
+
     fn time_expr(&mut self, t: &T) -> ExprId {
         match t {
             T::Init => self.arena.expr_relation(self.ids.first),
@@ -524,6 +548,11 @@ impl<'a> Ltl2Fol<'a> {
                 let te = self.time_expr(inner);
                 let tr = self.trace_expr();
                 self.arena.binary_expr(BinaryOp::Join, te, tr).unwrap()
+            }
+            T::Prev(inner) => {
+                let te = self.time_expr(inner);
+                let rt = self.rev_trace_expr();
+                self.arena.binary_expr(BinaryOp::Join, te, rt).unwrap()
             }
         }
     }
@@ -537,6 +566,29 @@ impl<'a> Ltl2Fol<'a> {
             .unary_expr(crate::ast::UnaryExprOp::ReflexiveClosure, tr)
             .unwrap();
         self.arena.binary_expr(BinaryOp::Join, te, rc).unwrap()
+    }
+
+    /// t .* ~TRACE  (backward reflexive-transitive closure)
+    fn rev_reach_expr(&mut self, t: &T) -> ExprId {
+        let te = self.time_expr(t);
+        let rt = self.rev_trace_expr();
+        let rc = self
+            .arena
+            .unary_expr(crate::ast::UnaryExprOp::ReflexiveClosure, rt)
+            .unwrap();
+        self.arena.binary_expr(BinaryOp::Join, te, rc).unwrap()
+    }
+
+    fn state_expr(&mut self) -> ExprId {
+        self.arena.expr_relation(self.ids.state)
+    }
+
+    fn last_expr(&mut self) -> ExprId {
+        self.arena.expr_relation(self.ids.last)
+    }
+
+    fn loop_expr(&mut self) -> ExprId {
+        self.arena.expr_relation(self.ids.loop_)
     }
 
     fn fresh_var(&mut self, tag: &str) -> VarId {
@@ -614,6 +666,44 @@ impl<'a> Ltl2Fol<'a> {
             .unwrap();
 
         let mut e = self.arena.if_expr(c, e1, e2).unwrap();
+        if incl {
+            e = self.arena.binary_expr(BinaryOp::Union, e, e_r).unwrap();
+        }
+        e
+    }
+
+    /// `downTo(t1, t2, incl)`: all states between t1 and t2 in backward
+    /// (past) direction. Mirrors Java's `downTo` in LTL2FOLTranslator.
+    fn down_to(&mut self, t1: &T, r: VarId, incl: bool) -> ExprId {
+        let e_t1 = self.time_expr(t1);
+        let e_r = self.arena.expr_variable(r);
+        let prefix = self.arena.expr_relation(self.ids.prefix);
+        // ~PREFIX
+        let prefix_t = self
+            .arena
+            .unary_expr(crate::ast::UnaryExprOp::Transpose, prefix)
+            .unwrap();
+        let prefix_t_rc = self
+            .arena
+            .unary_expr(crate::ast::UnaryExprOp::ReflexiveClosure, prefix_t)
+            .unwrap();
+        let prefix_cl = self
+            .arena
+            .unary_expr(crate::ast::UnaryExprOp::Closure, prefix)
+            .unwrap();
+        // e1 : t1.*~PREFIX ∩ t2.*^PREFIX
+        let a1 = self
+            .arena
+            .binary_expr(BinaryOp::Join, e_t1, prefix_t_rc)
+            .unwrap();
+        let b1 = self
+            .arena
+            .binary_expr(BinaryOp::Join, e_r, prefix_cl)
+            .unwrap();
+        let mut e = self
+            .arena
+            .binary_expr(BinaryOp::Intersection, a1, b1)
+            .unwrap();
         if incl {
             e = self.arena.binary_expr(BinaryOp::Union, e, e_r).unwrap();
         }
@@ -732,11 +822,139 @@ impl<'a> Ltl2Fol<'a> {
                     let inner = self.formula(child, pol, &T::Next(Box::new(t.clone())))?;
                     Ok(if pol { inner } else { self.arena.not(inner) })
                 }
-                TemporalFormulaOp::Before => Err(TemporalError::UnsupportedPast("before")),
+                // --- Past-time LTL ---
                 TemporalFormulaOp::Historically => {
-                    Err(TemporalError::UnsupportedPast("historically"))
+                    // HISTORICALLY f ≡ all s: t.*~TRACE | f[s]
+                    let positive_hist = pol;
+                    let v = self.fresh_var("h");
+                    let domain = self.rev_reach_expr(t);
+                    let d = self.arena.decl(v, Multiplicity::One, domain)?;
+                    let ds = self.arena.add_decls(vec![d]);
+                    let body = self.formula(child, true, &T::At(v))?;
+                    let q = if positive_hist {
+                        Quantifier::All
+                    } else {
+                        Quantifier::Some
+                    };
+                    Ok(self.arena.quantified(q, ds, body))
                 }
-                TemporalFormulaOp::Once => Err(TemporalError::UnsupportedPast("once")),
+                TemporalFormulaOp::Once => {
+                    // ONCE f ≡ some s: t.*~TRACE | f[s]
+                    let positive_once = pol;
+                    let v = self.fresh_var("o");
+                    let domain = self.rev_reach_expr(t);
+                    let d = self.arena.decl(v, Multiplicity::One, domain)?;
+                    let ds = self.arena.add_decls(vec![d]);
+                    let body = self.formula(child, true, &T::At(v))?;
+                    let q = if positive_once {
+                        Quantifier::Some
+                    } else {
+                        Quantifier::All
+                    };
+                    Ok(self.arena.quantified(q, ds, body))
+                }
+                TemporalFormulaOp::Before => {
+                    // BEFORE f ≡ f @ prev(t)
+                    let inner = self.formula(child, pol, &T::Prev(Box::new(t.clone())))?;
+                    Ok(if pol { inner } else { self.arena.not(inner) })
+                }
+                // --- Pardinus-specific operators ---
+                TemporalFormulaOp::Initially => {
+                    // INITIALLY f ≡ f @ FIRST
+                    let inner = self.formula(child, pol, &T::Init)?;
+                    Ok(if pol { inner } else { self.arena.not(inner) })
+                }
+                TemporalFormulaOp::Goal => {
+                    // GOAL f ≡ f @ LAST  (quantify over LAST)
+                    let v = self.fresh_var("g");
+                    let domain = self.last_expr();
+                    let d = self.arena.decl(v, Multiplicity::One, domain)?;
+                    let ds = self.arena.add_decls(vec![d]);
+                    let body = self.formula(child, true, &T::At(v))?;
+                    let q = if pol {
+                        Quantifier::All
+                    } else {
+                        Quantifier::Some
+                    };
+                    Ok(self.arena.quantified(q, ds, body))
+                }
+                TemporalFormulaOp::Restore => {
+                    // RESTORE f ≡ f @ LOOP  (quantify over LOOP)
+                    let v = self.fresh_var("rs");
+                    let domain = self.loop_expr();
+                    let d = self.arena.decl(v, Multiplicity::One, domain)?;
+                    let ds = self.arena.add_decls(vec![d]);
+                    let body = self.formula(child, true, &T::At(v))?;
+                    let q = if pol {
+                        Quantifier::All
+                    } else {
+                        Quantifier::Some
+                    };
+                    Ok(self.arena.quantified(q, ds, body))
+                }
+                TemporalFormulaOp::Keeping => {
+                    // KEEPING f ≡ all s: STATE - LAST | f[s]
+                    let v = self.fresh_var("k");
+                    let state = self.state_expr();
+                    let last = self.last_expr();
+                    let domain = self
+                        .arena
+                        .binary_expr(BinaryOp::Difference, state, last)
+                        .unwrap();
+                    let d = self.arena.decl(v, Multiplicity::One, domain)?;
+                    let ds = self.arena.add_decls(vec![d]);
+                    let body = self.formula(child, true, &T::At(v))?;
+                    let q = if pol {
+                        Quantifier::All
+                    } else {
+                        Quantifier::Some
+                    };
+                    Ok(self.arena.quantified(q, ds, body))
+                }
+                TemporalFormulaOp::Consistently => {
+                    // CONSISTENTLY f ≡ all s: LOOP.*TRACE | f[s]
+                    let v = self.fresh_var("c");
+                    let loop_reach = {
+                        let le = self.loop_expr();
+                        let tr = self.trace_expr();
+                        let rc = self
+                            .arena
+                            .unary_expr(crate::ast::UnaryExprOp::ReflexiveClosure, tr)
+                            .unwrap();
+                        self.arena.binary_expr(BinaryOp::Join, le, rc).unwrap()
+                    };
+                    let d = self.arena.decl(v, Multiplicity::One, loop_reach)?;
+                    let ds = self.arena.add_decls(vec![d]);
+                    let body = self.formula(child, true, &T::At(v))?;
+                    let q = if pol {
+                        Quantifier::All
+                    } else {
+                        Quantifier::Some
+                    };
+                    Ok(self.arena.quantified(q, ds, body))
+                }
+                TemporalFormulaOp::Regularly => {
+                    // REGULARLY f ≡ some s: LOOP.*TRACE | f[s]
+                    let v = self.fresh_var("rg");
+                    let loop_reach = {
+                        let le = self.loop_expr();
+                        let tr = self.trace_expr();
+                        let rc = self
+                            .arena
+                            .unary_expr(crate::ast::UnaryExprOp::ReflexiveClosure, tr)
+                            .unwrap();
+                        self.arena.binary_expr(BinaryOp::Join, le, rc).unwrap()
+                    };
+                    let d = self.arena.decl(v, Multiplicity::One, loop_reach)?;
+                    let ds = self.arena.add_decls(vec![d]);
+                    let body = self.formula(child, true, &T::At(v))?;
+                    let q = if pol {
+                        Quantifier::Some
+                    } else {
+                        Quantifier::All
+                    };
+                    Ok(self.arena.quantified(q, ds, body))
+                }
             },
             crate::ast::FormulaNode::TemporalBinary { op, left, right } => match op {
                 TemporalBinaryOp::Until => {
@@ -755,8 +973,22 @@ impl<'a> Ltl2Fol<'a> {
                         self.until(left, right, t)
                     }
                 }
-                TemporalBinaryOp::Since => Err(TemporalError::UnsupportedPast("since")),
-                TemporalBinaryOp::Triggered => Err(TemporalError::UnsupportedPast("triggered")),
+                TemporalBinaryOp::Since => {
+                    if pol {
+                        self.since(left, right, t)
+                    } else {
+                        // ¬(a S b) ≡ triggered(¬a, ¬b)
+                        self.triggered(left, right, t)
+                    }
+                }
+                TemporalBinaryOp::Triggered => {
+                    if pol {
+                        self.triggered(left, right, t)
+                    } else {
+                        // ¬(a T b) ≡ since(¬a, ¬b)
+                        self.since(left, right, t)
+                    }
+                }
             },
         }
     }
@@ -803,6 +1035,58 @@ impl<'a> Ltl2Fol<'a> {
 
         let lvar = self.fresh_var("s");
         let range = self.upto_expr(t, v, false);
+        let dl = self.arena.decl(lvar, Multiplicity::One, range)?;
+        let dsl = self.arena.add_decls(vec![dl]);
+        let lb = self.formula(right, true, &T::At(lvar))?;
+        let forall_b = self.arena.quantified(Quantifier::All, dsl, lb);
+
+        let conj = self.arena.and(&[ra, forall_b]);
+        let disj = self.arena.or(&[rb, conj]);
+        Ok(self.arena.quantified(Quantifier::All, ds, disj))
+    }
+
+    /// a S b @ t = some r: t.*~TRACE | b[r] && all l: downTo(t, r): a[l]
+    fn since(
+        &mut self,
+        left: FormulaId,
+        right: FormulaId,
+        t: &T,
+    ) -> Result<FormulaId, TemporalError> {
+        let v = self.fresh_var("su");
+        let domain = self.rev_reach_expr(t);
+        let d = self.arena.decl(v, Multiplicity::One, domain)?;
+        let ds = self.arena.add_decls(vec![d]);
+
+        let rb = self.formula(right, true, &T::At(v))?;
+
+        let lvar = self.fresh_var("w");
+        let range = self.down_to(t, v, false);
+        let dl = self.arena.decl(lvar, Multiplicity::One, range)?;
+        let dsl = self.arena.add_decls(vec![dl]);
+        let la = self.formula(left, true, &T::At(lvar))?;
+        let forall_a = self.arena.quantified(Quantifier::All, dsl, la);
+
+        let body = self.arena.and(&[rb, forall_a]);
+        Ok(self.arena.quantified(Quantifier::Some, ds, body))
+    }
+
+    /// a T b @ t = all r: t.*~TRACE | b[r] || (a[r] && all l: downTo(t, r): b[l])
+    fn triggered(
+        &mut self,
+        left: FormulaId,
+        right: FormulaId,
+        t: &T,
+    ) -> Result<FormulaId, TemporalError> {
+        let v = self.fresh_var("tr");
+        let domain = self.rev_reach_expr(t);
+        let d = self.arena.decl(v, Multiplicity::One, domain)?;
+        let ds = self.arena.add_decls(vec![d]);
+
+        let ra = self.formula(left, true, &T::At(v))?;
+        let rb = self.formula(right, true, &T::At(v))?;
+
+        let lvar = self.fresh_var("s");
+        let range = self.down_to(t, v, false);
         let dl = self.arena.decl(lvar, Multiplicity::One, range)?;
         let dsl = self.arena.add_decls(vec![dl]);
         let lb = self.formula(right, true, &T::At(lvar))?;
@@ -1225,12 +1509,78 @@ impl<'a> TemporalEval<'a> {
                     }
                     Ok(false)
                 }
-                _ => Err(EvalError::UnboundInteger(-1)),
+                TemporalFormulaOp::After => self.formula_at(arena, child, env, pos + 1),
+                TemporalFormulaOp::Before => {
+                    if pos > 0 {
+                        self.formula_at(arena, child, env, pos - 1)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                TemporalFormulaOp::Historically => {
+                    for d in (0..=pos).rev() {
+                        if !self.formula_at(arena, child, env, d)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                TemporalFormulaOp::Once => {
+                    for d in 0..=pos {
+                        if self.formula_at(arena, child, env, d)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                TemporalFormulaOp::Initially => {
+                    if pos == 0 {
+                        self.formula_at(arena, child, env, 0)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                TemporalFormulaOp::Goal => {
+                    if pos == self.ti.len() - 1 {
+                        self.formula_at(arena, child, env, pos)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                TemporalFormulaOp::Restore => {
+                    if pos == self.ti.loop_state() {
+                        self.formula_at(arena, child, env, pos)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                TemporalFormulaOp::Keeping => {
+                    for d in 0..self.ti.len() - 1 {
+                        if !self.formula_at(arena, child, env, d)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                TemporalFormulaOp::Consistently => {
+                    for d in self.ti.loop_state()..self.ti.len() {
+                        if !self.formula_at(arena, child, env, d)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                TemporalFormulaOp::Regularly => {
+                    for d in self.ti.loop_state()..self.ti.len() {
+                        if self.formula_at(arena, child, env, d)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
             },
             crate::ast::FormulaNode::TemporalBinary { op, left, right } => match op {
                 TemporalBinaryOp::Until => {
-                    // right must be checked before left fails AT the same
-                    // position (the witness position itself needs no left)
                     for d in 0..self.horizon() {
                         if self.formula_at(arena, right, env, pos + d)? {
                             return Ok(true);
@@ -1252,7 +1602,28 @@ impl<'a> TemporalEval<'a> {
                     }
                     Ok(true)
                 }
-                _ => Err(EvalError::UnboundInteger(-1)),
+                TemporalBinaryOp::Since => {
+                    for d in (0..=pos).rev() {
+                        if self.formula_at(arena, right, env, d)? {
+                            return Ok(true);
+                        }
+                        if !self.formula_at(arena, left, env, d)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(false)
+                }
+                TemporalBinaryOp::Triggered => {
+                    for d in (0..=pos).rev() {
+                        if self.formula_at(arena, left, env, d)? {
+                            return Ok(true);
+                        }
+                        if !self.formula_at(arena, right, env, d)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
             },
             other_node => {
                 // non-temporal spine: delegate, threading prime shifts via

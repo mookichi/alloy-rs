@@ -303,6 +303,41 @@
    Sparse(sorted Vec)/Dense(bitset) 自動切替。密な積境界で語単位集合演算。
    ベンチ回帰なし(pigeonhole 微改善)、BTreeSet オラクル比較テスト追加
 
+### Iter 17: 時制演算子拡張 — 過去時 LTL + Pardinus 固有演算子 ✅ 完了(2026-08-26)
+
+Java Pardinus `LTL2FOLTranslator` の全演算子を Rust に移植。11 演算子を追加。
+
+**Phase 1: 過去時 LTL (5 演算子)**
+- `before P` — 前ステートで P が成立
+- `historically P` — 過去全てで P が成立
+- `once P` — 過去のいずれかで P が成立
+- `a since b` — b が過去に成立し、それ以降 a が成立し続けた
+- `a triggered b` — a が成立する限り b も成立した
+
+**Phase 2: Pardinus 固有 (6 演算子)**
+- `initially P` — ステート 0 で P が成立
+- `goal P` — ステート N（最終）で P が成立
+- `restore P` — ステート L（ループ開始）で P が成立
+- `keeping P` — 全ステート（最終除く）で P が成立
+- `consistently P` — サイクル全体で P が常に成立
+- `regularly P` — サイクル中で P がいつか成立
+
+**kodkod-rs 変更:**
+- `TemporalFormulaOp` に 6 variant 追加
+- `T::Prev` 追加 + `rev_trace_expr()` (逆トレース) + `down_to()` (backward 範囲)
+- `Ltl2Fol::formula` で全 11 演算子の FOL 翻訳
+- `TemporalEval::formula_at` で全 11 演算子の直接評価
+- `expand_bounds` の `unrolls > 1` 許容 + 多重アンロール対応
+
+**alloy-front-rs 変更:**
+- lex: 11 キーワード追加
+- ast: 11 `Formula` variant + `has_temporal()`
+- parser: 前置 9 + 中置 2 = 11 パース規則
+- lower: 11 低層化 + `subst_formula` + `replace_var_formula`
+
+- **テスト**: temporal.rs 32 テスト(22 unit + 10 integration)
+- **検証**: 全 72 テスト通過、clippy 0 警告、fmt グリーン
+
 ## リスク登録
 | リスク | 影響 | 対策 |
 |---|---|---|
