@@ -1,0 +1,24 @@
+[package]
+name = "alloy-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.alloy-engine-rs]
+path = ".."
+default-features = true
+
+[[bin]]
+name = "are2_decode_solve"
+path = "fuzz_targets/are2_decode_solve.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
