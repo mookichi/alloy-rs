@@ -1,0 +1,15 @@
+[package]
+name = "alloy-front-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "als"
+path = "src/bin/als.rs"
+
+[dependencies]
+alloy-kodkod-rs = { path = "../alloy-kodkod-rs", features = ["ipasir"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]

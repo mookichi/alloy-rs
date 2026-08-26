@@ -27,3 +27,6 @@ languageServers-log/AlloyLanguageServer.log
 *.so
 /ring/
 **/.settings/org.eclipse.buildship.core.prefs
+
+# Rust CLI binary sources (re-include; `bin/` above is for Java build output)
+!/alloy-sat-rs/alloy-front-rs/src/bin/

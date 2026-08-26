@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["alloy-ipasir", "alloy-kodkod-rs", "alloy-engine-rs"]
+members = ["alloy-ipasir", "alloy-kodkod-rs", "alloy-engine-rs", "alloy-front-rs"]
 exclude = ["alloy-kodkod-rs/fuzz"]
 
 [workspace.package]
