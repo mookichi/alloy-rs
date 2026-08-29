@@ -137,6 +137,9 @@ public class CLI extends Env {
 		@Description("Be quiet with progress information")
 		boolean quiet();
 
+		@Description("Print per-phase timing (parse/solve)")
+		boolean timing();
+
 		@Description("After resolving each command, start an evaluator")
 		boolean evaluator();
 
@@ -155,6 +158,7 @@ public class CLI extends Env {
 			+ "This directory will also contain a receipt.json file that contains the solutions.")
 	public void _exec(ExecOptions options) throws Exception {
 		boolean quiet = options.quiet();
+		boolean timing = options.timing();
 		SimpleReporter rep = new SimpleReporter(this);
 		A4Options opt = this.options.dup();
 		opt.noOverflow = options.nooverflow();
@@ -211,7 +215,9 @@ public class CLI extends Env {
 
 
 		Map<String, String> cache = new HashMap<>();
+		long tParseStart = timing ? System.nanoTime() : 0;
 		CompModule world = CompUtil.parseEverything_fromFile(rep, cache, filename);
+		long tParseEnd = timing ? System.nanoTime() : 0;
 
 		List<Command> commands = world.getAllCommands();
 
@@ -269,6 +275,7 @@ public class CLI extends Env {
 		}
 
 		String source = IO.collect(file);
+		long tTotalStart = timing ? System.nanoTime() : 0;
 
 		for (Command c : commands) {
 
@@ -285,8 +292,10 @@ public class CLI extends Env {
 			String cname = toCName(c);
 
 			try {
+				long tSolveStart = timing ? System.nanoTime() : 0;
 				A4Solution solution = TranslateAlloyToKodkod.execute_commandFromBook(rep, world.getAllReachableSigs(),
 						c, opt);
+				long tSolveEnd = timing ? System.nanoTime() : 0;
 
 				if (!solution.satisfiable()) {
 					if (rep.output != null) {
@@ -295,6 +304,11 @@ public class CLI extends Env {
 						commandReceipt.transformPath = path;
 					} else {
 						trace.format("    0       UNSAT", options.repeat(1));
+						if (timing) {
+							double parseMs = (tParseEnd - tParseStart) / 1_000_000.0;
+							double solveMs = (tSolveEnd - tSolveStart) / 1_000_000.0;
+							trace.format("  parse=%.1fms solve=%.1fms", parseMs, solveMs);
+						}
 						if (opt.extractCore && solution.rustCore != null) {
 							trace.format("\n       unsat core (%d):", solution.rustCore.size());
 							int ci = 0;
@@ -320,6 +334,11 @@ public class CLI extends Env {
 					} while (index < repeat && solution.isIncremental() && (solution = solution.next()).satisfiable());
 
 					trace.back(back).format("%5d/%-5s SAT", index, options.repeat(1), c.expects);
+					if (timing) {
+						double parseMs = (tParseEnd - tParseStart) / 1_000_000.0;
+						double solveMs = (tSolveEnd - tSolveStart) / 1_000_000.0;
+						trace.format("  parse=%.1fms solve=%.1fms", parseMs, solveMs);
+					}
 					if (c.expects == 0) {
 						trace.format(" expects=%s", c.expects);
 						error("'%s' was satisfied against expectation",c);
@@ -342,6 +361,12 @@ public class CLI extends Env {
 				trace.format("!%s", Exceptions.unrollCause(e));
 			}
 			trace.format("%n");
+		}
+
+		if (timing) {
+			double parseMs = (tParseEnd - tParseStart) / 1_000_000.0;
+			double totalMs = (System.nanoTime() - tTotalStart) / 1_000_000.0;
+			stderr.printf("--- total  parse=%.1fms total=%.1fms%n", parseMs, totalMs);
 		}
 	}
 
