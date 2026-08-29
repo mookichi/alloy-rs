@@ -1,9 +1,27 @@
 //! Native CLI: parse and solve an .als file entirely in Rust.
 //!
 //! Usage: cargo run -p alloy-front-rs --release --example als_solve -- \
-//!          <file.als> [command-name | command-index] [--timing]
+//!          <file.als> [command-name | command-index] [--timing] [--help]
 
 use alloy_front_rs::{parse_and_run_timed, parse_module, run_command, CommandKind};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn print_usage() {
+    eprintln!("als_solve {VERSION} — Alloy model solver (Rust native)");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  als_solve <file.als> [command] [OPTIONS]");
+    eprintln!();
+    eprintln!("ARGS:");
+    eprintln!("  <file.als>              .als model file to solve");
+    eprintln!("  [command]               Run specific command by name or 0-based index");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("      --timing            Print per-phase timing (parse/lower/solve)");
+    eprintln!("  -h, --help              Print this help message");
+    eprintln!("  -V, --version           Print version");
+}
 
 fn fmt_dur(d: std::time::Duration) -> String {
     let us = d.as_micros();
@@ -18,18 +36,30 @@ fn fmt_dur(d: std::time::Duration) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        std::process::exit(0);
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("als_solve {VERSION}");
+        std::process::exit(0);
+    }
+
     if args.len() < 2 {
-        eprintln!("usage: als_solve <file.als> [command] [--timing]");
+        print_usage();
         std::process::exit(2);
     }
 
     let timing = args.iter().any(|a| a == "--timing");
-    let positional: Vec<&String> = args.iter().skip(1).filter(|a| a.as_str() != "--timing").collect();
+    let positional: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
 
     let path = match positional.first() {
         Some(p) => p.as_str(),
         None => {
-            eprintln!("usage: als_solve <file.als> [command] [--timing]");
+            eprintln!("error: no input file specified");
+            eprintln!();
+            print_usage();
             std::process::exit(2);
         }
     };
