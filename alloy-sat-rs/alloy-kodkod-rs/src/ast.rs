@@ -281,6 +281,11 @@ pub enum ExprNode {
     Relation(RelationId),
     Variable(VarId),
     Constant(ConstantExpr),
+    /// Unary constant set of universe atom positions (flat indices, arity 1).
+    /// Produced for atom literals such as `A$0`; n-ary tuples compose via
+    /// the generic product operator. Positions are scope-local: re-lowering
+    /// under a different scope re-resolves them by name.
+    Atoms(Vec<u32>),
     Unary {
         op: UnaryExprOp,
         child: ExprId,
@@ -528,6 +533,10 @@ impl AstArena {
 
     pub fn constant(&mut self, c: ConstantExpr) -> ExprId {
         self.push_expr(ExprNode::Constant(c), c.arity())
+    }
+
+    pub fn expr_atoms(&mut self, atoms: Vec<u32>) -> ExprId {
+        self.push_expr(ExprNode::Atoms(atoms), 1)
     }
 
     pub fn univ(&mut self) -> ExprId {

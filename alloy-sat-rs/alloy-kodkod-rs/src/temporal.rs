@@ -1150,7 +1150,7 @@ impl<'a> Ltl2Fol<'a> {
                     Ok(e)
                 }
             }
-            crate::ast::ExprNode::FromInt(_) => Ok(e),
+            crate::ast::ExprNode::Atoms(_) | crate::ast::ExprNode::FromInt(_) => Ok(e),
             crate::ast::ExprNode::Constant(c) => match c {
                 ConstantExpr::Univ => {
                     // UNIV − State
@@ -1743,6 +1743,7 @@ impl<'a> TemporalEval<'a> {
             crate::ast::ExprNode::Relation(_)
             | crate::ast::ExprNode::Variable(_)
             | crate::ast::ExprNode::Constant(_)
+            | crate::ast::ExprNode::Atoms(_)
             | crate::ast::ExprNode::FromInt(_) => {
                 let ev = Evaluator::new(self.ti.state_at(pos));
                 ev.expr_set(arena, e, env)

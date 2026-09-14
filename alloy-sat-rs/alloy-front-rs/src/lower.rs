@@ -549,7 +549,6 @@ impl<'m> Lowerer<'m> {
 /// Shared lowering context over resolved names.
 struct Ctx<'a> {
     module: &'a Module,
-    #[allow(dead_code)]
     res: &'a Resolved,
     rels: &'a HashMap<String, RelationId>,
     #[allow(dead_code)]
@@ -1381,6 +1380,14 @@ impl<'a> Ctx<'a> {
                     let out = self.lower_expr(arena, &body, env)?;
                     self.depth.set(d);
                     return Ok(out);
+                }
+                // Atom literal (e.g. `A$0` in saved partial instances, `:query`):
+                // a universe atom name denotes its singleton set. Declared
+                // names win (checked above), so this is strictly a fallback.
+                // Positions are scope-local: re-lowering under another scope
+                // re-resolves by name.
+                if let Ok(idx) = self.res.universe.index(n) {
+                    return Ok((arena.expr_atoms(vec![idx]), 1));
                 }
                 return Err(FrontError::Parse {
                     pos: *pos,

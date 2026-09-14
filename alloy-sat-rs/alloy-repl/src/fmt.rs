@@ -50,6 +50,70 @@ pub fn set_alloy(universe: &Universe, arity: u32, ts: &TupleSet) -> String {
         .join(" + ")
 }
 
+/// A tuple set as an Alloy expression safe for re-parsing (round-trip).
+///
+/// Unlike [`set_alloy`] (display-only), n-ary tuples are parenthesized so
+/// the grouping survives re-parsing regardless of `->`/`+` precedence.
+/// Empty renders as `none`.
+pub fn set_expr_alloy(universe: &Universe, arity: u32, ts: &TupleSet) -> String {
+    if ts.is_empty() {
+        return "none".to_string();
+    }
+    ts.index_view()
+        .iter()
+        .map(|idx| {
+            let t = tuple_alloy(universe, arity, idx);
+            if arity >= 2 {
+                format!("({t})")
+            } else {
+                t
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// Sanitize a file stem into an Alloy fact name (`pin_<stem>`).
+fn sanitize_fact_name(stem: &str) -> String {
+    let clean: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let clean = clean.trim_matches('_');
+    if clean.is_empty() {
+        "pin".to_string()
+    } else {
+        format!("pin_{clean}")
+    }
+}
+
+/// Assemble a partial-instance pin fact (`lines`: `(reference, expr)` pairs).
+///
+/// The fact is a single named declaration, so re-adding the file replaces
+/// the previous pin (`fragment_keys` yields one replace key).
+pub fn pin_fact_text(
+    file_stem: &str,
+    sol_name: &str,
+    universe_size: usize,
+    lines: &[(String, String)],
+) -> String {
+    let fact = sanitize_fact_name(file_stem);
+    let mut out =
+        format!("-- partial instance from solution `{sol_name}` (universe {universe_size})\n");
+    out.push_str(&format!("fact {fact} {{\n"));
+    for (name, expr) in lines {
+        out.push_str(&format!("  {name} = {expr}\n"));
+    }
+    out.push_str("}\n");
+    out
+}
+
 /// An instance in Alloy style: one `name = expr` line per relation.
 pub fn instance_alloy(inst: &Instance) -> String {
     let mut out = String::from("relations:");
@@ -98,6 +162,29 @@ mod tests {
         let mut ts = TupleSet::new(&u, 2).unwrap();
         ts.insert_index(1);
         assert_eq!(set_alloy(&u, 2, &ts), "A$0->B$0");
+    }
+
+    #[test]
+    fn set_expr_parens_nary_tuples() {
+        let u = u2();
+        let mut ts = TupleSet::new(&u, 2).unwrap();
+        ts.insert_index(1);
+        assert_eq!(set_expr_alloy(&u, 2, &ts), "(A$0->B$0)");
+        let empty = TupleSet::new(&u, 2).unwrap();
+        assert_eq!(set_expr_alloy(&u, 2, &empty), "none");
+        let mut one = TupleSet::new(&u, 1).unwrap();
+        one.insert_index(0);
+        assert_eq!(set_expr_alloy(&u, 1, &one), "A$0");
+    }
+
+    #[test]
+    fn pin_fact_text_shape() {
+        let s = pin_fact_text("my-pin", "s1", 4, &[("A".to_string(), "A$0".to_string())]);
+        assert!(s.contains("fact pin_my_pin {"), "got:\n{s}");
+        assert!(s.contains("A = A$0"), "got:\n{s}");
+        assert!(s.starts_with("--"), "got:\n{s}");
+        let weird = pin_fact_text("...///", "s", 1, &[]);
+        assert!(weird.contains("fact pin {"), "got:\n{weird}");
     }
 
     #[test]

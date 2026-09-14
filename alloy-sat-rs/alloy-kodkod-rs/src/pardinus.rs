@@ -158,6 +158,7 @@ fn collect_expr_relations(arena: &AstArena, e: ExprId, out: &mut BTreeSet<Relati
         }
         crate::ast::ExprNode::Variable(_)
         | crate::ast::ExprNode::Constant(_)
+        | crate::ast::ExprNode::Atoms(_)
         | crate::ast::ExprNode::FromInt(_) => {}
         crate::ast::ExprNode::Unary { child, .. }
         | crate::ast::ExprNode::Temporal { child, .. } => {

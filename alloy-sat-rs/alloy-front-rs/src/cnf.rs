@@ -186,7 +186,7 @@ pub fn check(module: &Module, index: usize) -> Result<Cnf, FrontError> {
 }
 
 /// Reconstruct an `Instance` from a SAT assignment over `cnf.origins`.
-fn materialize(
+pub(crate) fn materialize(
     bounds: &Bounds,
     origins: &[VarOrigin],
     truth: impl Fn(u32) -> bool,

@@ -424,7 +424,7 @@ impl Parser {
             names.push(self.ident()?);
         }
         if self.eat(&Tok::Colon) {
-            let expr = self.arrow_type(in_sig)?;
+            let expr = self.arrow_type()?;
             Ok(Decl {
                 disj,
                 names,
@@ -442,11 +442,15 @@ impl Parser {
     /// Parses a declaration type expression: sequence of `[mult] atom`
     /// joined by `->`. Leading multiplicity allowed.
     /// Alloy also allows trailing multiplicities: `Field lone -> lone Slot`.
-    fn arrow_type(&mut self, in_sig: bool) -> PResult<Expr> {
+    fn arrow_type(&mut self) -> PResult<Expr> {
         let lead_pos = self.pos();
         let lead_mult = self.opt_mult_kw();
         let lead_had_mult = lead_mult.is_some();
-        let mut acc = self.parse_rproduct(in_sig)?;
+        // Segments exclude arrows structurally: force the `in_sig` gate so
+        // `A -> lone B` still reaches this function's own loop (with its
+        // multiplicity placement), even in `decl(false)` contexts. Union and
+        // friends stay available inside segments (`f: A + B`).
+        let mut acc = self.parse_plusminus(true)?;
         // Trailing multiplicity overrides leading (e.g. `Field lone` or `lone Field lone`)
         let m = self.opt_mult_kw().or(lead_mult);
         if let Some(m) = m {
@@ -465,7 +469,7 @@ impl Parser {
         // Parse subsequent `-> [mult] type [mult]` parts
         while self.eat(&Tok::Arrow) {
             let pre_mult = self.opt_mult_kw();
-            let rhs = self.parse_rproduct(in_sig)?;
+            let rhs = self.parse_plusminus(true)?;
             let post_mult = self.opt_mult_kw();
             let m = post_mult.or(pre_mult);
             acc = Expr::Bin(BinOp::Product, Box::new(acc), Box::new(rhs));
@@ -731,37 +735,46 @@ impl Parser {
     // expressions
     // ------------------------------------------------------------------
 
-    /// Top-level relational expression (arrow lowest).
+    /// Top-level relational expression (union/difference loosest).
+    ///
+    /// Alloy6 precedence, loosest first: `+ -`, then `++`, then `&`, then
+    /// `->` (and the non-standard `<->` reverse product), then `<:`,
+    /// then unary/`'`/`.`/`[]`. All binary operators are left-associative.
     fn rel_expr_top(&mut self, in_sig: bool) -> PResult<Expr> {
-        let e = self.parse_arrow(in_sig)?;
+        let e = self.parse_plusminus(in_sig)?;
         Ok(e)
     }
 
     fn parse_arrow(&mut self, in_sig: bool) -> PResult<Expr> {
-        let l = self.parse_rproduct(in_sig)?;
-        if self.eat(&Tok::Arrow) {
-            let r = self.parse_arrow(in_sig)?;
-            return Ok(Expr::Bin(BinOp::Product, Box::new(l), Box::new(r)));
+        let mut l = self.parse_colon_lt(in_sig)?;
+        // `<->` is a non-standard reverse product: a <-> b == b -> a.
+        // It shares `->`'s level and left associativity.
+        // In sig-field types (`in_sig`, via `arrow_type`) arrows belong to
+        // `arrow_type`'s own loop (multiplicity placement like `A lone -> B`),
+        // so stop here and let it consume them.
+        if in_sig {
+            return Ok(l);
         }
-        Ok(l)
-    }
-
-    fn parse_rproduct(&mut self, in_sig: bool) -> PResult<Expr> {
-        let mut l = self.parse_override(in_sig)?;
-        // `<->` is the reverse product: a <-> b == b -> a
-        while matches!(self.peek(), Tok::ShArrow) {
-            self.bump();
-            let r = self.parse_override(in_sig)?;
-            l = Expr::Bin(BinOp::Product, Box::new(r), Box::new(l));
+        loop {
+            if self.eat(&Tok::Arrow) {
+                let r = self.parse_colon_lt(in_sig)?;
+                l = Expr::Bin(BinOp::Product, Box::new(l), Box::new(r));
+            } else if matches!(self.peek(), Tok::ShArrow) {
+                self.bump();
+                let r = self.parse_colon_lt(in_sig)?;
+                l = Expr::Bin(BinOp::Product, Box::new(r), Box::new(l));
+            } else {
+                break;
+            }
         }
         Ok(l)
     }
 
     fn parse_override(&mut self, in_sig: bool) -> PResult<Expr> {
-        let mut l = self.parse_plusminus(in_sig)?;
+        let mut l = self.parse_amp(in_sig)?;
         loop {
             if self.eat(&Tok::PlusPlus) {
-                let r = self.parse_plusminus(in_sig)?;
+                let r = self.parse_amp(in_sig)?;
                 l = Expr::Bin(BinOp::Override, Box::new(l), Box::new(r));
             } else {
                 break;
@@ -771,17 +784,17 @@ impl Parser {
     }
 
     fn parse_plusminus(&mut self, in_sig: bool) -> PResult<Expr> {
-        let mut l = self.parse_amp(in_sig)?;
+        let mut l = self.parse_override(in_sig)?;
         loop {
             match self.peek() {
                 Tok::Plus => {
                     self.bump();
-                    let r = self.parse_amp(in_sig)?;
+                    let r = self.parse_override(in_sig)?;
                     l = Expr::Bin(BinOp::Union, Box::new(l), Box::new(r));
                 }
                 Tok::Minus => {
                     self.bump();
-                    let r = self.parse_amp(in_sig)?;
+                    let r = self.parse_override(in_sig)?;
                     l = Expr::Bin(BinOp::Difference, Box::new(l), Box::new(r));
                 }
                 _ => break,
@@ -791,9 +804,9 @@ impl Parser {
     }
 
     fn parse_amp(&mut self, in_sig: bool) -> PResult<Expr> {
-        let mut l = self.parse_colon_lt(in_sig)?;
+        let mut l = self.parse_arrow(in_sig)?;
         while self.eat(&Tok::Amp) {
-            let r = self.parse_colon_lt(in_sig)?;
+            let r = self.parse_arrow(in_sig)?;
             l = Expr::Bin(BinOp::Intersect, Box::new(l), Box::new(r));
         }
         Ok(l)
@@ -987,21 +1000,37 @@ impl Parser {
     // formulas
     // ------------------------------------------------------------------
 
+    /// Top-level formula.
+    ///
+    /// Alloy6 precedence, loosest first: binary temporal connectives, then
+    /// `||`/`or`, then `<=>`/`iff`, then `=>`/`implies`, then `&&`/`and`,
+    /// then unary/`!`/`not`/multiplicities/comparisons. All binary operators
+    /// are left-associative, except `=>` (right) and the binary temporal
+    /// connectives (non-associative: chaining them is a parse error).
+    ///
+    /// Two deliberate deviations from Alloy6 proper: binary temporal
+    /// connectives sit at the very bottom (weakest) instead of above `&&`
+    /// (`a until b || c` reads as `a until (b || c)`), and the `;` sequence
+    /// operator is not supported (still a parse error).
     fn formula(&mut self) -> PResult<Formula> {
-        self.parse_iff()
+        self.parse_temporal_bin()
     }
 
     fn parse_iff(&mut self) -> PResult<Formula> {
-        let l = self.parse_implies()?;
-        if self.eat(&Tok::Iff) || self.eat(&Tok::IffKw) {
-            let r = self.parse_iff()?;
-            return Ok(Formula::Iff(Box::new(l), Box::new(r)));
+        let mut l = self.parse_implies()?;
+        loop {
+            if self.eat(&Tok::Iff) || self.eat(&Tok::IffKw) {
+                let r = self.parse_implies()?;
+                l = Formula::Iff(Box::new(l), Box::new(r));
+            } else {
+                break;
+            }
         }
         Ok(l)
     }
 
     fn parse_implies(&mut self) -> PResult<Formula> {
-        let l = self.parse_temporal_bin()?;
+        let l = self.parse_and()?;
         if self.eat(&Tok::Implies) || self.eat(&Tok::ImpliesKw) {
             let r = self.parse_implies()?;
             // legacy `A => B else C` form
@@ -1018,30 +1047,36 @@ impl Parser {
 
     fn parse_temporal_bin(&mut self) -> PResult<Formula> {
         let l = self.parse_or()?;
-        if self.eat(&Tok::Until) {
-            let r = self.parse_temporal_bin()?;
-            return Ok(Formula::Until(Box::new(l), Box::new(r)));
+        let mk = if self.eat(&Tok::Until) {
+            Formula::Until as fn(Box<Formula>, Box<Formula>) -> Formula
+        } else if self.eat(&Tok::Releases) {
+            Formula::Releases as fn(Box<Formula>, Box<Formula>) -> Formula
+        } else if self.eat(&Tok::Since) {
+            Formula::Since as fn(Box<Formula>, Box<Formula>) -> Formula
+        } else if self.eat(&Tok::Triggered) {
+            Formula::Triggered as fn(Box<Formula>, Box<Formula>) -> Formula
+        } else {
+            return Ok(l);
+        };
+        let r = self.parse_or()?;
+        // Binary temporal connectives are non-associative (Alloy6): chaining
+        // them without parentheses is rejected rather than guessed.
+        if matches!(
+            self.peek(),
+            Tok::Until | Tok::Releases | Tok::Since | Tok::Triggered
+        ) {
+            return Err(
+                self.err("temporal connectives are non-associative; parenthesize the nesting")
+            );
         }
-        if self.eat(&Tok::Releases) {
-            let r = self.parse_temporal_bin()?;
-            return Ok(Formula::Releases(Box::new(l), Box::new(r)));
-        }
-        if self.eat(&Tok::Since) {
-            let r = self.parse_temporal_bin()?;
-            return Ok(Formula::Since(Box::new(l), Box::new(r)));
-        }
-        if self.eat(&Tok::Triggered) {
-            let r = self.parse_temporal_bin()?;
-            return Ok(Formula::Triggered(Box::new(l), Box::new(r)));
-        }
-        Ok(l)
+        Ok(mk(Box::new(l), Box::new(r)))
     }
 
     fn parse_or(&mut self) -> PResult<Formula> {
-        let mut l = self.parse_and()?;
+        let mut l = self.parse_iff()?;
         while matches!(self.peek(), Tok::OrOp | Tok::OrKw) {
             self.bump();
-            let r = self.parse_and()?;
+            let r = self.parse_iff()?;
             l = Formula::Or(Box::new(l), Box::new(r));
         }
         // Alloy also accepts single '|' for or in some grammars; keep '||' only.
@@ -1100,47 +1135,47 @@ impl Parser {
             }
             Tok::Always => {
                 self.bump();
-                Ok(Formula::Always(Box::new(self.formula()?)))
+                Ok(Formula::Always(Box::new(self.parse_not_level()?)))
             }
             Tok::Eventually => {
                 self.bump();
-                Ok(Formula::Eventually(Box::new(self.formula()?)))
+                Ok(Formula::Eventually(Box::new(self.parse_not_level()?)))
             }
             Tok::Before => {
                 self.bump();
-                Ok(Formula::Before(Box::new(self.formula()?)))
+                Ok(Formula::Before(Box::new(self.parse_not_level()?)))
             }
             Tok::Historically => {
                 self.bump();
-                Ok(Formula::Historically(Box::new(self.formula()?)))
+                Ok(Formula::Historically(Box::new(self.parse_not_level()?)))
             }
             Tok::Once => {
                 self.bump();
-                Ok(Formula::Once(Box::new(self.formula()?)))
+                Ok(Formula::Once(Box::new(self.parse_not_level()?)))
             }
             Tok::Keeping => {
                 self.bump();
-                Ok(Formula::Keeping(Box::new(self.formula()?)))
+                Ok(Formula::Keeping(Box::new(self.parse_not_level()?)))
             }
             Tok::Goal => {
                 self.bump();
-                Ok(Formula::Goal(Box::new(self.formula()?)))
+                Ok(Formula::Goal(Box::new(self.parse_not_level()?)))
             }
             Tok::Restore => {
                 self.bump();
-                Ok(Formula::Restore(Box::new(self.formula()?)))
+                Ok(Formula::Restore(Box::new(self.parse_not_level()?)))
             }
             Tok::Initially => {
                 self.bump();
-                Ok(Formula::Initially(Box::new(self.formula()?)))
+                Ok(Formula::Initially(Box::new(self.parse_not_level()?)))
             }
             Tok::Regularly => {
                 self.bump();
-                Ok(Formula::Regularly(Box::new(self.formula()?)))
+                Ok(Formula::Regularly(Box::new(self.parse_not_level()?)))
             }
             Tok::Consistently => {
                 self.bump();
-                Ok(Formula::Consistently(Box::new(self.formula()?)))
+                Ok(Formula::Consistently(Box::new(self.parse_not_level()?)))
             }
             Tok::All | Tok::Some | Tok::No | Tok::Lone | Tok::One => self.parse_quant_or_cmp(),
             Tok::Sum => {
@@ -1315,7 +1350,8 @@ impl Parser {
         let l = self.rel_expr_top(false)?;
         if let Expr::Name(n, ppos) = &l {
             // bare identifier in formula position: zero-arg predicate call,
-            // valid when a formula operator follows (=> <=> || and or } ...)
+            // valid when a formula operator follows (=> <=> || and or,
+            // temporal connectives, } ) ...) as well as at `)`/EOF.
             if matches!(
                 self.peek(),
                 Tok::Implies
@@ -1326,7 +1362,12 @@ impl Parser {
                     | Tok::OrKw
                     | Tok::AndOp
                     | Tok::AndKw
+                    | Tok::Until
+                    | Tok::Releases
+                    | Tok::Since
+                    | Tok::Triggered
                     | Tok::RBrace
+                    | Tok::RParen
                     | Tok::Eof
             ) {
                 return Ok(Formula::Call(n.clone(), Vec::new(), *ppos));

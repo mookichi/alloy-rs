@@ -212,6 +212,13 @@ impl<'a> FolTranslator<'a> {
                 ))
             }
             ExprNode::Constant(c) => self.leaf_constant(c),
+            ExprNode::Atoms(atoms) => {
+                let set: std::collections::HashSet<usize> =
+                    atoms.into_iter().map(|a| a as usize).collect();
+                Ok(Rc::new(
+                    self.const_matrix(&self.dims(1)?, |i| set.contains(&i)),
+                ))
+            }
             ExprNode::Unary { op, child } => {
                 let m = self.expr_matrix(arena, child, env)?;
                 let out = match op {

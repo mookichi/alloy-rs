@@ -158,6 +158,14 @@ impl<'a> Evaluator<'a> {
                     .cloned()
                     .ok_or(EvalError::UnboundInteger(v))
             }
+            crate::ast::ExprNode::Atoms(atoms) => {
+                let mut out = IntSet::new();
+                for a in atoms {
+                    out.insert(a as Int);
+                }
+                TupleSet::from_indices(self.instance.universe(), 1, out)
+                    .map_err(|_| EvalError::UnboundVariable)
+            }
         }
     }
 

@@ -73,6 +73,17 @@ pub fn upper_bound_expr(arena: &AstArena, e: ExprId, bounds: &Bounds) -> Option<
             }
         }
         crate::ast::ExprNode::Variable(_) | crate::ast::ExprNode::Temporal { .. } => None,
+        crate::ast::ExprNode::Atoms(atoms) => {
+            let uni = bounds.universe();
+            let mut ts = TupleSet::new(uni, 1).ok()?;
+            for a in atoms {
+                if a as usize >= uni.size() {
+                    return None;
+                }
+                ts.insert_index(a as i64);
+            }
+            Some(ts)
+        }
         crate::ast::ExprNode::Unary { op, child } => {
             let m = upper_bound_expr(arena, child, bounds)?;
             match op {
@@ -144,6 +155,7 @@ impl<'a> StaticSkolemizer<'a> {
             },
             crate::ast::ExprNode::Relation(_)
             | crate::ast::ExprNode::Constant(_)
+            | crate::ast::ExprNode::Atoms(_)
             | crate::ast::ExprNode::FromInt(_)
             | crate::ast::ExprNode::Temporal { .. } => e,
             crate::ast::ExprNode::Unary { op, child } => {
