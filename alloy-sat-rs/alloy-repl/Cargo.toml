@@ -1,0 +1,16 @@
+[package]
+name = "alloy-repl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Interactive REPL for Alloy (Rust native): run/check build Cnf, solve inspects it"
+
+[[bin]]
+name = "alloy-repl"
+path = "src/main.rs"
+
+[dependencies]
+alloy-front-rs = { path = "../alloy-front-rs" }
+alloy-kodkod-rs = { path = "../alloy-kodkod-rs" }
+rustyline = "15"
+clap = { version = "4", features = ["derive"] }

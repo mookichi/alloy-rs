@@ -330,13 +330,14 @@ fn sig_fact_block_unsat() {
     assert_eq!(outcome(src, 0), "UNSAT");
 }
 
-/// Let binding in expression position: `let x = A in some x`.
+/// Let binding in expression position: `let x = A | some x`
+/// (Java parity: `|` separator; `in` is rejected).
 #[test]
 fn let_expr_position() {
     let src = r#"
         module t
         sig A {}
-        pred p { some (let x = A in x) }
+        pred p { some (let x = A | x) }
         run p for exactly 2
     "#;
     assert_eq!(outcome(src, 0), "SAT");
@@ -348,7 +349,7 @@ fn let_expr_multi_bind() {
     let src = r#"
         module t
         sig A {}
-        pred p { some (let x = A, y = A in x + y) }
+        pred p { some (let x = A, y = A | x + y) }
         run p for exactly 2
     "#;
     assert_eq!(outcome(src, 0), "SAT");

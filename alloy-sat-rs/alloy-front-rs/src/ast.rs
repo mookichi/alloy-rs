@@ -46,6 +46,7 @@ pub enum BinOp {
     Override,
     Product,
     Join,
+    DomainRestrict,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +72,8 @@ pub enum Expr {
     LeadMult(Mult3, Box<Expr>),
     /// Prime (next-state): `e'` or `after e`
     Prime(Box<Expr>),
+    /// Static field access: `@field` or `^@field`
+    AtExpr(Box<Expr>),
     /// Let binding in expression position: `let x = expr in expr`
     LetBind(Vec<(String, Expr)>, Box<Expr>),
 }
@@ -193,6 +196,7 @@ impl Expr {
     pub fn has_temporal(&self) -> bool {
         match self {
             Expr::Prime(_) => true,
+            Expr::AtExpr(x) => x.has_temporal(),
             Expr::Bin(_, a, b) => a.has_temporal() || b.has_temporal(),
             Expr::Transpose(x) | Expr::TClosure(x) | Expr::RClosure(x) => x.has_temporal(),
             Expr::Comprehension(decls, body) => {

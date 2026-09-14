@@ -76,6 +76,21 @@ impl Parser {
     // module
     // ------------------------------------------------------------------
 
+    /// Parse a single bare relational expression (REPL `:eval`/`:query` input).
+    /// `let` bindings are accepted wherever the expression grammar allows them.
+    pub fn expr(mut self) -> PResult<Expr> {
+        let e = self.rel_expr_top(false)?;
+        self.expect(&Tok::Eof)?;
+        Ok(e)
+    }
+
+    /// Parse a single top-level formula (REPL `:eval` input).
+    pub fn formula_top(mut self) -> PResult<Formula> {
+        let f = self.formula()?;
+        self.expect(&Tok::Eof)?;
+        Ok(f)
+    }
+
     pub fn module(mut self) -> PResult<Module> {
         let mut header = String::new();
         if self.eat(&Tok::Module) {
@@ -327,8 +342,24 @@ impl Parser {
         }
         // Optional sig fact block: `sig A { fields } { formula }`
         let fact = if self.eat(&Tok::LBrace) {
-            let f = self.formula()?;
-            self.expect(&Tok::RBrace)?;
+            let mut parts: Vec<Formula> = Vec::new();
+            loop {
+                if self.eat(&Tok::RBrace) {
+                    break;
+                }
+                if matches!(self.peek(), Tok::Eof) {
+                    return Err(self.err("unterminated sig fact block"));
+                }
+                parts.push(self.formula()?);
+            }
+            let f = if parts.is_empty() {
+                Formula::Const(true)
+            } else {
+                parts
+                    .into_iter()
+                    .reduce(|a, b| Formula::And(Box::new(a), Box::new(b)))
+                    .unwrap()
+            };
             Some(f)
         } else {
             None
@@ -410,26 +441,37 @@ impl Parser {
 
     /// Parses a declaration type expression: sequence of `[mult] atom`
     /// joined by `->`. Leading multiplicity allowed.
+    /// Alloy also allows trailing multiplicities: `Field lone -> lone Slot`.
     fn arrow_type(&mut self, in_sig: bool) -> PResult<Expr> {
-        let mut parts: Vec<(Option<Tok>, Expr)> = Vec::new();
+        let lead_pos = self.pos();
         let lead_mult = self.opt_mult_kw();
-        parts.push((lead_mult.clone(), self.parse_rproduct(in_sig)?));
-        while self.eat(&Tok::Arrow) {
-            let m = self.opt_mult_kw();
-            parts.push((m, self.parse_rproduct(in_sig)?));
+        let lead_had_mult = lead_mult.is_some();
+        let mut acc = self.parse_rproduct(in_sig)?;
+        // Trailing multiplicity overrides leading (e.g. `Field lone` or `lone Field lone`)
+        let m = self.opt_mult_kw().or(lead_mult);
+        if let Some(m) = m {
+            acc = Expr::LeadMult(mult3(&m), Box::new(acc));
         }
-        // fold right-assoc: a -> b -> c == a -> (b -> c)
-        let mut iter = parts.into_iter().rev();
-        let (_, mut acc) = iter.next().unwrap();
-        for (m, lhs) in iter {
-            acc = Expr::Bin(BinOp::Product, Box::new(lhs), Box::new(acc));
+        // Java parity: a multiplicity BEFORE the first segment of a
+        // multi-segment arrow (`lone A -> B`) is a type error; the
+        // marking must follow its segment (`A lone -> B`). (`set` is
+        // consumed without marking, so it never triggers this.)
+        if lead_had_mult && matches!(self.peek(), Tok::Arrow) {
+            return Err(FrontError::Parse {
+                pos: lead_pos,
+                msg: "multiplicity must follow its type in `A m -> B` (Java parity)".to_string(),
+            });
+        }
+        // Parse subsequent `-> [mult] type [mult]` parts
+        while self.eat(&Tok::Arrow) {
+            let pre_mult = self.opt_mult_kw();
+            let rhs = self.parse_rproduct(in_sig)?;
+            let post_mult = self.opt_mult_kw();
+            let m = post_mult.or(pre_mult);
+            acc = Expr::Bin(BinOp::Product, Box::new(acc), Box::new(rhs));
             if let Some(kw) = m {
-                // multiplicity marker; the lowerer reads ArrowMult nodes
                 acc = Expr::ArrowMult(mult3(&kw), Box::new(acc));
             }
-        }
-        if let Some(m) = lead_mult {
-            acc = Expr::LeadMult(mult3(&m), Box::new(acc));
         }
         Ok(acc)
     }
@@ -610,6 +652,37 @@ impl Parser {
         } else {
             scope.overall = Some(first);
         }
+        // handle comma-separated entries: `for 2 State, 1 Assignment, ...`
+        while self.eat(&Tok::Comma) {
+            let exact = self.eat(&Tok::Exactly);
+            if matches!(self.peek(), Tok::IntKw) {
+                self.bump();
+                let n = self.int_lit()? as u32;
+                scope.int_scope = Some(n);
+            } else if matches!(self.peek(), Tok::Steps) {
+                self.bump();
+                let n = first;
+                scope.steps = Some(n);
+            } else {
+                let n = self.int_lit()? as u32;
+                if matches!(self.peek(), Tok::Ident(_)) {
+                    let name = self.ident()?;
+                    scope.entries.push((
+                        name,
+                        if exact {
+                            ScopeEntry::Exactly(n)
+                        } else {
+                            ScopeEntry::Num(n)
+                        },
+                    ));
+                } else {
+                    scope.overall = Some(n);
+                    if exact {
+                        scope.overall_exact = true;
+                    }
+                }
+            }
+        }
         if self.eat(&Tok::But) {
             loop {
                 let exact = self.eat(&Tok::Exactly);
@@ -718,10 +791,19 @@ impl Parser {
     }
 
     fn parse_amp(&mut self, in_sig: bool) -> PResult<Expr> {
-        let mut l = self.parse_unary(in_sig)?;
+        let mut l = self.parse_colon_lt(in_sig)?;
         while self.eat(&Tok::Amp) {
-            let r = self.parse_unary(in_sig)?;
+            let r = self.parse_colon_lt(in_sig)?;
             l = Expr::Bin(BinOp::Intersect, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn parse_colon_lt(&mut self, in_sig: bool) -> PResult<Expr> {
+        let mut l = self.parse_unary(in_sig)?;
+        while self.eat(&Tok::ColonLt) {
+            let r = self.parse_unary(in_sig)?;
+            l = Expr::Bin(BinOp::DomainRestrict, Box::new(l), Box::new(r));
         }
         Ok(l)
     }
@@ -730,15 +812,24 @@ impl Parser {
         match self.peek() {
             Tok::Tilde => {
                 self.bump();
-                Ok(Expr::Transpose(Box::new(self.parse_unary(in_sig)?)))
+                let at = self.eat(&Tok::At);
+                let inner = self.parse_unary(in_sig)?;
+                let inner = if at { Expr::AtExpr(Box::new(inner)) } else { inner };
+                Ok(Expr::Transpose(Box::new(inner)))
             }
             Tok::Hat => {
                 self.bump();
-                Ok(Expr::TClosure(Box::new(self.parse_unary(in_sig)?)))
+                let at = self.eat(&Tok::At);
+                let inner = self.parse_unary(in_sig)?;
+                let inner = if at { Expr::AtExpr(Box::new(inner)) } else { inner };
+                Ok(Expr::TClosure(Box::new(inner)))
             }
             Tok::Star => {
                 self.bump();
-                Ok(Expr::RClosure(Box::new(self.parse_unary(in_sig)?)))
+                let at = self.eat(&Tok::At);
+                let inner = self.parse_unary(in_sig)?;
+                let inner = if at { Expr::AtExpr(Box::new(inner)) } else { inner };
+                Ok(Expr::RClosure(Box::new(inner)))
             }
             Tok::After => {
                 self.bump();
@@ -754,8 +845,10 @@ impl Parser {
             match self.peek() {
                 Tok::Dot => {
                     self.bump();
+                    let at = self.eat(&Tok::At);
                     // right side may carry prefix closures: n.^next
                     let r = self.parse_unary(in_sig)?;
+                    let r = if at { Expr::AtExpr(Box::new(r)) } else { r };
                     l = Expr::Bin(BinOp::Join, Box::new(l), Box::new(r));
                 }
                 Tok::LBracket => {
@@ -778,7 +871,8 @@ impl Parser {
 
     fn parse_primary(&mut self, in_sig: bool) -> PResult<Expr> {
         let pos = self.pos();
-        // let binding in expression context: `let x = expr in expr`
+        // let binding in expression context: `let x = expr | expr`
+        // (Java parity: `|` separator like the formula level; `in` is rejected).
         if matches!(self.peek(), Tok::Let) {
             self.bump();
             let mut binds = Vec::new();
@@ -791,7 +885,7 @@ impl Parser {
                     break;
                 }
             }
-            self.expect(&Tok::In)?;
+            self.eat(&Tok::Bar);
             let body = self.rel_expr_top(in_sig)?;
             return Ok(Expr::LetBind(binds, Box::new(body)));
         }
@@ -987,8 +1081,12 @@ impl Parser {
                     break;
                 }
             }
-            self.expect(&Tok::Bar)?;
-            let body = self.formula()?;
+            self.eat(&Tok::Bar);
+            let body = if matches!(self.peek(), Tok::LBrace) {
+                self.braced_formula()?
+            } else {
+                self.formula()?
+            };
             return Ok(Formula::LetBind(binds, Box::new(body)));
         }
         match self.peek() {
@@ -1049,6 +1147,7 @@ impl Parser {
                 // sum formula? not a formula starter; error out naturally
                 self.parse_quant_or_cmp()
             }
+            Tok::LBrace => self.braced_formula(),
             _ => self.parse_comparison(),
         }
     }
@@ -1089,15 +1188,13 @@ impl Parser {
                 }
                 let ds = self.quant_decls()?;
                 // both `all x: D | F` and `all x: D { F }` forms
-                let body = if matches!(self.peek(), Tok::LBrace) {
+                let body = if matches!(self.peek(), Tok::Bar) {
+                    self.bump(); // consume |
+                    self.formula()?
+                } else if matches!(self.peek(), Tok::LBrace) {
                     self.braced_formula()?
                 } else {
-                    self.expect(&Tok::Bar)?;
-                    if matches!(self.peek(), Tok::LBrace) {
-                        self.braced_formula()?
-                    } else {
-                        self.formula()?
-                    }
+                    return Err(self.err("expected '|' or '{' after quantifier declarations"));
                 };
                 if qk == QuantKind::No {
                     let some = Formula::Quant(QuantKind::Some, ds, Box::new(body));
@@ -1143,7 +1240,15 @@ impl Parser {
             && (matches!(self.peek_at(2), Tok::Colon) || matches!(self.peek_at(2), Tok::Comma))
         {
             self.bump(); // comma
+            // If the token after the name we're about to read is Colon,
+            // it means the group ends with this name: `x, y: S`
+            // But if peek_at(1) (after the comma) is a name followed by Colon
+            // and we've already consumed a Colon for a prior name, stop.
             names.push(self.ident()?);
+            // If next is Colon, the group is complete — don't add more
+            if matches!(self.peek(), Tok::Colon) {
+                break;
+            }
         }
         self.expect(&Tok::Colon)?;
         let expr = self.rel_expr_top(false)?;

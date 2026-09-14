@@ -99,6 +99,8 @@ pub enum Tok {
     OrOp,
     AndOp,
     ShArrow,
+    At,
+    ColonLt,
     Eof,
 }
 
@@ -199,6 +201,8 @@ impl Tok {
             Tok::OrOp => "'||'",
             Tok::AndOp => "'&&'",
             Tok::ShArrow => "'=>'",
+            Tok::At => "'@'",
+            Tok::ColonLt => "'<:'",
             Tok::Eof => "end of input",
         }
     }
@@ -215,7 +219,16 @@ fn is_ident_start(c: char) -> bool {
 }
 
 fn is_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '\'' || c == '"'
+    // NOTE: must be a superset of `is_ident_start` (in particular `$`),
+    // otherwise the lexer emits an empty token without advancing and
+    // loops forever (fuzz-found OOM on `B$`).
+    c.is_ascii_alphanumeric()
+        || c == '_'
+        || c == '$'
+        || c == '\''
+        || c == '"'
+        || c == '\u{2019}'  // right single quotation mark (unicode prime)
+        || c == '\u{201D}'  // right double quotation mark
 }
 
 /// Tokenizes `src`. Comments (`//`, `--`, `/* */`) and whitespace are
@@ -259,6 +272,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, crate::FrontError> {
             if two(b'<', b'=') && three.len() >= 3 && three[2] == b'>' {
                 i += 3;
                 Some((Tok::Iff, "<=>"))
+            } else if two(b'<', b':') {
+                i += 2;
+                Some((Tok::ColonLt, "<:"))
+            } else if two(b'=', b'<') {
+                i += 2;
+                Some((Tok::LtEq, "=<"))
             } else if two(b'<', b'=') {
                 i += 2;
                 Some((Tok::LtEq, "<="))
@@ -319,10 +338,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, crate::FrontError> {
             '<' => push(&mut out, Tok::Lt, start, &mut i),
             '!' => push(&mut out, Tok::Not, start, &mut i),
             '>' => push(&mut out, Tok::Gt, start, &mut i),
+            '@' => push(&mut out, Tok::At, start, &mut i),
             _ if c.is_ascii_digit() => {
+                // Saturate: overlong literals (fuzz-found panic on 24 digits)
+                // clamp at i64::MAX instead of overflowing.
                 let mut v: i64 = 0;
                 while i < b.len() && (b[i] as char).is_ascii_digit() {
-                    v = v * 10 + (b[i] - b'0') as i64;
+                    v = v
+                        .saturating_mul(10)
+                        .saturating_add((b[i] - b'0') as i64);
                     i += 1;
                 }
                 out.push(Token {

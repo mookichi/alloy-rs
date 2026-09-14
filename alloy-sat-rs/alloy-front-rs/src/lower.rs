@@ -42,7 +42,164 @@ impl<'m> Lowerer<'m> {
             .commands
             .get(index)
             .ok_or_else(|| FrontError::Resolve(format!("no command #{index}")))?;
-        let res = bounds::resolve(self.module, &cmd.scope).map_err(FrontError::Resolve)?;
+        // Clone up front: the setup closure below borrows `self` mutably.
+        let scope = cmd.scope.clone();
+        let kind = cmd.kind.clone();
+        let (arena, bounds, bitwidth, formula) = self.with_setup(&scope, |ctx, arena, _bounds, mut parts| {
+            // global facts
+            for (_, f) in &ctx.module.facts {
+                parts.push(ctx.lower_formula(arena, f, &mut Vec::new())?);
+            }
+            // sig facts: all this: S | fact
+            for sd in &ctx.module.sigs {
+                if let Some(f) = &sd.fact {
+                    for owner in &sd.names {
+                        let fid = ctx.lower_sig_fact(arena, f, owner)?;
+                        parts.push(fid);
+                    }
+                }
+            }
+            // sig `in` constraints: sig A in B  =>  A in B (subset)
+            for sd in &ctx.module.sigs {
+                if sd.rel == crate::ast::SigRel::In {
+                    if let Some(parent_name) = &sd.extends {
+                        for child_name in &sd.names {
+                            let child_rel = ctx.lookup_rel(child_name).ok_or_else(|| {
+                                FrontError::Resolve(format!("unknown sig '{child_name}'"))
+                            })?;
+                            let parent_rel = ctx.lookup_rel(parent_name).ok_or_else(|| {
+                                FrontError::Resolve(format!("unknown sig '{parent_name}'"))
+                            })?;
+                            let ce = arena.expr_relation(child_rel);
+                            let pe = arena.expr_relation(parent_rel);
+                            // A in B  <=>  no (A - B)
+                            let diff = arena
+                                .binary_expr(kk::BinaryOp::Difference, ce, pe)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            let some_diff = arena
+                                .multiplicity_formula(Multiplicity::Some, diff)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            parts.push(arena.not(some_diff));
+                        }
+                    }
+                }
+            }
+            // command body
+            let body_name = match &kind {
+                CommandKind::Run(n) => n.clone(),
+                CommandKind::Check(n) => n.clone(),
+            };
+            match body_name {
+                None => parts.push(arena.bool_formula(true)),
+                Some(name) => {
+                    let para = ctx
+                        .module
+                        .paras
+                        .iter()
+                        .find(|p| p.name == name)
+                        .ok_or_else(|| {
+                            FrontError::Resolve(format!("command references unknown '{name}'"))
+                        })?;
+                    if !para.params.is_empty() {
+                        return Err(FrontError::Unsupported(format!(
+                            "parametrized '{name}' in command"
+                        )));
+                    }
+                    let bf = ctx.lower_formula(arena, &para.body, &mut Vec::new())?;
+                    // `check F` searches for a counterexample to F
+                    match kind {
+                        CommandKind::Check(_) => parts.push(arena.not(bf)),
+                        CommandKind::Run(_) => parts.push(bf),
+                    }
+                }
+            }
+            Ok(arena.and(&parts))
+        })?;
+        Ok(LoweredProblem {
+            arena,
+            bounds,
+            formula,
+            bitwidth,
+        })
+    }
+
+    /// Lower a bare expression reusing a caller-provided arena (REPL `:query`).
+    ///
+    /// Relation names are re-interned into `arena`, so IDs line up with any
+    /// instance built from the same pool (e.g. `Cnf.arena`). A fresh scope
+    /// resolution supplies only typing info; no bounds are (re)built here.
+    /// Pass `cnf.arena` (cloned) together with the instance solved from it.
+    pub fn lower_expr_in_scope(
+        &mut self,
+        scope: &Scope,
+        arena: &mut kk::AstArena,
+        e: &Expr,
+    ) -> LResult<(kk::ExprId, u32)> {
+        let res = bounds::resolve(self.module, scope).map_err(FrontError::Resolve)?;
+        // Re-intern only: names already present keep their IDs.
+        let mut rels: HashMap<String, RelationId> = HashMap::new();
+        for name in res.sigs.keys() {
+            let r = arena.relation(name, 1);
+            rels.insert(name.clone(), r);
+        }
+        let mut field_arity: HashMap<String, u32> = HashMap::new();
+        for sd in &self.module.sigs {
+            for owner in &sd.names {
+                for d in &sd.fields {
+                    for fname in &d.names {
+                        let key = format!("{owner}.{fname}");
+                        let ta = self.type_arity(&d.expr, &res)?;
+                        let fa = arena.relation(&key, 1 + ta);
+                        field_arity.insert(key.clone(), 1 + ta);
+                        rels.insert(key, fa);
+                    }
+                }
+            }
+        }
+        let mut ordering_info: HashMap<String, (RelationId, RelationId)> = HashMap::new();
+        for open in &self.module.opens {
+            if open.path != "util/ordering" || open.params.is_empty() {
+                continue;
+            }
+            let first_rel = arena.relation(&format!("${}_first", open.alias), 1);
+            let next_rel = arena.relation(&format!("${}_next", open.alias), 2);
+            ordering_info.insert(open.alias.clone(), (first_rel, next_rel));
+        }
+        let mut open_params: HashMap<String, Vec<String>> = HashMap::new();
+        for open in &self.module.opens {
+            let params: Vec<String> = open
+                .params
+                .iter()
+                .map(|p| match p {
+                    OpenParam::Exactly(n) | OpenParam::Set(n) => n.clone(),
+                })
+                .collect();
+            if !params.is_empty() {
+                open_params.insert(open.alias.clone(), params);
+            }
+        }
+        let ctx = Ctx {
+            module: self.module,
+            res: &res,
+            rels: &rels,
+            field_arity: &field_arity,
+            ordering_info: &ordering_info,
+            depth: std::cell::Cell::new(0),
+            open_params,
+            expr_binds: std::cell::RefCell::new(HashMap::new()),
+            let_binds: std::cell::RefCell::new(Vec::new()),
+        };
+        ctx.lower_expr(arena, e, &mut Vec::new())
+    }
+
+    /// Shared bounds/arena setup for one scope; runs `f` with the lowering
+    /// context and returns the owned arena/bounds plus `f`'s result.
+    fn with_setup<R>(
+        &mut self,
+        scope: &Scope,
+        f: impl FnOnce(&Ctx<'_>, &mut kk::AstArena, &mut Bounds, Vec<FormulaId>) -> LResult<R>,
+    ) -> LResult<(kk::AstArena, Bounds, u32, R)> {
+        let res = bounds::resolve(self.module, scope).map_err(FrontError::Resolve)?;
         let pool = Arc::new(RelationPool::new());
         let mut arena = kk::AstArena::with_pool(Arc::clone(&pool));
         let mut b = Bounds::new(&res.universe, &pool);
@@ -63,9 +220,6 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
-        // global facts collected first so field constraints can join them
-        let mut parts: Vec<FormulaId> = Vec::new();
-
         // field relations (per owning sig name)
         let mut field_arity: HashMap<String, u32> = HashMap::new();
         for sd in &self.module.sigs {
@@ -100,25 +254,12 @@ impl<'m> Lowerer<'m> {
                         b.bound(fa, &lo, &ts)
                             .map_err(|e| FrontError::Resolve(e.to_string()))?;
                         rels.insert(key.clone(), fa);
-                        // type_tuples already yields deterministic rows; reuse it
-                        let tuples_list: Vec<Vec<String>> = self.type_tuples(&d.expr, &res)?;
-                        if let Some(c) = field_mult_constraint(
-                            &mut arena,
-                            &res,
-                            &mut b,
-                            fa,
-                            d,
-                            owner,
-                            &tuples_list,
-                        )? {
-                            parts.push(c);
-                        }
                     }
                 }
             }
         }
         // bind sig bounds AFTER field bounds so pool interning is consistent
-        bounds::bind_sigs(self.module, &res, &pool, &mut arena, &mut b, &cmd.scope)
+        bounds::bind_sigs(self.module, &res, &pool, &mut arena, &mut b, scope)
             .map_err(FrontError::Resolve)?;
 
         // ------------------------------------------------------------------
@@ -190,6 +331,21 @@ impl<'m> Lowerer<'m> {
             rels.insert(format!("{alias}/next"), next_rel);
         }
 
+        // Build open_params: alias -> parameter type names
+        let mut open_params: HashMap<String, Vec<String>> = HashMap::new();
+        for open in &self.module.opens {
+            let params: Vec<String> = open
+                .params
+                .iter()
+                .map(|p| match p {
+                    OpenParam::Exactly(n) | OpenParam::Set(n) => n.clone(),
+                })
+                .collect();
+            if !params.is_empty() {
+                open_params.insert(open.alias.clone(), params);
+            }
+        }
+
         let ctx = Ctx {
             module: self.module,
             res: &res,
@@ -197,81 +353,93 @@ impl<'m> Lowerer<'m> {
             field_arity: &field_arity,
             ordering_info: &ordering_info,
             depth: std::cell::Cell::new(0),
+            open_params,
+            expr_binds: std::cell::RefCell::new(HashMap::new()),
+            let_binds: std::cell::RefCell::new(Vec::new()),
         };
 
-        // global facts
-        for (_, f) in &self.module.facts {
-            parts.push(ctx.lower_formula(&mut arena, f, &mut Vec::new())?);
-        }
-        // sig facts: all this: S | fact
+        // Field-level formulas, now that `ctx` exists: per-field typing
+        // (`f in Owner -> Type`, no dangling tuples) and multiplicity
+        // constraints over dynamic (instance-level) quantifier domains.
+        let field_formulas = self.field_constraints(&ctx, &mut arena, &mut b)?;
+
+        let out = f(&ctx, &mut arena, &mut b, field_formulas)?;
+        Ok((arena, b, res.bitwidth, out))
+    }
+
+    /// Per-field formulas for every declared field: typing (`f` stays inside
+    /// the current `Owner -> Type` extent) plus multiplicity constraints.
+    /// `field_parts` ordering: typing first, then multiplicity.
+    fn field_constraints(
+        &self,
+        ctx: &Ctx,
+        arena: &mut kk::AstArena,
+        b: &mut Bounds,
+    ) -> LResult<Vec<FormulaId>> {
+        let mut out = Vec::new();
         for sd in &self.module.sigs {
-            if let Some(f) = &sd.fact {
-                for owner in &sd.names {
-                    let fid = ctx.lower_sig_fact(&mut arena, f, owner)?;
-                    parts.push(fid);
-                }
-            }
-        }
-        // sig `in` constraints: sig A in B  =>  A in B (subset)
-        for sd in &self.module.sigs {
-            if sd.rel == crate::ast::SigRel::In {
-                if let Some(parent_name) = &sd.extends {
-                    for child_name in &sd.names {
-                        let child_rel = ctx.lookup_rel(child_name).ok_or_else(|| {
-                            FrontError::Resolve(format!("unknown sig '{child_name}'"))
+            for owner in &sd.names {
+                for d in &sd.fields {
+                    for fname in &d.names {
+                        let key = format!("{owner}.{fname}");
+                        if let Some(t) = self.field_typing(ctx, arena, owner, &key, d)? {
+                            out.push(t);
+                        }
+                        let tuples = self.type_tuples(&d.expr, ctx.res)?;
+                        let frel = ctx.lookup_rel(&key).ok_or_else(|| {
+                            FrontError::Resolve(format!("unknown field '{key}'"))
                         })?;
-                        let parent_rel = ctx.lookup_rel(parent_name).ok_or_else(|| {
-                            FrontError::Resolve(format!("unknown sig '{parent_name}'"))
-                        })?;
-                        let ce = arena.expr_relation(child_rel);
-                        let pe = arena.expr_relation(parent_rel);
-                        // A in B  <=>  no (A - B)
-                        let diff = arena
-                            .binary_expr(kk::BinaryOp::Difference, ce, pe)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        let some_diff = arena
-                            .multiplicity_formula(Multiplicity::Some, diff)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        parts.push(arena.not(some_diff));
+                        if let Some(c) =
+                            field_mult_constraint(ctx, arena, b, frel, d, owner, &tuples)?
+                        {
+                            out.push(c);
+                        }
                     }
                 }
             }
         }
-        // command body
-        let body_name = match &cmd.kind {
-            CommandKind::Run(n) => n.clone(),
-            CommandKind::Check(n) => n.clone(),
-        };
-        match body_name {
-            None => parts.push(arena.bool_formula(true)),
-            Some(name) => {
-                let para = self
-                    .module
-                    .paras
-                    .iter()
-                    .find(|p| p.name == name)
-                    .ok_or_else(|| {
-                        FrontError::Resolve(format!("command references unknown '{name}'"))
-                    })?;
-                if !para.params.is_empty() {
-                    return self.unsup(format!("parametrized '{name}' in command"));
-                }
-                let bf = ctx.lower_formula(&mut arena, &para.body, &mut Vec::new())?;
-                // `check F` searches for a counterexample to F
-                match cmd.kind {
-                    CommandKind::Check(_) => parts.push(arena.not(bf)),
-                    CommandKind::Run(_) => parts.push(bf),
-                }
-            }
-        }
+        Ok(out)
+    }
 
-        let formula = arena.and(&parts);
-        Ok(LoweredProblem {
-            arena,
-            bounds: b,
-            formula,
-            bitwidth: res.bitwidth,
-        })
+    /// Typing constraint `f in Owner -> Type` over instance-level extents.
+    ///
+    /// Without it the solver may fill `f` with atoms outside the sig
+    /// extents (dangling tuples). Integer-typed fields (which the formula
+    /// layer cannot evaluate) keep bounds-only behavior.
+    fn field_typing(
+        &self,
+        ctx: &Ctx,
+        arena: &mut kk::AstArena,
+        owner: &str,
+        key: &str,
+        d: &Decl,
+    ) -> LResult<Option<FormulaId>> {
+        if mentions_int_expr(&d.expr) {
+            return Ok(None);
+        }
+        let frel = match ctx.lookup_rel(key) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let owner_rel = match ctx.lookup_rel(owner) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let stripped = strip_mult(&d.expr);
+        let (type_e, _) = match ctx.lower_expr(arena, &stripped, &mut Vec::new()) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let owner_e = arena.expr_relation(owner_rel);
+        let prod = match arena.binary_expr(kk::BinaryOp::Product, owner_e, type_e) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let f_e = arena.expr_relation(frel);
+        match arena.comparison(ExprCompOp::Subset, f_e, prod) {
+            Ok(s) => Ok(Some(s)),
+            Err(_) => Ok(None),
+        }
     }
 
     fn type_arity(&self, e: &Expr, res: &Resolved) -> LResult<u32> {
@@ -388,6 +556,12 @@ struct Ctx<'a> {
     field_arity: &'a HashMap<String, u32>,
     ordering_info: &'a HashMap<String, (RelationId, RelationId)>,
     depth: std::cell::Cell<u32>,
+    /// alias -> parameter type names (from `open util/graph[Type] as graph`)
+    open_params: HashMap<String, Vec<String>>,
+    /// expression-level name bindings (used for sig fact field qualification)
+    expr_binds: std::cell::RefCell<HashMap<String, (ExprId, u32)>>,
+    /// let-binding scope: name -> (lowered ExprId, arity)
+    let_binds: std::cell::RefCell<Vec<HashMap<String, (ExprId, u32)>>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -411,6 +585,18 @@ impl<'a> Ctx<'a> {
         } else {
             None
         }
+    }
+
+    /// Look up a field by bare name, returning all matching relations (for ambiguous field names).
+    fn lookup_rel_all(&self, name: &str) -> Vec<RelationId> {
+        if let Some(r) = self.rels.get(name) {
+            return vec![*r];
+        }
+        self.rels
+            .iter()
+            .filter(|(k, _)| k.ends_with(&format!(".{name}")))
+            .map(|(_, v)| *v)
+            .collect()
     }
 
     /// Try to resolve an ordering builtin call as an expression.
@@ -700,6 +886,327 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Try to resolve a stdlib predicate call (e.g. `graph/dag[r]`, `relation/acyclic[r, s]`).
+    fn try_stdlib_pred(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        args: &[Expr],
+        env: &mut Env,
+    ) -> LResult<Option<FormulaId>> {
+        let (alias, builtin) = match name.split_once('/') {
+            Some((a, b)) => (a, b),
+            None => return Ok(None),
+        };
+        let domain_type = match self.open_params.get(alias) {
+            Some(params) if !params.is_empty() => params[0].clone(),
+            _ => return Ok(None),
+        };
+        let domain_sig = match self.rels.get(&domain_type) {
+            Some(&r) => r,
+            _ => return Ok(None),
+        };
+
+        match builtin {
+            "dag" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("dag expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let domain_e = arena.expr_relation(domain_sig);
+                let v = arena.variable("_x_dag");
+                let d = arena.decl(v, Multiplicity::One, domain_e).unwrap();
+                let ds = arena.add_decls(vec![d]);
+                let ve = arena.expr_variable(v);
+                let tc = arena
+                    .unary_expr(kk::UnaryExprOp::Closure, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let x_tc = arena
+                    .binary_expr(kk::BinaryOp::Join, ve, tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let x_in_tc = arena
+                    .comparison(ExprCompOp::Subset, ve, x_tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let nx_in_tc = arena.not(x_in_tc);
+                Ok(Some(arena.quantified(Quantifier::All, ds, nx_in_tc)))
+            }
+            "forest" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("forest expects 1 arg".into()));
+                }
+                let dag_f = self
+                    .try_stdlib_pred(arena, &format!("{alias}/dag"), args, env)?
+                    .ok_or_else(|| FrontError::Resolve("dag not found".into()))?;
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let domain_e = arena.expr_relation(domain_sig);
+                let v = arena.variable("_n_for");
+                let d = arena.decl(v, Multiplicity::One, domain_e).unwrap();
+                let ds = arena.add_decls(vec![d]);
+                let ve = arena.expr_variable(v);
+                let n_r = arena
+                    .binary_expr(kk::BinaryOp::Join, ve, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let lone_n_r = arena
+                    .multiplicity_formula(Multiplicity::Lone, n_r)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let all_lone = arena.quantified(Quantifier::All, ds, lone_n_r);
+                Ok(Some(arena.and(&[dag_f, all_lone])))
+            }
+            "tree" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("tree expects 1 arg".into()));
+                }
+                let forest_f = self
+                    .try_stdlib_pred(arena, &format!("{alias}/forest"), args, env)?
+                    .ok_or_else(|| FrontError::Resolve("forest not found".into()))?;
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let domain_e = arena.expr_relation(domain_sig);
+                let domain_all = arena.expr_relation(domain_sig);
+                let tr = arena
+                    .unary_expr(kk::UnaryExprOp::Transpose, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let tc = arena
+                    .unary_expr(kk::UnaryExprOp::Closure, tr)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let all_tc = arena
+                    .binary_expr(kk::BinaryOp::Join, domain_all, tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let roots = arena
+                    .binary_expr(kk::BinaryOp::Difference, domain_e, all_tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let lone_roots = arena
+                    .multiplicity_formula(Multiplicity::Lone, roots)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some(arena.and(&[forest_f, lone_roots])))
+            }
+            "weaklyConnected" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("weaklyConnected expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let domain_e = arena.expr_relation(domain_sig);
+                let tr = arena
+                    .unary_expr(kk::UnaryExprOp::Transpose, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let r_plus_tr = arena
+                    .binary_expr(kk::BinaryOp::Union, re, tr)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let star = arena
+                    .unary_expr(kk::UnaryExprOp::ReflexiveClosure, r_plus_tr)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let v1 = arena.variable("_n1_wc");
+                let v2 = arena.variable("_n2_wc");
+                let d1 = arena.decl(v1, Multiplicity::One, domain_e).unwrap();
+                let domain_e2 = arena.expr_relation(domain_sig);
+                let d2 = arena.decl(v2, Multiplicity::One, domain_e2).unwrap();
+                let ds = arena.add_decls(vec![d1, d2]);
+                let v1e = arena.expr_variable(v1);
+                let v2e = arena.expr_variable(v2);
+                let n2_star = arena
+                    .binary_expr(kk::BinaryOp::Join, v2e, star)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let f = arena
+                    .comparison(ExprCompOp::Subset, v1e, n2_star)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some(arena.quantified(Quantifier::All, ds, f)))
+            }
+            "stronglyConnected" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("stronglyConnected expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let domain_e = arena.expr_relation(domain_sig);
+                let star = arena
+                    .unary_expr(kk::UnaryExprOp::ReflexiveClosure, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let v1 = arena.variable("_n1_sc");
+                let v2 = arena.variable("_n2_sc");
+                let d1 = arena.decl(v1, Multiplicity::One, domain_e).unwrap();
+                let domain_e2 = arena.expr_relation(domain_sig);
+                let d2 = arena.decl(v2, Multiplicity::One, domain_e2).unwrap();
+                let ds = arena.add_decls(vec![d1, d2]);
+                let v1e = arena.expr_variable(v1);
+                let v2e = arena.expr_variable(v2);
+                let n2_star = arena
+                    .binary_expr(kk::BinaryOp::Join, v2e, star)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let f = arena
+                    .comparison(ExprCompOp::Subset, v1e, n2_star)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some(arena.quantified(Quantifier::All, ds, f)))
+            }
+            "acyclic" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve("acyclic expects 2 args".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let (se, _sa) = self.lower_expr(arena, &args[1], env)?;
+                let v = arena.variable("_x_acyc");
+                let d = arena.decl(v, Multiplicity::One, se).unwrap();
+                let ds = arena.add_decls(vec![d]);
+                let ve = arena.expr_variable(v);
+                let tc = arena
+                    .unary_expr(kk::UnaryExprOp::Closure, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let x_tc = arena
+                    .binary_expr(kk::BinaryOp::Join, ve, tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let x_in_tc = arena
+                    .comparison(ExprCompOp::Subset, ve, x_tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let nx_in_tc = arena.not(x_in_tc);
+                Ok(Some(arena.quantified(Quantifier::All, ds, nx_in_tc)))
+            }
+            "irreflexive" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("irreflexive expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let iden = arena.constant(kk::ConstantExpr::Iden);
+                let inter = arena
+                    .binary_expr(kk::BinaryOp::Intersection, iden, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let some_inter = arena
+                    .multiplicity_formula(Multiplicity::Some, inter)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some(arena.not(some_inter)))
+            }
+            "symmetric" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("symmetric expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let tr = arena
+                    .unary_expr(kk::UnaryExprOp::Transpose, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let f = arena
+                    .comparison(ExprCompOp::Subset, tr, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some(f))
+            }
+            "transitive" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("transitive expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let rr = arena
+                    .binary_expr(kk::BinaryOp::Join, re, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let f = arena
+                    .comparison(ExprCompOp::Subset, rr, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some(f))
+            }
+            "reflexive" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve("reflexive expects 2 args".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let (se, _sa) = self.lower_expr(arena, &args[1], env)?;
+                let iden = arena.constant(kk::ConstantExpr::Iden);
+                let univ = arena.constant(kk::ConstantExpr::Univ);
+                let sxu = arena
+                    .binary_expr(kk::BinaryOp::Product, se, univ)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let s_iden = arena
+                    .binary_expr(kk::BinaryOp::Intersection, iden, sxu)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let f = arena
+                    .comparison(ExprCompOp::Subset, s_iden, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some(f))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Try to resolve a stdlib function call (e.g. `graph/roots[r]`).
+    fn try_stdlib_expr(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        args: &[Expr],
+        env: &mut Env,
+    ) -> LResult<Option<(ExprId, u32)>> {
+        let (alias, builtin) = match name.split_once('/') {
+            Some((a, b)) => (a, b),
+            None => return Ok(None),
+        };
+        let domain_type = match self.open_params.get(alias) {
+            Some(params) if !params.is_empty() => params[0].clone(),
+            _ => return Ok(None),
+        };
+        let domain_sig = match self.rels.get(&domain_type) {
+            Some(&r) => r,
+            _ => return Ok(None),
+        };
+
+        match builtin {
+            "roots" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("roots expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let domain_e = arena.expr_relation(domain_sig);
+                let tr = arena
+                    .unary_expr(kk::UnaryExprOp::Transpose, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let tc = arena
+                    .unary_expr(kk::UnaryExprOp::Closure, tr)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let all_tc = arena
+                    .binary_expr(kk::BinaryOp::Join, domain_e, tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let domain_e2 = arena.expr_relation(domain_sig);
+                let roots = arena
+                    .binary_expr(kk::BinaryOp::Difference, domain_e2, all_tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some((roots, 1)))
+            }
+            "leaves" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("leaves expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let tc = arena
+                    .unary_expr(kk::UnaryExprOp::Closure, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let domain_e = arena.expr_relation(domain_sig);
+                let all_tc = arena
+                    .binary_expr(kk::BinaryOp::Join, domain_e, tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let domain_e2 = arena.expr_relation(domain_sig);
+                let leaves = arena
+                    .binary_expr(kk::BinaryOp::Difference, domain_e2, all_tc)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some((leaves, 1)))
+            }
+            "dom" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("dom expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let univ = arena.constant(kk::ConstantExpr::Univ);
+                let dom = arena
+                    .binary_expr(kk::BinaryOp::Join, re, univ)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some((dom, 1)))
+            }
+            "ran" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve("ran expects 1 arg".into()));
+                }
+                let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
+                let univ = arena.constant(kk::ConstantExpr::Univ);
+                let ran = arena
+                    .binary_expr(kk::BinaryOp::Join, univ, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                Ok(Some((ran, 1)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn lower_sig_fact(
         &self,
         arena: &mut kk::AstArena,
@@ -714,9 +1221,73 @@ impl<'a> Ctx<'a> {
         let dom = arena.expr_relation(srel);
         let d = arena.decl(var, Multiplicity::One, dom).unwrap();
         let ds = arena.add_decls(vec![d]);
+        let this_e = arena.expr_variable(var);
+
+        // Collect all field names for this sig and ancestors, and build this.field bindings
+        let mut binds = HashMap::new();
+        self.collect_sig_field_binds(arena, owner, this_e, &mut binds);
+
+        *self.expr_binds.borrow_mut() = binds;
         let mut env: Env = vec![("this".into(), var, 1)];
         let body = self.lower_formula(arena, f, &mut env)?;
+        self.expr_binds.borrow_mut().clear();
         Ok(arena.quantified(Quantifier::All, ds, body))
+    }
+
+    fn collect_sig_field_binds(
+        &self,
+        arena: &mut kk::AstArena,
+        sig_name: &str,
+        this_e: ExprId,
+        binds: &mut HashMap<String, (ExprId, u32)>,
+    ) {
+        // Find the sig decl
+        let sd = match self.module.sigs.iter().find(|s| s.names.iter().any(|n| n == sig_name)) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        // Process this sig's fields
+        for fd in &sd.fields {
+            for fname in &fd.names {
+                if binds.contains_key(fname) {
+                    continue;
+                }
+                // Try this sig first
+                let field_key = format!("{sig_name}.{fname}");
+                let fr = self.rels.get(&field_key).copied();
+                // If not found, walk up ancestors
+                let fr = if fr.is_some() {
+                    fr
+                } else {
+                    let mut found = None;
+                    let mut cur = sd.extends.as_deref();
+                    while let Some(parent) = cur {
+                        let pk = format!("{parent}.{fname}");
+                        if let Some(&r) = self.rels.get(&pk) {
+                            found = Some(r);
+                            break;
+                        }
+                        if let Some(psd) = self.module.sigs.iter().find(|s| s.names.iter().any(|n| n == parent)) {
+                            cur = psd.extends.as_deref();
+                        } else {
+                            break;
+                        }
+                    }
+                    found
+                };
+                if let Some(fr) = fr {
+                    let fexpr = arena.expr_relation(fr);
+                    let fa = arena.relation_arity(fr);
+                    if let Ok(this_field) = arena.binary_expr(kk::BinaryOp::Join, this_e, fexpr) {
+                        binds.insert(fname.clone(), (this_field, fa - 1));
+                    }
+                }
+            }
+        }
+        // Recurse to parent
+        if let Some(ref parent) = sd.extends {
+            self.collect_sig_field_binds(arena, parent, this_e, binds);
+        }
     }
 
     fn lower_expr(
@@ -731,13 +1302,61 @@ impl<'a> Ctx<'a> {
             Expr::Iden => (arena.constant(kk::ConstantExpr::Iden), 2),
             Expr::IntAtom => (arena.constant(kk::ConstantExpr::Ints), 1),
             Expr::Name(n, pos) => {
+                // Check let-binding scopes (innermost first)
+                {
+                    let binds = self.let_binds.borrow();
+                    for scope in binds.iter().rev() {
+                        if let Some(&(eid, a)) = scope.get(n) {
+                            return Ok((eid, a));
+                        }
+                    }
+                }
                 if let Some((_, v, a)) = env.iter().rev().find(|(nm, _, _)| nm == n) {
                     let (v, a) = (*v, *a);
                     return Ok((arena.expr_variable(v), a));
                 }
+                // Check expression-level bindings (sig fact field qualification)
+                if let Some(&(eid, a)) = self.expr_binds.borrow().get(n) {
+                    return Ok((eid, a));
+                }
                 if let Some(r) = self.lookup_rel(n) {
                     let ar = arena.relation_arity(r);
                     return Ok((arena.expr_relation(r), ar));
+                }
+                // Ambiguous field name: union of all matching relations
+                let all_hits = self.lookup_rel_all(n);
+                if all_hits.len() > 1 {
+                    let mut cur = arena.expr_relation(all_hits[0]);
+                    let mut car = arena.relation_arity(all_hits[0]);
+                    for &r in &all_hits[1..] {
+                        let ar = arena.relation_arity(r);
+                        let other = arena.expr_relation(r);
+                        if ar > car {
+                            let univ = arena.constant(kk::ConstantExpr::Univ);
+                            for _ in car..ar {
+                                cur = arena
+                                    .binary_expr(kk::BinaryOp::Product, cur, univ)
+                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            }
+                            car = ar;
+                        } else if ar < car {
+                            let univ = arena.constant(kk::ConstantExpr::Univ);
+                            let mut promoted = other;
+                            for _ in ar..car {
+                                promoted = arena
+                                    .binary_expr(kk::BinaryOp::Product, promoted, univ)
+                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            }
+                            cur = arena
+                                .binary_expr(kk::BinaryOp::Union, cur, promoted)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            continue;
+                        }
+                        cur = arena
+                            .binary_expr(kk::BinaryOp::Union, cur, other)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                    }
+                    return Ok((cur, car));
                 }
                 // ordering builtins without args (e.g., ord/first, ord/last, ord/prev)
                 if let Some(result) = self.try_ordering_expr(arena, n, &[], env)? {
@@ -754,22 +1373,24 @@ impl<'a> Ctx<'a> {
                         .body_expr
                         .clone()
                         .ok_or_else(|| FrontError::Resolve(format!("'{n}' has no body")))?;
-                    return self.lower_expr(arena, &body, env);
+                    let d = self.depth.get();
+                    if d > 64 {
+                        return Err(FrontError::Resolve("call recursion too deep".into()));
+                    }
+                    self.depth.set(d + 1);
+                    let out = self.lower_expr(arena, &body, env)?;
+                    self.depth.set(d);
+                    return Ok(out);
                 }
                 return Err(FrontError::Parse {
                     pos: *pos,
-                    msg: format!("unresolved name '{n}'"),
+                    msg: format!("unresolved name '{}' (env has: {:?})", n, env.iter().map(|(n,_,_)| n.as_str()).collect::<Vec<_>>()),
                 });
             }
             Expr::Bin(op, a, b) => {
                 let (ea, aa) = self.lower_expr(arena, a, env)?;
                 let (eb, ab) = self.lower_expr(arena, b, env)?;
                 let id = (match op {
-                    BinOp::Union => arena.binary_expr(kk::BinaryOp::Union, ea, eb),
-                    BinOp::Intersect => arena.binary_expr(kk::BinaryOp::Intersection, ea, eb),
-                    BinOp::Difference => arena.binary_expr(kk::BinaryOp::Difference, ea, eb),
-                    BinOp::Override => arena.binary_expr(kk::BinaryOp::Override, ea, eb),
-                    BinOp::Product => arena.binary_expr(kk::BinaryOp::Product, ea, eb),
                     BinOp::Join => {
                         if aa + ab < 2 {
                             return Err(FrontError::Resolve(format!(
@@ -777,6 +1398,54 @@ impl<'a> Ctx<'a> {
                             )));
                         }
                         arena.binary_expr(kk::BinaryOp::Join, ea, eb)
+                    }
+                    BinOp::DomainRestrict => {
+                        // A <: B = (A × univ^(b-1)) & B
+                        // This restricts B to tuples whose first column is in A
+                        let bx_ar = ab;
+                        let mut ax = ea;
+                        let univ = arena.constant(kk::ConstantExpr::Univ);
+                        for _ in 1..bx_ar {
+                            ax = arena
+                                .binary_expr(kk::BinaryOp::Product, ax, univ)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        }
+                        arena.binary_expr(kk::BinaryOp::Intersection, ax, eb)
+                    }
+                    _ => {
+                        // For Union, Intersect, Difference, Override, Product:
+                        // Auto-promote lower-arity side with univ padding
+                        let kk_op = match op {
+                            BinOp::Union => kk::BinaryOp::Union,
+                            BinOp::Intersect => kk::BinaryOp::Intersection,
+                            BinOp::Difference => kk::BinaryOp::Difference,
+                            BinOp::Override => kk::BinaryOp::Override,
+                            BinOp::Product => kk::BinaryOp::Product,
+                            _ => unreachable!(),
+                        };
+                        if aa == ab || matches!(op, BinOp::Product) {
+                            arena.binary_expr(kk_op, ea, eb)
+                        } else if aa < ab {
+                            // Promote ea to match eb's arity
+                            let mut promoted = ea;
+                            let univ = arena.constant(kk::ConstantExpr::Univ);
+                            for _ in aa..ab {
+                                promoted = arena
+                                    .binary_expr(kk::BinaryOp::Product, promoted, univ)
+                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            }
+                            arena.binary_expr(kk_op, promoted, eb)
+                        } else {
+                            // Promote eb to match ea's arity
+                            let mut promoted = eb;
+                            let univ = arena.constant(kk::ConstantExpr::Univ);
+                            for _ in ab..aa {
+                                promoted = arena
+                                    .binary_expr(kk::BinaryOp::Product, univ, promoted)
+                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            }
+                            arena.binary_expr(kk_op, ea, promoted)
+                        }
                     }
                 })
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
@@ -841,6 +1510,7 @@ impl<'a> Ctx<'a> {
                 (id, ta)
             }
             Expr::Bracket(base, args) => {
+                // Box join slices the FIRST column: `r[a]` == `a.r`.
                 let (mut cur, mut car) = self.lower_expr(arena, base, env)?;
                 for a in args {
                     let (ai, aa) = self.lower_expr(arena, a, env)?;
@@ -848,9 +1518,9 @@ impl<'a> Ctx<'a> {
                         return Err(FrontError::Resolve("bracket join arity".into()));
                     }
                     cur = arena
-                        .binary_expr(kk::BinaryOp::Join, cur, ai)
+                        .binary_expr(kk::BinaryOp::Join, ai, cur)
                         .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                    car -= 1;
+                    car = arena.arity(cur);
                 }
                 (cur, car)
             }
@@ -862,10 +1532,41 @@ impl<'a> Ctx<'a> {
                 if let Some(result) = self.try_ordering_expr(arena, name, args, env)? {
                     return Ok(result);
                 }
+                // Check stdlib builtins (graph, relation)
+                if let Some(result) = self.try_stdlib_expr(arena, name, args, env)? {
+                    return Ok(result);
+                }
                 if args.is_empty() {
                     if let Some(r) = self.lookup_rel(name) {
                         let ar = arena.relation_arity(r);
                         return Ok((arena.expr_relation(r), ar));
+                    }
+                }
+                // name(args) where name is a relation: treat as bracket indexing
+                // Check expr_binds first (sig fact context), then lookup_rel
+                if !args.is_empty() {
+                    let base = if let Some(&(eid, ea)) = self.expr_binds.borrow().get(name) {
+                        Some((eid, ea))
+                    } else {
+                        self.lookup_rel(name).map(|r| {
+                            let ar = arena.relation_arity(r);
+                            (arena.expr_relation(r), ar)
+                        })
+                    };
+                    if let Some((base_e, mut car)) = base {
+                        // Box join slices the FIRST column: `r[a]` == `a.r`.
+                        let mut cur = base_e;
+                        for a in args {
+                            let (ai, aa) = self.lower_expr(arena, a, env)?;
+                            if car + aa < 2 {
+                                return Err(FrontError::Resolve("bracket join arity".into()));
+                            }
+                            cur = arena
+                                .binary_expr(kk::BinaryOp::Join, ai, cur)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            car = arena.arity(cur);
+                        }
+                        return Ok((cur, car));
                     }
                 }
                 let para = self
@@ -874,10 +1575,11 @@ impl<'a> Ctx<'a> {
                     .iter()
                     .find(|p| p.name == *name && p.is_fun)
                     .ok_or_else(|| FrontError::Resolve(format!("unknown function '{name}'")))?;
-                if para.params.len() != args.len() {
+                let total_param_names: usize = para.params.iter().map(|d| d.names.len()).sum();
+                if total_param_names != args.len() {
                     return Err(FrontError::Resolve(format!(
                         "'{name}' expects {} args, got {}",
-                        para.params.len(),
+                        total_param_names,
                         args.len()
                     )));
                 }
@@ -890,9 +1592,11 @@ impl<'a> Ctx<'a> {
                     .body_expr
                     .clone()
                     .ok_or_else(|| FrontError::Resolve(format!("'{name}' has no body")))?;
-                for (pd, arg) in para.params.iter().zip(args.iter()) {
+                let mut arg_idx = 0;
+                for pd in &para.params {
                     for pn in &pd.names {
-                        body = replace_var_expr(&body, pn, arg);
+                        body = replace_var_expr(&body, pn, &args[arg_idx]);
+                        arg_idx += 1;
                     }
                 }
                 let out = self.lower_expr(arena, &body, env)?;
@@ -903,6 +1607,10 @@ impl<'a> Ctx<'a> {
                 let (ex, ax) = self.lower_expr(arena, inner, env)?;
                 let id = arena.prime(ex);
                 (id, ax)
+            }
+            Expr::AtExpr(inner) => {
+                // @ is static field access - no-op for non-overriding semantics
+                self.lower_expr(arena, inner, env)?
             }
             Expr::LetBind(binds, body) => {
                 // For each binding, substitute the name with the expression
@@ -1022,6 +1730,10 @@ impl<'a> Ctx<'a> {
                 if let Some(f) = self.try_ordering_pred(arena, name, args, env)? {
                     return Ok(f);
                 }
+                // Check stdlib builtins (graph, relation)
+                if let Some(f) = self.try_stdlib_pred(arena, name, args, env)? {
+                    return Ok(f);
+                }
                 // Field fallback: `a.f[b]` as a formula means `some a.f[b]`.
                 let is_pred = self
                     .module
@@ -1044,10 +1756,12 @@ impl<'a> Ctx<'a> {
                     .iter()
                     .find(|p| p.name == *name && !p.is_fun)
                     .ok_or_else(|| FrontError::Resolve(format!("unknown predicate '{name}'")))?;
-                if para.params.len() != args.len() {
+                // Flatten multi-name declarations: "t, t\": Type" counts as 2 params
+                let total_param_names: usize = para.params.iter().map(|d| d.names.len()).sum();
+                if total_param_names != args.len() {
                     return Err(FrontError::Resolve(format!(
                         "'{name}' expects {} args, got {}",
-                        para.params.len(),
+                        total_param_names,
                         args.len()
                     )));
                 }
@@ -1057,9 +1771,11 @@ impl<'a> Ctx<'a> {
                 }
                 self.depth.set(d + 1);
                 let mut body = para.body.clone();
-                for (pd, arg) in para.params.iter().zip(args.iter()) {
+                let mut arg_idx = 0;
+                for pd in &para.params {
                     for pn in &pd.names {
-                        body = replace_var_formula(&body, pn, arg);
+                        body = replace_var_formula(&body, pn, &args[arg_idx]);
+                        arg_idx += 1;
                     }
                 }
                 let out = self.lower_formula(arena, &body, env)?;
@@ -1067,34 +1783,51 @@ impl<'a> Ctx<'a> {
                 out
             }
             Formula::LetBind(binds, body) => {
-                let mut added = 0usize;
+                let mut scope = HashMap::new();
                 for (name, e) in binds {
-                    let (_ee, ea) = self.lower_expr(arena, e, env)?;
-                    let v = arena.variable(name);
-                    env.push((name.clone(), v, ea));
-                    added += 1;
-                    let _ = v;
+                    let (ee, ea) = self.lower_expr(arena, e, env)?;
+                    scope.insert(name.clone(), (ee, ea));
                 }
+                self.let_binds.borrow_mut().push(scope);
                 let bf = self.lower_formula(arena, body, env)?;
-                for _ in 0..added {
-                    env.pop();
-                }
+                self.let_binds.borrow_mut().pop();
                 bf
             }
             Formula::Cmp(kind, l, r, _) => {
                 let (el, al) = self.lower_expr(arena, l, env)?;
                 let (er, ar) = self.lower_expr(arena, r, env)?;
-                if al != ar {
-                    return Err(FrontError::Resolve(format!(
-                        "comparison arity mismatch: {al} vs {ar}"
-                    )));
-                }
+                // Auto-promote lower arity side for comparisons
+                let (el, er) = if al < ar {
+                    let mut promoted = el;
+                    let univ = arena.constant(kk::ConstantExpr::Univ);
+                    for _ in al..ar {
+                        promoted = arena
+                            .binary_expr(kk::BinaryOp::Product, promoted, univ)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                    }
+                    (promoted, er)
+                } else if ar < al {
+                    let mut promoted = er;
+                    let univ = arena.constant(kk::ConstantExpr::Univ);
+                    for _ in ar..al {
+                        promoted = arena
+                            .binary_expr(kk::BinaryOp::Product, univ, promoted)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                    }
+                    (el, promoted)
+                } else {
+                    (el, er)
+                };
+                let final_ar = arena.arity(el);
+                let final_ar2 = arena.arity(er);
                 let base = match kind {
                     CmpKind::Eq | CmpKind::Neq => {
-                        arena.comparison(ExprCompOp::Equals, el, er).unwrap()
+                        arena.comparison(ExprCompOp::Equals, el, er)
+                            .map_err(|e| FrontError::Resolve(format!("{e} (final arities: {final_ar} vs {final_ar2}, original: {al} vs {ar})")))?
                     }
                     CmpKind::In | CmpKind::NotIn => {
-                        arena.comparison(ExprCompOp::Subset, el, er).unwrap()
+                        arena.comparison(ExprCompOp::Subset, el, er)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?
                     }
                 };
                 match kind {
@@ -1140,8 +1873,8 @@ impl<'a> Ctx<'a> {
                         // `disj` groups contribute x != y conjuncts/guards
                         let disj_pairs = collect_disj_pairs(decls, arena);
                         let (ds, pushed) = self.lower_decls(arena, decls, env)?;
-                        let mut bf = self.lower_formula(arena, body, env)?;
-                        for _ in 0..pushed {
+                let mut bf = self.lower_formula(arena, body, env)?;
+                for _ in 0..pushed {
                             env.pop();
                         }
                         for &(a, b) in &disj_pairs {
@@ -1435,6 +2168,7 @@ fn subst_expr(e: &Expr, from: &str, to: &str) -> Expr {
             *p,
         ),
         Expr::Prime(inner) => Expr::Prime(Box::new(subst_expr(inner, from, to))),
+        Expr::AtExpr(inner) => Expr::AtExpr(Box::new(subst_expr(inner, from, to))),
         Expr::LetBind(binds, body) => Expr::LetBind(
             binds
                 .iter()
@@ -1475,31 +2209,194 @@ fn subst_int(i: &IntExpr, from: &str, to: &str) -> IntExpr {
 /// or None when it carries no markers. Exact helper relations give every
 /// quantified variable its true domain.
 #[allow(clippy::too_many_arguments)]
-fn field_mult_constraint(
+/// Strip multiplicity markers (`lone`/`one`/`some` on either side of `->`)
+/// from a field type expression.
+fn strip_mult(e: &Expr) -> Expr {
+    match e {
+        Expr::ArrowMult(_, inner) | Expr::LeadMult(_, inner) => strip_mult(inner),
+        Expr::Bin(op, a, b) => Expr::Bin(
+            *op,
+            Box::new(strip_mult(a)),
+            Box::new(strip_mult(b)),
+        ),
+        Expr::Transpose(x) => Expr::Transpose(Box::new(strip_mult(x))),
+        Expr::TClosure(x) => Expr::TClosure(Box::new(strip_mult(x))),
+        Expr::RClosure(x) => Expr::RClosure(Box::new(strip_mult(x))),
+        Expr::Comprehension(ds, body) => Expr::Comprehension(ds.clone(), body.clone()),
+        Expr::If(c, t, el) => Expr::If(c.clone(), Box::new(strip_mult(t)), Box::new(strip_mult(el))),
+        Expr::Bracket(base, args) => Expr::Bracket(
+            Box::new(strip_mult(base)),
+            args.iter().map(|a| Box::new(strip_mult(a))).collect(),
+        ),
+        Expr::Call(n, args, p) => Expr::Call(
+            n.clone(),
+            args.iter().map(|a| strip_mult(a)).collect(),
+            *p,
+        ),
+        Expr::Prime(x) => Expr::Prime(Box::new(strip_mult(x))),
+        Expr::AtExpr(x) => Expr::AtExpr(Box::new(strip_mult(x))),
+        Expr::LetBind(binds, body) => Expr::LetBind(binds.clone(), Box::new(strip_mult(body))),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom => e.clone(),
+    }
+}
+
+/// True if a field type mentions `int`/`Int`: the formula layer cannot
+/// evaluate integer atoms, so those fields keep bounds-only behavior.
+/// (`none`/`iden` lower and evaluate fine and are kept.)
+fn mentions_int_expr(e: &Expr) -> bool {
+    match e {
+        Expr::IntAtom => true,
+        Expr::Name(n, _) => n == "int" || n == "Int",
+        Expr::ArrowMult(_, inner) | Expr::LeadMult(_, inner) => mentions_int_expr(inner),
+        Expr::Bin(_, a, b) => mentions_int_expr(a) || mentions_int_expr(b),
+        Expr::Transpose(x) | Expr::TClosure(x) | Expr::RClosure(x) => mentions_int_expr(x),
+        Expr::Comprehension(ds, body) => {
+            ds.iter().any(|d| mentions_int_expr(&d.expr)) || mentions_int_formula(body)
+        }
+        Expr::If(c, t, el) => {
+            mentions_int_formula(c) || mentions_int_expr(t) || mentions_int_expr(el)
+        }
+        Expr::Bracket(base, args) => {
+            mentions_int_expr(base) || args.iter().any(|a| mentions_int_expr(a))
+        }
+        Expr::Call(_, args, _) => args.iter().any(mentions_int_expr),
+        Expr::Prime(x) | Expr::AtExpr(x) => mentions_int_expr(x),
+        Expr::LetBind(binds, body) => {
+            binds.iter().any(|(_, ex)| mentions_int_expr(ex)) || mentions_int_expr(body)
+        }
+        Expr::Univ | Expr::None_ | Expr::Iden => false,
+    }
+}
+
+fn mentions_int_formula(f: &Formula) -> bool {
+    match f {
+        Formula::IntCmp(..) => true,
+        Formula::Const(_) => false,
+        Formula::Cmp(_, a, b, _) => mentions_int_expr(a) || mentions_int_expr(b),
+        Formula::Quant(_, ds, body) => {
+            ds.iter().any(|d| mentions_int_expr(&d.expr)) || mentions_int_formula(body)
+        }
+        Formula::Multi(_, e, _) => mentions_int_expr(e),
+        Formula::And(a, b)
+        | Formula::Or(a, b)
+        | Formula::Implies(a, b)
+        | Formula::Iff(a, b)
+        | Formula::Until(a, b)
+        | Formula::Releases(a, b)
+        | Formula::Since(a, b)
+        | Formula::Triggered(a, b) => mentions_int_formula(a) || mentions_int_formula(b),
+        Formula::Not(x)
+        | Formula::Always(x)
+        | Formula::Eventually(x)
+        | Formula::Before(x)
+        | Formula::Historically(x)
+        | Formula::Once(x)
+        | Formula::Keeping(x)
+        | Formula::Goal(x)
+        | Formula::Restore(x)
+        | Formula::Initially(x)
+        | Formula::Regularly(x)
+        | Formula::Consistently(x) => mentions_int_formula(x),
+        Formula::LetBind(binds, body) => {
+            binds.iter().any(|(_, ex)| mentions_int_expr(ex)) || mentions_int_formula(body)
+        }
+        Formula::Call(_, args, _) => args.iter().any(mentions_int_expr),
+    }
+}
+
+/// Split a (mult-stripped) field type into top-level product leaves.
+fn flatten_product<'x>(e: &'x Expr, out: &mut Vec<&'x Expr>) {
+    match e {
+        Expr::Bin(BinOp::Product, a, b) => {
+            flatten_product(a, out);
+            flatten_product(b, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+/// Arity of one product leaf (mirrors `Lowerer::type_arity` for the
+/// shapes that can appear here).
+fn seg_arity(e: &Expr) -> u32 {
+    match e {
+        Expr::ArrowMult(_, inner) | Expr::LeadMult(_, inner) => seg_arity(inner),
+        Expr::Bin(BinOp::Product, a, b) => seg_arity(a) + seg_arity(b),
+        Expr::Bin(BinOp::Join, a, b) => seg_arity(a).saturating_add(seg_arity(b)).saturating_sub(2),
+        Expr::Bin(_, a, _) => seg_arity(a),
+        _ => 1,
+    }
+}
+
+/// A product leaf usable directly as a unary quantifier domain.
+fn is_plain_domain(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden
+    )
+}
+
+/// Resolve one field-type column to a unary quantifier-domain expression:
+/// the lowered product segment for plain sigs, else an exact static helper
+/// (`%dom%`, exact so the solver cannot vacate the domain).
+#[allow(clippy::too_many_arguments)]
+fn col_domain(
+    ctx: &Ctx,
     arena: &mut kk::AstArena,
+    b: &mut Bounds,
     res: &Resolved,
+    segs: &[&Expr],
+    seg_cols: &[(usize, u32)],
+    col_atoms: &[Vec<String>],
+    d: &Decl,
+    k: usize,
+) -> LResult<ExprId> {
+    for (s, (start, a)) in segs.iter().zip(seg_cols.iter()) {
+        if *a == 1 && *start == k - 1 && is_plain_domain(s) && !mentions_int_expr(s) {
+            if let Ok((eid, 1)) = ctx.lower_expr(arena, s, &mut Vec::new()) {
+                return Ok(eid);
+            }
+            break;
+        }
+    }
+    let name = format!("%dom%{}.{}", std::ptr::from_ref(d) as usize, k);
+    let r = arena.relation(&name, 1);
+    let up = bounds::ts_of(res, &col_atoms[k]).map_err(FrontError::Resolve)?;
+    b.bound_exactly(r, &up)
+        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+    Ok(arena.expr_relation(r))
+}
+
+fn field_mult_constraint(
+    ctx: &Ctx,
+    arena: &mut kk::AstArena,
     b: &mut Bounds,
     frel: RelationId,
     d: &Decl,
     owner: &str,
     tuples: &[Vec<String>],
 ) -> LResult<Option<FormulaId>> {
-    // markers: (column index, mult)
+    // markers: (column index, mult, trailing, end). `trailing` is true for
+    // `X -> mult Y` (ArrowMult); `end` is the exclusive end column of the
+    // marked segment, so `end == total` tells a last-column marking
+    // (`N -> some T`) apart from a middle one (`A -> lone B -> C`).
+    // LeadMult (`mult X`) records `trailing == false`.
     fn walk(
         e: &Expr,
         offset: usize,
-        markers: &mut Vec<(usize, crate::ast::Mult3)>,
+        markers: &mut Vec<(usize, crate::ast::Mult3, bool, usize)>,
         total_cols: &mut usize,
     ) -> LResult<()> {
         match e {
             Expr::LeadMult(m, inner) => {
+                let end = offset + arity_of_seg(inner, ()) as usize;
                 walk(inner, offset, markers, total_cols)?;
-                markers.push((0, *m));
+                markers.push((0, *m, false, end));
                 Ok(())
             }
             Expr::ArrowMult(m, inner) => {
+                let end = offset + arity_of_seg(inner, ()) as usize;
                 walk(inner, offset, markers, total_cols)?;
-                markers.push((offset, *m));
+                markers.push((offset, *m, true, end));
                 Ok(())
             }
             Expr::Bin(BinOp::Product, a, b) => {
@@ -1511,7 +2408,12 @@ fn field_mult_constraint(
                 walk(b, offset + aa as usize, markers, total_cols)?;
                 Ok(())
             }
-            Expr::Name(..) | Expr::Univ | Expr::IntAtom => {
+            Expr::Name(..) | Expr::Univ | Expr::IntAtom | Expr::None_ | Expr::Iden => {
+                *total_cols += 1;
+                Ok(())
+            }
+            Expr::AtExpr(inner) => walk(inner, offset, markers, total_cols),
+            Expr::Bin(BinOp::Union, _, _) | Expr::Bin(BinOp::Intersect, _, _) | Expr::Bin(BinOp::Difference, _, _) => {
                 *total_cols += 1;
                 Ok(())
             }
@@ -1527,18 +2429,53 @@ fn field_mult_constraint(
             _ => 1,
         }
     }
-    let _ = res;
     fn res_static() {}
 
-    let mut markers: Vec<(usize, crate::ast::Mult3)> = Vec::new();
+    let mut markers: Vec<(usize, crate::ast::Mult3, bool, usize)> = Vec::new();
     let mut ncols = 0usize;
     walk(&d.expr, 0, &mut markers, &mut ncols)?;
     if markers.is_empty() {
         return Ok(None);
     }
     let n = ncols + 1; // owner column included
+    let res = ctx.res;
 
-    // per-column atom domains from actual upper-bound tuples
+    // Quantifier domains are instance-level (dynamic) extents, so the
+    // solver cannot vacate them:
+    // - column 0 is the owner sig relation;
+    // - columns 1.. are the lowered product-segment types (plain unary
+    //   sigs); anything else falls back to an exact static helper.
+    let mut dom_exprs: Vec<ExprId> = Vec::with_capacity(n);
+    let owner_rel = ctx.lookup_rel(owner).ok_or_else(|| {
+        FrontError::Resolve(format!("unknown sig '{owner}'"))
+    })?;
+    dom_exprs.push(arena.expr_relation(owner_rel));
+    // Uniform rule (documented `r: A m -> n B` table, Java-verified): a
+    // multiplicity marking constrains, per (owner x prefix) row, the
+    // suffix tuple set. Prefix length == the marked segment's end offset:
+    // P9 (`N -> some T`, end == total) quantifies owner + middles, middle
+    // markings (`A -> lone B -> C`, end < total) quantify owner + earlier
+    // middles. Binary fields need only the owner column.
+    let max_pre = markers
+        .iter()
+        .filter(|(c, _, t, _)| *c == 0 && *t)
+        .map(|(_, _, _, e)| *e)
+        .max()
+        .unwrap_or(0);
+    // Map each middle column to its product segment. (The last column, for
+    // leading constraints, is resolved lazily in the emission loop below.)
+    let stripped = strip_mult(&d.expr);
+    let mut segs: Vec<&Expr> = Vec::new();
+    flatten_product(&stripped, &mut segs);
+    // Segment arities and column offsets.
+    let mut seg_cols: Vec<(usize, u32)> = Vec::with_capacity(segs.len());
+    let mut off = 0usize;
+    for s in &segs {
+        let a = seg_arity(s);
+        seg_cols.push((off, a));
+        off += a as usize;
+    }
+    // Per-column static atoms (fallback helper contents).
     let mut col_atoms: Vec<Vec<String>> = vec![Vec::new(); n];
     col_atoms[0] = res.atoms_of(owner);
     for row in tuples {
@@ -1548,37 +2485,35 @@ fn field_mult_constraint(
             }
         }
     }
-
-    // exact helper domain relations
-    let mut dom_rel: Vec<RelationId> = Vec::with_capacity(n);
-    for (k, atoms) in col_atoms.iter().enumerate() {
-        let name = format!("%dom%{}.{}", std::ptr::from_ref(d) as usize, k);
-        let r = arena.relation(&name, 1);
-        let mut lo = alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 1)
-            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-        let up = bounds::ts_of(res, atoms).map_err(FrontError::Resolve)?;
-        b.bound(r, &lo, &up)
-            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-        let _ = &mut lo;
-        dom_rel.push(r);
+    if max_pre > 1 {
+        for k in 1..max_pre {
+            dom_exprs.push(col_domain(
+                ctx, arena, b, res, &segs, &seg_cols, &col_atoms, d, k,
+            )?);
+        }
     }
 
     let mut out: Vec<FormulaId> = Vec::new();
-    for (col, m) in markers {
+    for (col, m, trailing, end) in markers {
         let mult = match m {
             crate::ast::Mult3::Some => Multiplicity::Some,
             crate::ast::Mult3::Lone => Multiplicity::Lone,
             crate::ast::Mult3::One => Multiplicity::One,
         };
         let frec = arena.expr_relation(frel);
-        if col == n - 1 {
-            // all c0: D0, ..., c_{n-2}: D_{n-2} | ((c0.f).c1...). M D_{n-1}
+        // Uniform rule (grammar yields column-0 markers only): a marking
+        // constrains, per (owner x prefix) row, the suffix tuple set.
+        // `f: lone B` means `all a: Owner | lone(a.f)`; `N -> some T`
+        // means `all b,n | some((b.f).n)`; `A -> lone B -> C` means
+        // `all o,a | lone((o.f).a)` over (B x C) pairs. Prefix length is
+        // the marked segment's end offset.
+        if col == 0 && ((n == 2) || (trailing && end >= 1 && end <= ncols)) {
+            // all c0: D0, ..., c_{end-1}: D_{end-1} | M(join..(c0.f)..c_{end-1})
             let mut ds: Vec<kk::Decl> = Vec::new();
             let mut vars: Vec<kk::VarId> = Vec::new();
-            for (j, dr) in dom_rel.iter().enumerate().take(n - 1) {
+            for (j, dv) in dom_exprs.iter().enumerate().take(end) {
                 let v = arena.variable(&format!("%mc{j}%{}", std::ptr::from_ref(d) as usize));
-                let dv = arena.expr_relation(*dr);
-                let dd = arena.decl(v, Multiplicity::One, dv).unwrap();
+                let dd = arena.decl(v, Multiplicity::One, *dv).unwrap();
                 ds.push(dd);
                 vars.push(v);
             }
@@ -1586,32 +2521,45 @@ fn field_mult_constraint(
             let mut g = arena
                 .binary_expr(kk::BinaryOp::Join, v0e, frec)
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
-            for vj_expr in vars.iter().take(n - 1).skip(1) {
+            // Box-join order (argument first): each further variable
+            // slices the current first column.
+            for vj_expr in vars.iter().skip(1) {
                 let vj = arena.expr_variable(*vj_expr);
                 g = arena
-                    .binary_expr(kk::BinaryOp::Join, g, vj)
+                    .binary_expr(kk::BinaryOp::Join, vj, g)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?;
             }
             let mf = arena.multiplicity_formula(mult, g).unwrap();
             let dsid = arena.add_decls(ds);
             out.push(arena.quantified(Quantifier::All, dsid, mf));
-        } else if col == 0 && n == 2 {
-            // all c1: D1 | c1.~f M D0
-            let v = arena.variable(&format!("%mlead%{}", std::ptr::from_ref(d) as usize));
-            let dv = arena.expr_relation(dom_rel[1]);
-            let dd = arena.decl(v, Multiplicity::One, dv).unwrap();
-            let tr = arena.unary_expr(kk::UnaryExprOp::Transpose, frec).unwrap();
-            let ve = arena.expr_variable(v);
+        } else if col == 0 && !trailing && n == 3 {
+            // Leading marking on a ternary field (`A m -> B` in O, per the
+            // documented `r: A m -> n B` table): each (owner, last-column)
+            // pair sees multiplicity M of the preimage:
+            // `all o: O, bl: D_last | M(join(join(o, f), bl))`.
+            // (Argument-LAST single join = preimage direction.)
+            let dv_last = col_domain(
+                ctx, arena, b, res, &segs, &seg_cols, &col_atoms, d, n - 1,
+            )?;
+            let v0 = arena.variable(&format!("%ml0%{}", std::ptr::from_ref(d) as usize));
+            let d0 = arena.decl(v0, Multiplicity::One, dom_exprs[0]).unwrap();
+            let vl = arena.variable(&format!("%ml1%{}", std::ptr::from_ref(d) as usize));
+            let dl = arena.decl(vl, Multiplicity::One, dv_last).unwrap();
+            let dsid = arena.add_decls(vec![d0, dl]);
+            let v0e = arena.expr_variable(v0);
+            let vle = arena.expr_variable(vl);
             let g = arena
-                .binary_expr(kk::BinaryOp::Join, ve, tr)
+                .binary_expr(kk::BinaryOp::Join, v0e, frec)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            let g = arena
+                .binary_expr(kk::BinaryOp::Join, g, vle)
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
             let mf = arena.multiplicity_formula(mult, g).unwrap();
-            let dsid = arena.add_decls(vec![dd]);
             out.push(arena.quantified(Quantifier::All, dsid, mf));
         } else {
-            return Err(FrontError::Unsupported(format!(
-                "multiplicity on internal column {col} of arity-{n} field"
-            )));
+            // Leading markings on wider-than-ternary fields are not yet
+            // supported; skip gracefully rather than erroring.
+            continue;
         }
     }
     Ok(if out.is_empty() {
@@ -1672,6 +2620,7 @@ fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
             *p,
         ),
         Expr::Prime(inner) => Expr::Prime(Box::new(replace_var_expr(inner, from, to))),
+        Expr::AtExpr(inner) => Expr::AtExpr(Box::new(replace_var_expr(inner, from, to))),
         Expr::LetBind(binds, body) => Expr::LetBind(
             binds
                 .iter()

@@ -341,24 +341,6 @@ impl<'a> FolTranslator<'a> {
         len as u32
     }
 
-    fn decl_domain(
-        &mut self,
-        arena: &AstArena,
-        d: &crate::ast::Decl,
-        env: &[(VarId, Vec<u32>)],
-    ) -> Result<(Rc<BooleanMatrix>, VarId), TranslateError> {
-        let var_arity = arena.variable_arity(d.variable);
-        let m = self.expr_matrix(arena, d.expr, env)?;
-        if m.dims().num_dimensions() as u32 != var_arity {
-            return Err(TranslateError::Arity {
-                op: "decl",
-                expected: var_arity,
-                got: m.dims().num_dimensions() as u32,
-            });
-        }
-        Ok((m, d.variable))
-    }
-
     fn iter_decls(
         &mut self,
         arena: &AstArena,
@@ -368,26 +350,38 @@ impl<'a> FolTranslator<'a> {
     ) -> Result<(), TranslateError> {
         fn rec<'b>(
             this: &mut FolTranslator<'b>,
-            domains: &[Rc<BooleanMatrix>],
-            vars: &[VarId],
+            arena: &AstArena,
+            decls: &[crate::ast::Decl],
             env: &mut Env,
             lits: &mut Vec<BoolRef>,
             visit: &mut DeclVisitor<'b, '_>,
             depth: usize,
         ) -> Result<(), TranslateError> {
-            if depth == domains.len() {
+            if depth == decls.len() {
                 return visit(this, env.clone(), lits);
             }
-            let cells: Vec<usize> = domains[depth].iter().map(|(i, _)| i).collect();
+            let d = &decls[depth];
+            let var_arity = arena.variable_arity(d.variable);
+            let m = this.expr_matrix(arena, d.expr, env)?;
+            if m.dims().num_dimensions() as u32 != var_arity {
+                return Err(TranslateError::Arity {
+                    op: "decl",
+                    expected: var_arity,
+                    got: m.dims().num_dimensions() as u32,
+                });
+            }
+            let cells: Vec<usize> = m.iter().map(|(i, _)| i).collect();
             for idx in cells {
-                let vec = domains[depth]
-                    .dims()
-                    .vector_of(idx)
-                    .ok_or(TranslateError::BadDomain)?;
-                let lit = domains[depth].get(idx).unwrap_or_else(const_true);
-                env.push((vars[depth], vec));
+                let vec = match m.dims().vector_of(idx) {
+                    Some(v) => v,
+                    None => {
+                        return Err(TranslateError::BadDomain);
+                    }
+                };
+                let lit = m.get(idx).unwrap_or_else(const_true);
+                env.push((d.variable, vec));
                 lits.push(lit);
-                let res = rec(this, domains, vars, env, lits, visit, depth + 1);
+                let res = rec(this, arena, decls, env, lits, visit, depth + 1);
                 lits.pop();
                 env.pop();
                 res?;
@@ -395,16 +389,9 @@ impl<'a> FolTranslator<'a> {
             Ok(())
         }
 
-        let mut domains = Vec::with_capacity(decls.len());
-        let mut vars = Vec::with_capacity(decls.len());
-        for d in decls {
-            let (m, v) = self.decl_domain(arena, d, env)?;
-            domains.push(m);
-            vars.push(v);
-        }
         let mut env2: Env = env.to_vec();
         let mut lits: Vec<BoolRef> = Vec::with_capacity(decls.len());
-        rec(self, &domains, &vars, &mut env2, &mut lits, visit, 0)
+        rec(self, arena, decls, &mut env2, &mut lits, visit, 0)
     }
 
     pub fn int_expr(

@@ -11,6 +11,11 @@
 //! product, set ops (+ & - ++), closures (^ * ~), comprehension, ite,
 //! quantifiers (all/some/no/lone/one), cardinality # and int arithmetic.
 
+pub mod cnf;
+pub mod snippet;
+/// Structured model generator + brute-force oracle (fuzzing support).
+/// Zero extra dependencies; also used by `tests/fuzz_model.rs`.
+pub mod fuzzgen;
 mod ast;
 mod bounds;
 mod lex;
@@ -22,7 +27,11 @@ pub use ast::{
     Command, CommandKind, Decl, Expr, Formula, IntBinOp, IntCmpOp, IntExpr, Module, Open,
     OpenParam, SigDecl, SigMult,
 };
-pub use lower::Lowerer;
+pub use lower::{Lowerer, LoweredProblem};
+pub use cnf::{check, run, solve, validate, Cnf, CnfKind};
+pub use snippet::{eval, fragment_keys, parse_expr, parse_formula, query};
+pub use alloy_kodkod_rs::tupleset::TupleSet;
+pub use alloy_kodkod_rs::instance::Instance;
 
 use alloy_kodkod_rs::solver::Solution;
 use std::time::{Duration, Instant};

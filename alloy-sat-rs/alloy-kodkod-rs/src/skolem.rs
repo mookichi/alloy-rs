@@ -263,7 +263,14 @@ impl<'a> StaticSkolemizer<'a> {
         shadow: &mut HashSet<VarId>,
     ) -> IntId {
         match self.arena.int(i).clone() {
-            crate::ast::IntNode::Constant(_) | crate::ast::IntNode::OfExpr { .. } => i,
+            crate::ast::IntNode::Constant(_) => i,
+            crate::ast::IntNode::OfExpr { op, expr } => {
+                // `sum`/`#` bodies must see the substitution too; skipping
+                // leaves stale variables behind (e.g. `#(b.addr[n])`,
+                // which then fails later stages with `BadDomain`).
+                let e = self.subst_expr(expr, map, shadow);
+                self.arena.cast_to_int(op, e).unwrap_or(i)
+            }
             crate::ast::IntNode::Binary { op, left, right } => {
                 let l = self.subst_int(left, map, shadow);
                 let r = self.subst_int(right, map, shadow);
@@ -467,10 +474,37 @@ fn sk_walk(
         | crate::ast::FormulaNode::Comparison { .. }
         | crate::ast::FormulaNode::IntComparison { .. }
         | crate::ast::FormulaNode::Multiplicity { .. } => f,
-        crate::ast::FormulaNode::Not(child) => {
-            let c = sk_walk(sk, child, !pol)?;
-            sk.arena.not(c)
-        }
+            crate::ast::FormulaNode::Not(child) => {
+                // ¬∀x.F ≡ ∃x.¬F: flip to a positive existential and skolemize
+                // it directly. The replacement is returned AS-IS — the outer
+                // negation is consumed by the flip. Re-wrapping it (the old
+                // behavior via the (All, false) arm below) dropped the
+                // negation and admitted spurious models (fuzz-found: an
+                // empty witness satisfied `one $sk` vacuously through NOT).
+                if pol {
+                    if let crate::ast::FormulaNode::Quantified {
+                        quant: Quantifier::All,
+                        decls,
+                        body,
+                    } = sk.arena.formula(child).clone()
+                    {
+                        let list = sk.arena.decls(decls).to_vec();
+                        let nb = sk.arena.not(body);
+                        if let Some((new_body, constraints)) =
+                            sk.skolemize_quantifier(&list, nb)?
+                        {
+                            let mut parts = constraints;
+                            parts.push(new_body);
+                            return Ok(sk.arena.and(&parts));
+                        }
+                        // Unsupported domain: preserve `not all` shape.
+                        let b = sk_walk(sk, child, false)?;
+                        return Ok(sk.arena.not(b));
+                    }
+                }
+                let c = sk_walk(sk, child, !pol)?;
+                sk.arena.not(c)
+            }
         crate::ast::FormulaNode::Nary { op, children } => {
             let out = children
                 .iter()
@@ -535,19 +569,28 @@ fn sk_walk(
                         sk.arena.quantified(Quantifier::Some, ds, b)
                     }
                 }
-                // all x: D | F  (negative): ¬∀ ≡ ∃¬ — flip to SOME and skolemize
+                // all x: D | F  (negative): cannot flip in place — the
+                // enclosing negation belongs to an ancestor node, and the
+                // flip is now handled at the `Not` arm above. Scope the
+                // universals for inner witnesses, descend preserving
+                // polarity (mirrors the positive arm), and leave intact.
                 (Quantifier::All, false) => {
                     let list = sk.arena.decls(decls).to_vec();
-                    let nb = sk.arena.not(body);
-                    if let Some((new_body, constraints)) = sk.skolemize_quantifier(&list, nb)? {
-                        let mut parts = constraints;
-                        parts.push(new_body);
-                        sk.arena.and(&parts)
-                    } else {
-                        let b = sk_walk(sk, nb, false)?;
-                        let ds = sk.arena.add_decls(list);
-                        sk.arena.quantified(Quantifier::All, ds, b)
+                    for d in &list {
+                        let ub = upper_bound_expr(sk.arena, d.expr, sk.bounds)
+                            .expect("universal domains must have upper bounds to reach here");
+                        sk.universal_uppers.push(ub);
                     }
+                    sk.universals.extend(
+                        list.iter()
+                            .map(|d| (d.variable, sk.arena.variable_arity(d.variable), d.expr)),
+                    );
+                    let _b = sk_walk(sk, body, false)?;
+                    for _ in &list {
+                        sk.universals.pop();
+                        sk.universal_uppers.pop();
+                    }
+                    f
                 }
             }
         }

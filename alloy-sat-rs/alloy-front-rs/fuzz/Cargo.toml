@@ -1,0 +1,30 @@
+[package]
+name = "alloy-front-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.alloy-front-rs]
+path = ".."
+
+[[bin]]
+name = "front_model"
+path = "fuzz_targets/front_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "front_parse"
+path = "fuzz_targets/front_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

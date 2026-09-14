@@ -80,3 +80,35 @@ fn skolem_disj_unsat_single() {
     "#;
     assert_eq!(outcome(src, 0), "UNSAT");
 }
+
+/// Regression: skolem substitution must descend into `#(...)` (OfExpr).
+/// Without it, `some a: A | #(a.f) > 1` fails at build with `BadDomain`
+/// from a stale quantified variable instead of solving.
+#[test]
+fn skolem_descends_into_cardinality() {
+    let src = r#"
+        module t
+        sig A { f: B }
+        sig B {}
+        pred two { some a: A | #(a.f) > 1 }
+        run two for 2
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// Regression (fuzz-found): skolemizing `not (all ...)` must preserve the
+/// negation. The old code re-wrapped the flipped replacement in `Not`,
+/// dropping the negation so an empty witness was accepted (bogus SAT).
+#[test]
+fn skolem_not_all_keeps_negation() {
+    let src = r#"
+        module t
+        lone sig A {}
+        sig B { h: A }
+        fact { some B }
+        pred p { not (all c: B | lone c.h) }
+        run p for 1
+    "#;
+    // A holds at most one atom, so every `c.h` is lone: `not all` is UNSAT.
+    assert_eq!(outcome(src, 0), "UNSAT");
+}

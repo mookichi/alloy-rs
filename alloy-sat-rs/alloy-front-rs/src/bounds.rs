@@ -102,7 +102,6 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     // For `sig in`, the child does NOT allocate its own atoms; it shares
     // the parent's atoms (subset constraint added as formula in lower.rs).
     let mut atoms_of: HashMap<String, Vec<String>> = HashMap::new();
-    let mut counter: usize = 0;
 
     fn is_root(parents: &HashMap<&str, Option<String>>, n: &str) -> bool {
         parents.get(n).map(|p| p.is_none()).unwrap_or(true)
@@ -114,13 +113,10 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         .cloned()
         .collect();
 
-    let alloc_for = |name: &str, count: u32, counter: &mut usize| -> Vec<String> {
-        let mut v = Vec::new();
-        for i in 0..count {
-            v.push(format!("{name}${}", *counter + i as usize));
-        }
-        *counter += count as usize;
-        v
+    // Per-sig 0-based numbering (Java Kodkod style: `Book$0`): each sig's
+    // atoms are numbered from 0, not from a shared global counter.
+    let alloc_for = |name: &str, count: u32| -> Vec<String> {
+        (0..count).map(|i| format!("{name}${i}")).collect()
     };
 
     // iterate until fixed point so parents seen before children regardless of order
@@ -158,7 +154,6 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
                 } else {
                     0
                 }),
-                &mut counter,
             );
             atoms_of.insert(root.clone(), at);
             continue;
@@ -179,7 +174,6 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
                 } else {
                     0
                 }),
-                &mut counter,
             );
             atoms_of.insert(root.clone(), at);
             continue;
@@ -211,7 +205,7 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
                     SigMult::One | SigMult::Lone => 1,
                     _ => *n,
                 };
-                atoms_of.insert(k.clone(), alloc_for(k, n2, &mut counter));
+                atoms_of.insert(k.clone(), alloc_for(k, n2));
             } else {
                 let kmult = mults.get(k.as_str()).copied().unwrap_or(SigMult::None);
                 let take = match kmult {
@@ -222,7 +216,7 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
                         t
                     }
                 };
-                atoms_of.insert(k.clone(), alloc_for(k, take, &mut counter));
+                atoms_of.insert(k.clone(), alloc_for(k, take));
             }
         }
         let _ = exact;
