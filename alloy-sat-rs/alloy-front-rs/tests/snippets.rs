@@ -386,6 +386,69 @@ fn query_sum_of_set() {
     }
 }
 
+/// `$` names are rejected in declarations (Java parity: atoms are solver
+/// outputs, not language terms), at every binding site.
+#[test]
+fn dollar_names_rejected_in_decls() {
+    for src in [
+        "sig A$0 {}",
+        "sig A { f$0: lone B }\nsig B {}",
+        "sig A {}\nsig B {}\npred p[x$0: A] { some x$0 }",
+        "sig A {}\nfact f$1 { some A }",
+        "sig A {}\nassert a$2 { some A }",
+        "sig A {}\nrun { all x$3: A | some x$3 } for 3",
+        "sig A {}\nrun { let y$4 = A | some y$4 } for 3",
+    ] {
+        let err = match alloy_front_rs::parse_module(src) {
+            Ok(_) => panic!("`$` accepted: {src}"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains('$'),
+            "error should mention `$`: {err}"
+        );
+    }
+}
+
+/// `$` references are rejected in model formulas, even when the atom
+/// exists in the universe.
+#[test]
+fn dollar_refs_rejected_in_models() {
+    // parse succeeds (references are not bindings)...
+    let src = "sig A {}\nrun { some A$0 } for 3";
+    let m = alloy_front_rs::parse_module(src).expect("parse");
+    // ...but lowering the model fails with Java's `$` error.
+    let err = run(&m, 0).expect_err("model atom ref built");
+    assert!(
+        err.to_string().contains('$'),
+        "error should mention `$`: {err}"
+    );
+    // Same through the `:eval` path (`run { ... }` wrapper).
+    let err = eval("sig A {}\nrun {} for 3", "some A$0").expect_err("eval atom ref built");
+    assert!(
+        err.to_string().contains('$'),
+        "error should mention `$`: {err}"
+    );
+}
+
+/// `:query` keeps atom references: solve-after evaluation may name
+/// universe atoms (Java's `frame.a2k` equivalent).
+#[test]
+fn query_atom_literal_allowed() {
+    let (m, cnf, inst) = solved_demo_int();
+    let scope = &m.commands[0].scope;
+    match query_value(&m, scope, &cnf, "A$0", &inst).expect("query A$0") {
+        QueryValue::Set(arity, ts) => {
+            assert_eq!(arity, 1);
+            assert_eq!(ts.len(), 1, "one atom singleton");
+        }
+        QueryValue::Int(..) => panic!("expected Set"),
+    }
+    // atoms compose in larger set expressions too
+    let (_, ts) = query(&m, scope, &cnf, "{A$0}", &inst).expect("query {A$0}");
+    assert_eq!(ts.len(), 1);
+}
+
 /// Reported case: `:query {x: Int}` enumerates every in-scope integer.
 /// (Needs materialized Int atoms: explicit scope here.)
 #[test]

@@ -222,6 +222,10 @@ impl<'m> Lowerer<'m> {
             open_params,
             expr_binds: std::cell::RefCell::new(HashMap::new()),
             let_binds: std::cell::RefCell::new(Vec::new()),
+            // Query-only: atom references resolve against the solved Cnf's
+            // universe (Java's solve-after `frame.a2k` equivalent).
+            allow_atoms: true,
+            pin_seq: std::cell::Cell::new(0),
         };
         f(&ctx, arena)
     }
@@ -394,6 +398,10 @@ impl<'m> Lowerer<'m> {
             open_params,
             expr_binds: std::cell::RefCell::new(HashMap::new()),
             let_binds: std::cell::RefCell::new(Vec::new()),
+            // Model builds never resolve atom names (Java parity: atoms
+            // are solver outputs, not language terms).
+            allow_atoms: false,
+            pin_seq: std::cell::Cell::new(0),
         };
 
         // Field-level formulas, now that `ctx` exists: per-field typing
@@ -602,6 +610,15 @@ struct Ctx<'a> {
     expr_binds: std::cell::RefCell<HashMap<String, (ExprId, u32)>>,
     /// let-binding scope: name -> (lowered ExprId, arity)
     let_binds: std::cell::RefCell<Vec<HashMap<String, (ExprId, u32)>>>,
+    /// Whether universe atom names (`A$0`) resolve as singleton sets.
+    /// True only for the `:query` path (solve-after evaluation, mirroring
+    /// Java's `frame.a2k`); model text (run/check/eval builds) rejects
+    /// them with Java's `$` error instead.
+    allow_atoms: bool,
+    /// Gensym sequence for `pin` label variables (`$pin{n}_...`).
+    /// A counter (not source positions): one `pin` inside a twice-called
+    /// predicate expands twice and must not collide with itself.
+    pin_seq: std::cell::Cell<u32>,
 }
 
 impl<'a> Ctx<'a> {
@@ -1422,12 +1439,23 @@ impl<'a> Ctx<'a> {
                     self.depth.set(d);
                     return Ok(out);
                 }
-                // Atom literal (e.g. `A$0` in saved partial instances, `:query`):
-                // a universe atom name denotes its singleton set. Declared
-                // names win (checked above), so this is strictly a fallback.
-                // Positions are scope-local: re-lowering under another scope
-                // re-resolves by name.
-                if let Ok(idx) = self.res.universe.index(n) {
+                // Atom literal (`A$0` in `:query`): a universe atom name
+                // denotes its singleton set. Declared names win (checked
+                // above), so this is strictly a fallback. Positions are
+                // scope-local: re-lowering under another scope re-resolves
+                // by name. Model builds reject `$` names (Java parity).
+                if self.allow_atoms {
+                    if let Ok(idx) = self.res.universe.index(n) {
+                        return Ok((arena.expr_atoms(vec![idx]), 1));
+                    }
+                } else if n.contains('$') {
+                    return Err(FrontError::Parse {
+                        pos: *pos,
+                        msg: "The name cannot contain the '$' symbol.".to_string(),
+                    });
+                } else if let Ok(idx) = self.res.universe.index(n) {
+                    // Numeric int atoms (`5`, `-5`) stay resolvable in
+                    // models: they carry no `$`.
                     return Ok((arena.expr_atoms(vec![idx]), 1));
                 }
                 // A-plan lazy allocation: integer literals in set position need
@@ -1769,6 +1797,177 @@ impl<'a> Ctx<'a> {
         })
     }
 
+    /// Desugar `pin P` to `some x1: D1, ... | <entry comparisons>`.
+    ///
+    /// Each distinct label `Sig$tag` becomes a fresh variable over the
+    /// sig's atoms (`$pin{n}_Sig_tag`, un-collidable since `$` is banned
+    /// in user bindings); same-prefix labels get pairwise `!=`. Entries
+    /// normalize by label presence and comparison orientation:
+    /// `R = S` (exact), `L in R` (lower), `R in S` (upper), plus the
+    /// `R = none` exact-empty special case.
+    fn lower_pin(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        pos: usize,
+        env: &mut Env,
+    ) -> LResult<FormulaId> {
+        let pd = self
+            .module
+            .partials
+            .iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| FrontError::Resolve(format!("unknown partial '{name}'")))?;
+        let _ = pos;
+        // Distinct labels in first-seen order: (prefix, tag, full).
+        let mut labels: Vec<(String, String, String)> = Vec::new();
+        for e in &pd.entries {
+            collect_pin_labels(&e.left, &mut labels)?;
+            collect_pin_labels(&e.right, &mut labels)?;
+        }
+        // Mint gensym variables and bind label names in `env` so the
+        // entry expressions lower with variables in label positions.
+        let base = self.pin_seq.get();
+        self.pin_seq.set(base + labels.len() as u32);
+        let mut decl_list = Vec::new();
+        let mut pushed = 0usize;
+        let mut var_of: HashMap<String, kk::VarId> = HashMap::new();
+        for (i, (prefix, tag, full)) in labels.iter().enumerate() {
+            if !self
+                .module
+                .sigs
+                .iter()
+                .flat_map(|s| s.names.iter())
+                .any(|n| n == prefix)
+            {
+                return Err(FrontError::Resolve(format!(
+                    "unknown sig prefix '{prefix}' in partial label '{full}'"
+                )));
+            }
+            let vname = format!("$pin{}_{}_{}", base + i as u32, prefix, tag);
+            let (dom, _) = self
+                .lower_expr(arena, &Expr::Name(prefix.clone(), pd.pos), env)
+                .map_err(|_| {
+                    FrontError::Resolve(format!(
+                        "unknown sig prefix '{prefix}' in partial label '{full}'"
+                    ))
+                })?;
+            let v = arena.variable(&vname);
+            let da = arena
+                .decl(v, Multiplicity::One, dom)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            decl_list.push(da);
+            env.push((full.clone(), v, 1));
+            pushed += 1;
+            var_of.insert(full.clone(), v);
+        }
+        // Normalize + lower every entry, then conjoin.
+        let mut parts: Vec<FormulaId> = Vec::new();
+        for e in &pd.entries {
+            let norm = self.normalize_pin_entry(&e.left, &e.right, e.op, &pd.name, e.pos)?;
+            let (le, _) = self.lower_expr(arena, norm.left, env)?;
+            let (re, _) = self.lower_expr(arena, norm.right, env)?;
+            // Normalization only ever yields `Eq`/`In`.
+            let kop = match norm.cmp {
+                CmpKind::Eq => ExprCompOp::Equals,
+                CmpKind::In => ExprCompOp::Subset,
+                CmpKind::Neq | CmpKind::NotIn => {
+                    return self.unsup("partial entry comparison");
+                }
+            };
+            parts.push(
+                arena
+                    .comparison(kop, le, re)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?,
+            );
+        }
+        // Same-prefix labels denote distinct atoms.
+        let mut by_prefix: HashMap<&str, Vec<kk::VarId>> = HashMap::new();
+        for (prefix, _, full) in &labels {
+            by_prefix
+                .entry(prefix.as_str())
+                .or_default()
+                .push(var_of[full.as_str()]);
+        }
+        for vars in by_prefix.values() {
+            for i in 0..vars.len() {
+                for j in i + 1..vars.len() {
+                    parts.push(var_neq(arena, vars[i], vars[j]));
+                }
+            }
+        }
+        for _ in 0..pushed {
+            env.pop();
+        }
+        let body = arena.and(&parts);
+        let ds = arena.add_decls(decl_list);
+        Ok(arena.quantified(Quantifier::Some, ds, body))
+    }
+
+    /// Decide which side of a `partial` entry is the relation and which
+    /// is the label set, by label presence and comparison orientation.
+    /// Returns the comparison to build with operands already in order:
+    /// `=` (exact, either orientation), `L in R` (lower), `R in S`
+    /// (upper), plus the `R = none` exact-empty special case.
+    fn normalize_pin_entry<'e>(
+        &self,
+        left: &'e Expr,
+        right: &'e Expr,
+        op: PartialOp,
+        pname: &str,
+        pos: usize,
+    ) -> LResult<PinNorm<'e>> {
+        let _ = pos;
+        let lh = expr_has_label(left);
+        let rh = expr_has_label(right);
+        // Exact-empty: `R = none` (either orientation).
+        if op == PartialOp::Eq && (matches!(left, Expr::None_) ^ matches!(right, Expr::None_)) {
+            let (rel, none) = if matches!(left, Expr::None_) {
+                (right, left)
+            } else {
+                (left, right)
+            };
+            if expr_has_label(rel) {
+                return Err(FrontError::Resolve(format!(
+                    "partial '{pname}': label cannot equal `none`"
+                )));
+            }
+            return Ok(PinNorm {
+                cmp: CmpKind::Eq,
+                left: rel,
+                right: none,
+            });
+        }
+        match (op, lh, rh) {
+            (PartialOp::Eq, false, true) | (PartialOp::Eq, true, false) => {
+                let (rel, set) = if lh { (right, left) } else { (left, right) };
+                Ok(PinNorm {
+                    cmp: CmpKind::Eq,
+                    left: rel,
+                    right: set,
+                })
+            }
+            // Lower: label set on the left.
+            (PartialOp::In, true, false) => Ok(PinNorm {
+                cmp: CmpKind::In,
+                left,
+                right,
+            }),
+            // Upper: label set on the right.
+            (PartialOp::In, false, true) => Ok(PinNorm {
+                cmp: CmpKind::In,
+                left,
+                right,
+            }),
+            (PartialOp::Eq, _, _) => Err(FrontError::Resolve(format!(
+                "partial '{pname}': `=` needs labels on exactly one side"
+            ))),
+            (PartialOp::In, _, _) => Err(FrontError::Resolve(format!(
+                "partial '{pname}': `in` needs labels on exactly one side"
+            ))),
+        }
+    }
+
     fn lower_formula(
         &self,
         arena: &mut kk::AstArena,
@@ -1878,6 +2077,10 @@ impl<'a> Ctx<'a> {
                 self.let_binds.borrow_mut().pop();
                 bf
             }
+            // `pin P`: embed the named partial instance by desugaring to
+            // an existential over gensym label variables (`avoid P` is
+            // already wrapped in `Not` by the parser).
+            Formula::Pin(name, pos) => self.lower_pin(arena, name, *pos, env)?,
             Formula::Cmp(kind, l, r, _) => {
                 let (el, al) = self.lower_expr(arena, l, env)?;
                 let (er, ar) = self.lower_expr(arena, r, env)?;
@@ -2103,11 +2306,74 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// A normalized `partial` entry: comparison operands already in order.
+struct PinNorm<'e> {
+    cmp: CmpKind,
+    left: &'e Expr,
+    right: &'e Expr,
+}
+
+/// True when `e` mentions any `Sig$tag` label. Entries use the
+/// restricted shape (names, `none`, `+`, `->`), so anything else is
+/// label-free here (it was rejected at parse time).
+fn expr_has_label(e: &Expr) -> bool {
+    match e {
+        Expr::Name(n, _) => n.contains('$'),
+        Expr::Bin(_, a, b) => expr_has_label(a) || expr_has_label(b),
+        _ => false,
+    }
+}
+
+/// A label tag follows plain identifier rules (`$` excluded): leading
+/// letter/`_`, then alphanumerics/`_`/`'`.
+fn valid_pin_tag(tag: &str) -> bool {
+    let mut cs = tag.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
+}
+
+/// Collect distinct `(prefix, tag, full)` labels in first-seen order.
+/// Anything that is not a well-formed `Sig$tag` label is an error here
+/// (the `$` declaration ban keeps user bindings out of this path).
+fn collect_pin_labels(
+    e: &Expr,
+    out: &mut Vec<(String, String, String)>,
+) -> LResult<()> {
+    match e {
+        Expr::Name(n, pos) => {
+            if let Some((prefix, tag)) = n.split_once('$') {
+                if prefix.is_empty() || !valid_pin_tag(tag) {
+                    return Err(FrontError::Parse {
+                        pos: *pos,
+                        msg: format!("malformed partial label '{n}' (want `Sig$tag`)"),
+                    });
+                }
+                if !out.iter().any(|(p, t, _)| p == prefix && t == tag) {
+                    out.push((prefix.to_string(), tag.to_string(), n.clone()));
+                }
+            }
+            Ok(())
+        }
+        Expr::Bin(_, a, b) => {
+            collect_pin_labels(a, out)?;
+            collect_pin_labels(b, out)
+        }
+        // Restricted entry grammar guarantees nothing else carries
+        // labels; other shapes were rejected at parse time.
+        _ => Ok(()),
+    }
+}
+
 /// Textual variable renaming used by lone/one desugaring; stops at
 /// shadowing redeclarations of `from`.
 fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
     match f {
         Formula::Const(v) => Formula::Const(*v),
+        // `pin` names a partial block, not a variable: untouched.
+        Formula::Pin(name, pos) => Formula::Pin(name.clone(), *pos),
         Formula::Not(x) => Formula::Not(Box::new(subst_formula(x, from, to))),
         Formula::And(a, b) => Formula::And(
             Box::new(subst_formula(a, from, to)),
@@ -2359,6 +2625,8 @@ fn mentions_int_formula(f: &Formula) -> bool {
     match f {
         Formula::IntCmp(..) => true,
         Formula::Const(_) => false,
+        // `pin` bodies live in `Module::partials`, walked at module level.
+        Formula::Pin(..) => false,
         Formula::Cmp(_, a, b, _) => mentions_int_expr(a) || mentions_int_expr(b),
         Formula::Quant(_, ds, body) => {
             ds.iter().any(|d| mentions_int_expr(&d.expr)) || mentions_int_formula(body)
@@ -2721,6 +2989,8 @@ fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
 fn replace_var_formula(f: &Formula, from: &str, to: &Expr) -> Formula {
     match f {
         Formula::Const(v) => Formula::Const(*v),
+        // `pin` names a partial block, not a variable: untouched.
+        Formula::Pin(name, pos) => Formula::Pin(name.clone(), *pos),
         Formula::Not(x) => Formula::Not(Box::new(replace_var_formula(x, from, to))),
         Formula::And(a, b) => Formula::And(
             Box::new(replace_var_formula(a, from, to)),

@@ -40,13 +40,18 @@ pub fn parse_formula(src: &str) -> Result<Formula, FrontError> {
 /// Classify a REPL fragment for the accumulating buffer.
 ///
 /// Returns replace keys: at most one entry per declared name, so re-entering
-/// a `sig`/`pred`/`fun`/`assert`/named-`fact` swaps the old fragment out.
-/// An empty vector means append-only (anonymous facts, commands, `open`s,
-/// multi-declaration pastes).
+/// a `sig`/`pred`/`fun`/`assert`/named-`fact`/`partial` swaps the old
+/// fragment out. An empty vector means append-only (anonymous facts,
+/// commands, `open`s, multi-declaration pastes).
 pub fn fragment_keys(src: &str) -> Result<Vec<String>, FrontError> {
     let m: Module = crate::parse_module(src)?;
     let mut keys = Vec::new();
-    let total = m.sigs.len() + m.facts.len() + m.paras.len() + m.commands.len() + m.opens.len();
+    let total = m.sigs.len()
+        + m.facts.len()
+        + m.paras.len()
+        + m.commands.len()
+        + m.opens.len()
+        + m.partials.len();
     if total != 1 {
         return Ok(keys);
     }
@@ -62,6 +67,9 @@ pub fn fragment_keys(src: &str) -> Result<Vec<String>, FrontError> {
     }
     for p in &m.paras {
         keys.push(format!("para:{}", p.name));
+    }
+    for p in &m.partials {
+        keys.push(format!("partial:{}", p.name));
     }
     Ok(keys)
 }

@@ -214,9 +214,11 @@ fn decl_types_unaffected() {
 }
 
 // End to end: range restriction keeps tuples whose last column is in range.
+// (`one sig` singletons stand in for atom literals, which are rejected in
+// model text since atoms are solver outputs, not language terms.)
 #[test]
 fn range_restrict_solves() {
-    let src = "sig A {}\nsig B { f: A }\nrun { f :> A$1 = B$0->A$1 + B$1->A$1 } for 2";
+    let src = "sig A {}\none sig A1 extends A {}\nsig B { f: A }\nrun { f :> A1 = B->A1 } for 2";
     let m = parse_module(src).expect("parse");
     let sol = run_command(&m, 0).expect("run");
     assert!(sol.satisfiable, "range restriction must be SAT");
@@ -229,7 +231,7 @@ fn range_restrict_solves() {
 // (previously regrouped and went UNSAT).
 #[test]
 fn unparenthesized_pin_solves() {
-    let src = "sig A {}\nsig B { f: A }\nrun { f = B$0->A$1 + B$1->A$0 } for 2";
+    let src = "sig A {}\none sig A0 extends A {}\none sig A1 extends A {}\nsig B { f: A }\none sig B0 extends B {}\none sig B1 extends B {}\nrun { f = B0->A1 + B1->A0 } for 3";
     let m = parse_module(src).expect("parse");
     let sol = run_command(&m, 0).expect("run");
     assert!(sol.satisfiable, "unparenthesized pin must be SAT");

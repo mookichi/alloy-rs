@@ -524,6 +524,25 @@ fn set_literal_formula() {
     assert_eq!(outcome(src, 0), "SAT");
 }
 
+/// `{}` is the empty set literal (same as `none`).
+#[test]
+fn set_literal_empty() {
+    let src = r#"
+        module t
+        sig A {}
+        pred p { {} = none and no {} }
+        run p for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+    let src2 = r#"
+        module t
+        sig A {}
+        pred p { some {} }
+        run p for 3
+    "#;
+    assert_eq!(outcome(src2, 0), "UNSAT");
+}
+
 /// `{1+1}` is `{2}` (folded), not `{1}`.
 #[test]
 fn set_literal_fold_eq() {

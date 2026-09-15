@@ -12,9 +12,9 @@
 //! - Bare expression lines follow the bare mode (`:mode eval|query`,
 //!   default `eval`): `:eval` in eval mode, `:query` against the default
 //!   solution in query mode (never stored either way).
-//! - `:save <file>` writes a solution as an Alloy pin fact;
-//!   `:add <file>` loads a file back as a fragment. Atom names (`A$0`)
-//!   resolve as singleton sets, so pins round-trip.
+//! - `:psave <file>` writes a solution as a binary partial instance
+//!   (`.apin`); `:ppin`/`:pavoid` apply it to a Cnf. Partial instances
+//!   transfer tuple indices directly, so no atom-name text is involved.
 
 use std::collections::HashMap;
 
@@ -795,143 +795,6 @@ impl Session {
         }
     }
 
-    /// Write a (partial) instance as an Alloy pin fact.
-    ///
-    /// `rels` selects relations by pool name (`+` tokens already stripped by
-    /// the caller); empty selects every non-skolem relation. Field relations
-    /// (`Owner.field`) are emitted under their bare field name when it is
-    /// unambiguous — dotted names would parse as joins, not references.
-    /// Skolems, ints, and unreferenceable (ambiguous/slashed) relations are
-    /// skipped with a notice.
-    fn do_save(&self, file: &str, sol_arg: Option<&str>, rels: &[&str]) {
-        let sol_name: &str = match sol_arg {
-            Some(n) => n,
-            None => match self.default_sol.as_deref() {
-                Some(n) => n,
-                None => {
-                    println!(
-                        "no solution saved yet (use :solve first; \
-                         form: :save <file> [in <sol>] [rels...])"
-                    );
-                    return;
-                }
-            },
-        };
-        let stored = match self.sols.get(sol_name) {
-            Some(s) => s,
-            None => {
-                println!("no solution named `{sol_name}` (:sols to list)");
-                return;
-            }
-        };
-        let inst = match &stored.instance {
-            Some(i) => i,
-            None => {
-                println!("solution `{sol_name}` is UNSAT (nothing to save)");
-                return;
-            }
-        };
-        let pool = inst.pool();
-        let all_names: Vec<String> = inst
-            .relation_tuples()
-            .map(|(r, _)| pool.name(r).to_string())
-            .collect();
-        // Resolve the selection to pool names.
-        let wanted: Vec<String> = if rels.is_empty() {
-            all_names
-                .iter()
-                .filter(|n| {
-                    inst.find_relation_by_name(n)
-                        .map(|r| !pool.is_skolem(r))
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect()
-        } else {
-            let mut out = Vec::new();
-            for want in rels {
-                let pool_name = if all_names.iter().any(|n| n == want) {
-                    want.to_string()
-                } else if let Some(hit) = unique_bare_field(&all_names, want) {
-                    hit
-                } else {
-                    println!("no relation `{want}` in solution `{sol_name}`");
-                    return;
-                };
-                if pin_ref(&all_names, &pool_name).is_none() {
-                    println!("cannot reference `{pool_name}` in Alloy (ambiguous field)");
-                    return;
-                }
-                out.push(pool_name);
-            }
-            out
-        };
-        let mut lines: Vec<(String, String)> = Vec::new();
-        let mut skipped_skolem = 0;
-        let mut skipped_ref = 0;
-        for name in &wanted {
-            let r = match inst.find_relation_by_name(name) {
-                Some(r) => r,
-                None => continue,
-            };
-            if pool.is_skolem(r) {
-                skipped_skolem += 1;
-                continue;
-            }
-            let emit = match pin_ref(&all_names, name) {
-                Some(e) => e,
-                None => {
-                    skipped_ref += 1;
-                    continue;
-                }
-            };
-            let ts = inst.tuples(r).expect("resolved relation has tuples");
-            lines.push((emit, fmt::set_expr_alloy(inst.universe(), ts.arity(), ts)));
-        }
-        if lines.is_empty() {
-            println!("nothing to save (all selected relations skipped)");
-            return;
-        }
-        let base = file.rsplit('/').next().unwrap_or(file);
-        let stem = match base.rfind('.') {
-            Some(i) if i > 0 => &base[..i],
-            _ => base,
-        };
-        let text = fmt::pin_fact_text(stem, sol_name, inst.universe().size(), &lines);
-        match std::fs::write(file, &text) {
-            Ok(()) => {
-                let mut msg = format!(
-                    "saved {file} (fact from `{sol_name}`, {} relations pinned)",
-                    lines.len()
-                );
-                let mut skipped = Vec::new();
-                if skipped_skolem > 0 {
-                    skipped.push(format!("{skipped_skolem} skolem"));
-                }
-                if skipped_ref > 0 {
-                    skipped.push(format!("{skipped_ref} unreferenceable"));
-                }
-                let n_ints = inst.int_tuples().count();
-                if n_ints > 0 {
-                    skipped.push(format!("{n_ints} int"));
-                }
-                if !skipped.is_empty() {
-                    msg.push_str(&format!("; skipped {}", skipped.join(", ")));
-                }
-                println!("{msg}");
-            }
-            Err(e) => println!("cannot write {file}: {e}"),
-        }
-    }
-
-    /// Load a file back as a model fragment (replace semantics via fact name).
-    fn do_add(&mut self, file: &str) {
-        match std::fs::read_to_string(file) {
-            Ok(text) => self.add_fragment(&text),
-            Err(e) => println!("cannot read {file}: {e}"),
-        }
-    }
-
     /// Inspect a binary partial instance (decode + summary, no solving).
     fn do_pread(&self, file: &str) {
         let bytes = match std::fs::read(file) {
@@ -1201,7 +1064,7 @@ impl Session {
     }
 
     /// Write a (partial) instance in binary APIN form (lossless, incl. ints).
-    /// Relation filter mirrors `:save` (exact or unique bare field); no
+    /// Relation filter takes an exact pool name or a unique bare field; no
     /// Alloy-reference filtering applies since indices transfer directly.
     fn do_psave(&self, file: &str, sol_arg: Option<&str>, rels: &[&str]) {
         let (sol_name, inst) = match self.sol_instance(sol_arg) {
@@ -1358,6 +1221,8 @@ impl Session {
 fn print_help() {
     println!("declare (accumulate into the model; re-enter a name to replace):");
     println!("  sig ... / fact ... / pred ... / fun ... / assert ... / open ...");
+    println!("  partial <name> {{ R = S, L in R, ... }}  named partial instance");
+    println!("    (`pin <name>` / `avoid <name>` in formulas; labels `Sig$tag`)");
     println!("  run ... / check ...      as a fragment when it names no command");
     println!("  multi-line continues on `... ` until braces balance;");
     println!("  blank line or a `:command` line submits pending input first");
@@ -1384,8 +1249,6 @@ fn print_help() {
     println!("  :mode [eval|query]  toggle/switch how bare lines read (:m; no arg toggles)");
     println!("  :fragments          list entered fragments");
     println!("  :drop <i>           delete fragment by index, rebuild (stores cleared)");
-    println!("  :save <file> [in <sol>] [rels...]  write solution as Alloy pin fact");
-    println!("  :add <file>         load a file back as a fragment (replaces same pin)");
     println!("  :psave <file> [in <sol>] [rels...] write solution as binary partial (.apin)");
     println!("  :pread <file>       inspect a binary partial (no solving)");
     println!("  :ppin <file> [rels...] [to <cnf>] [as <sol>] [gated]");
@@ -1404,34 +1267,7 @@ fn print_help() {
     println!("  materialize the range).");
 }
 
-/// Reference form for a pool relation name inside an emitted pin fact.
-///
-/// Plain sig names emit as-is. `Owner.field` emits as bare `field` iff that
-/// name is unambiguous (exactly one dotted owner, and no top-level relation
-/// already uses it): dotted syntax would parse as a join, not a reference.
-/// Anything else (slashes, ambiguity) yields `None` (skip with notice).
-fn pin_ref(all_names: &[String], name: &str) -> Option<String> {
-    if name.contains('/') {
-        return None;
-    }
-    let (_, field) = match name.split_once('.') {
-        None => return Some(name.to_string()),
-        Some((_, f)) if !f.contains('/') => ((), f),
-        Some(_) => return None,
-    };
-    let owners = all_names
-        .iter()
-        .filter(|n| n.rsplit('.').next() == Some(field))
-        .count();
-    let bare_taken = all_names.iter().any(|n| n == field);
-    if owners == 1 && !bare_taken {
-        Some(field.to_string())
-    } else {
-        None
-    }
-}
-
-/// Resolve an explicit `:save` relation argument: exact pool name first,
+/// Resolve an explicit `:psave` relation argument: exact pool name first,
 /// then a unique bare field name.
 fn unique_bare_field(all_names: &[String], want: &str) -> Option<String> {
     let mut hits = all_names
@@ -1455,7 +1291,7 @@ fn second_token(s: &str) -> &str {
 /// through build-or-add). `one`/`lone`/`some`/`var` count only before `sig`.
 fn looks_like_decl(s: &str) -> bool {
     match first_token(s) {
-        "sig" | "abstract" | "fact" | "pred" | "fun" | "assert" | "open" => true,
+        "sig" | "abstract" | "fact" | "pred" | "fun" | "assert" | "open" | "partial" => true,
         "one" | "lone" | "some" | "var" => second_token(s) == "sig",
         _ => false,
     }
@@ -1522,13 +1358,13 @@ fn split_query_in<'a>(sess: &Session, body: &'a str) -> (&'a str, Option<&'a str
     (body, None)
 }
 
-/// Split `:save` args into (file, sol, rels).
+/// Split `:psave` args into (file, sol, rels).
 /// Forms: `<file>`, `<file> in <sol>`, either followed by relation names
 /// (`+` tokens ignored, so `A + B` and `A B` agree).
-fn parse_save_args<'a>(
+fn parse_psave_args<'a>(
     rest: &[&'a str],
 ) -> Result<(&'a str, Option<&'a str>, Vec<&'a str>), &'static str> {
-    const USAGE: &str = "usage: :save <file> [in <sol>] [rels...]";
+    const USAGE: &str = "usage: :psave <file> [in <sol>] [rels...]";
     if rest.is_empty() {
         return Err(USAGE);
     }
@@ -1771,15 +1607,7 @@ fn main() {
                         sess.drop_fragment(arg);
                     }
                 }
-                "save" => match parse_save_args(&rest) {
-                    Ok((file, sol, rels)) => sess.do_save(file, sol, &rels),
-                    Err(usage) => println!("{usage}"),
-                },
-                "add" => match arg {
-                    Some(p) => sess.do_add(p),
-                    None => println!("usage: :add <file>"),
-                },
-                "psave" => match parse_save_args(&rest) {
+                "psave" => match parse_psave_args(&rest) {
                     Ok((file, sol, rels)) => sess.do_psave(file, sol, &rels),
                     Err(usage) => println!("{usage}"),
                 },
@@ -1911,15 +1739,7 @@ fn main() {
                         sess.drop_fragment(arg);
                     }
                 }
-                "save" => match parse_save_args(&rest) {
-                    Ok((file, sol, rels)) => sess.do_save(file, sol, &rels),
-                    Err(usage) => println!("{usage}"),
-                },
-                "add" => match arg {
-                    Some(p) => sess.do_add(p),
-                    None => println!("usage: add <file>"),
-                },
-                "psave" => match parse_save_args(&rest) {
+                "psave" => match parse_psave_args(&rest) {
                     Ok((file, sol, rels)) => sess.do_psave(file, sol, &rels),
                     Err(usage) => println!("{usage}"),
                 },

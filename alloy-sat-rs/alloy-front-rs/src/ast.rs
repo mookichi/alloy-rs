@@ -176,6 +176,10 @@ pub enum Formula {
     Not(Box<Formula>),
     LetBind(Vec<(String, Expr)>, Box<Formula>),
     Call(String, Vec<Expr>, usize),
+    /// `pin P`: the partial instance `P` embeds (existentially) here.
+    /// `avoid P` parses as `Not(Pin)`. Lowered by desugaring to an
+    /// existential over gensym label variables; never temporal.
+    Pin(String, usize),
     // temporal operators (LTL)
     Always(Box<Formula>),
     Eventually(Box<Formula>),
@@ -219,6 +223,7 @@ impl Formula {
             Formula::IntCmp(_, a, b, _) => a.has_temporal() || b.has_temporal(),
             Formula::Multi(_, e, _) => e.has_temporal(),
             Formula::Call(_, args, _) => args.iter().any(|a| a.has_temporal()),
+            Formula::Pin(..) => false,
             Formula::Const(_) => false,
         }
     }
@@ -314,6 +319,35 @@ pub struct Open {
     pub params: Vec<OpenParam>,
 }
 
+/// Comparison shape of one `partial` block entry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PartialOp {
+    /// `R = S`: exact (the relation equals the label set).
+    Eq,
+    /// `L in R` (lower) or `R in S` (upper), decided by which side is
+    /// the bare relation reference.
+    In,
+}
+
+/// One `partial` block entry: a comparison between a relation and a
+/// label-set expression over the same columns.
+#[derive(Debug, Clone)]
+pub struct PartialEntry {
+    pub op: PartialOp,
+    pub left: Expr,
+    pub right: Expr,
+    pub pos: usize,
+}
+
+/// A parsed `partial name { ... }` block: a named partial instance
+/// (diagram) usable via `pin name` / `avoid name` in formulas.
+#[derive(Debug, Clone)]
+pub struct PartialDef {
+    pub name: String,
+    pub entries: Vec<PartialEntry>,
+    pub pos: usize,
+}
+
 pub struct Module {
     pub header: String,
     pub sigs: Vec<SigDecl>,
@@ -321,6 +355,7 @@ pub struct Module {
     pub paras: Vec<Para>,
     pub commands: Vec<Command>,
     pub opens: Vec<Open>,
+    pub partials: Vec<PartialDef>,
 }
 
 impl Module {
@@ -401,6 +436,12 @@ pub fn effective_bitwidth(module: &Module, scope: &Scope) -> u32 {
             visit_expr.push(&d.expr);
         }
     }
+    for pd in &module.partials {
+        for e in &pd.entries {
+            visit_expr.push(&e.left);
+            visit_expr.push(&e.right);
+        }
+    }
     for e in visit_expr {
         collect_int_widths_expr(e, &mut acc);
     }
@@ -461,6 +502,18 @@ pub fn module_needs_int_atoms(module: &Module, scope: &Scope) -> bool {
             }
         }
     }
+    for pd in &module.partials {
+        for e in &pd.entries {
+            scan_expr_int_set(&e.left, &mut needs);
+            if needs {
+                return true;
+            }
+            scan_expr_int_set(&e.right, &mut needs);
+            if needs {
+                return true;
+            }
+        }
+    }
     needs
 }
 
@@ -512,6 +565,8 @@ fn collect_int_widths_expr(e: &Expr, acc: &mut u32) {
 fn collect_int_widths_formula(f: &Formula, acc: &mut u32) {
     match f {
         Formula::Const(_) => {}
+        // `pin` bodies live in `Module::partials`, walked at module level.
+        Formula::Pin(..) => {}
         Formula::Cmp(_, a, b, _) => {
             collect_int_widths_expr(a, acc);
             collect_int_widths_expr(b, acc);
@@ -640,6 +695,8 @@ fn scan_formula_int_set(f: &Formula, needs: &mut bool) {
     }
     match f {
         Formula::Const(_) => {}
+        // `pin` bodies live in `Module::partials`, walked at module level.
+        Formula::Pin(..) => {}
         Formula::Cmp(_, a, b, _) => {
             scan_expr_int_set(a, needs);
             scan_expr_int_set(b, needs);

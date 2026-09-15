@@ -98,7 +98,50 @@ Java版にREPLは存在しないため、以下はすべて Rust 側の独自設
   Cnfとsolutionの名前空間は別。
 - **`:eval` の素式リフト**: 素の関係式は `some (...)` で包んで充足可能性を
   問う (`als -e` と同じ手口)。
-- **pin/apin**: `:save`/`:add` (Alloy fact形式) と `:psave`/`:pread`/
-  `:ppin`/`:pavoid` (バイナリ部分インスタンス)。`gated` は将来の永続
+- **pin/apin**: パーシャルインスタンスはバイナリ形式のみ
+  (`:psave`/`:pread`/`:ppin`/`:pavoid`, `.apin`)。テキストpin
+  (`:save`/`:add`, Alloy fact形式) は廃止した。`gated` は将来の永続
   セッション向けの先行予約であり、現行のワンショット解決では恒久配置と
   同値。
+- **atom名 (`A$0`) の扱い** (Java互換): モデル記述内 (sig/field/変数/para/
+  fact名の宣言、`fact`・`run`・`:eval` 中の参照) では `$` 含有を拒否する
+  (`The name cannot contain the '$' symbol.`。Javaの `Alloy.cup` `nod()` と
+  同文言)。atomはsolver出力の表示ラベルであり言語項ではないため。
+  唯一の例外は `:query` ワンライナーで、解後の評価としてuniverse atomを
+  単集合として参照できる (Javaのsolve後 `frame.a2k` 相当)。番号はscope割当
+  順であり、Java visualizerの解後採番と一致するとは限らない。
+
+## 5. ASTレベル・パーシャルインスタンス: `partial` / `pin` / `avoid`
+
+Java・Kodkodいずれにも対応物がない純粋な拡張 (REPLのバイナリ `.apin`
+機構とは独立)。テキストpin (`:save`/`:add`) 廃止後の置換えとして、
+`$` ラベルをブロック内に閉じ込めたdiagram法を提供する:
+
+```alloy
+partial part1 { A = A$book + A$note }   // exact
+partial part2 { A$book in A }           // lower
+run { pin part1 and #A = 2 } for 3
+```
+
+- **定義**: `partial <name> { <entry>, ... }`。エントリは `=` (exact)、
+  `L in R` (lower)、`R in S` (upper) の3形式。`!=`/`not in` は不可
+  (`avoid` を使う)。エントリの式はラベル (`Sig$tag`)・intリテラル・
+  `none`/`{}`・素リレーション参照・dotted参照 (`B.f`)・`+`/`->` のみ。
+- **参照**: formula位置の `pin <name>` / `avoid <name>` (`avoid` は
+  `Not(pin)` に読む)。`pin P` は `some x... | <連言>` に、`avoid P` は
+  その否定にdesugarされ、既存lower→CNF経路のみを通る (Kodkod層無改修)。
+- **ラベル規則**: `Sig$tag` のみ (prefixは宣言sig、`Int` 不可、tagは
+  ID規則)。同一 `(prefix,tag)` は同一atom、同一prefixの異tagは `!=`
+  で区別。ラベルは定義内局所 (`pin P and pin P` は冪等、定義間共有なし)。
+  Subsig跨ぎの同一指示は不可。
+- **下限のみの `in` との違い**: `:ppin` は記載リレーション完全固定だが、
+  `pin` エントリは `=` のみexactで `in` は下限/上限。単独使用は濃度条件に
+  縮退する (`avoid {A={x,y}}` ≡ `#A≠2`、`avoid {x in A}` ≡ `A=∅`)。
+- **番号非依存**: ラベルは名前であり `A$0` のようなscope番号ではない。
+  universe再構成時も名前解決されるため、scope変更に強い (ただしprefix
+  sigの割当自体はscope依存)。
+- **集合の表示形式**: `:query`・`:solve`/`:show` の表示と `:save` の保存は
+  `{A$0, B$0}` 形 (空集合は `{}`、単要素も `{A$0}`)。旧 `A + B` / `none`
+  表示からの変更で、表示と保存のみ (文法は不変: `+` も `none` も従来通り
+  受理し、`{}` は空集合リテラルとして受理)。表示出力はそのまま `:add` や
+  `:query {...}` に再投入できる。

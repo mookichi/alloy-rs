@@ -28,8 +28,8 @@ mod parser;
 pub use ast::Scope;
 pub use ast::{
     BinOp, CmpKind, Command, CommandKind, Decl, Expr, Formula, IntBinOp, IntCmpOp, IntExpr, Module,
-    Open, OpenParam, QuantKind, SigDecl, SigMult, DEFAULT_INT_BITWIDTH, effective_bitwidth,
-    module_needs_int_atoms,
+    Open, OpenParam, PartialDef, PartialEntry, PartialOp, QuantKind, SigDecl, SigMult,
+    DEFAULT_INT_BITWIDTH, effective_bitwidth, module_needs_int_atoms,
 };
 pub use lower::{Lowerer, LoweredProblem};
 pub use cnf::{check, run, solve, validate, Cnf, CnfKind};

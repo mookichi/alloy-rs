@@ -191,7 +191,10 @@ impl Parser {
             if hit_bracket {
                 self.eat(&Tok::As); // optional `as`
                 let alias = match self.bump().tok {
-                    Tok::Ident(n) => n,
+                    Tok::Ident(n) => {
+                        self.nod(&n)?;
+                        n
+                    }
                     other => {
                         return Err(self.err(&format!(
                             "expected alias after open params, got {}",
@@ -206,7 +209,10 @@ impl Parser {
                 });
             } else {
                 let alias = match self.bump().tok {
-                    Tok::Ident(n) => n,
+                    Tok::Ident(n) => {
+                        self.nod(&n)?;
+                        n
+                    }
                     other => return Err(self.err(&format!("bad open alias: {}", other.describe()))),
                 };
                 opens.push(crate::ast::Open {
@@ -221,6 +227,7 @@ impl Parser {
         let mut facts = Vec::new();
         let mut paras = Vec::new();
         let mut commands = Vec::new();
+        let mut partials = Vec::new();
         loop {
             match self.peek() {
                 Tok::Sig => sigs.push(self.sig_decl()?),
@@ -229,11 +236,27 @@ impl Parser {
                 {
                     sigs.push(self.sig_decl()?);
                 }
+                // `partial name { ... }`: named partial-instance block.
+                // A bare `partial` is never valid Alloy, so the keyword
+                // check needs no further lookahead.
+                Tok::Ident(n) if n == "partial" => {
+                    let pd = self.partial_def()?;
+                    if partials.iter().any(|p: &PartialDef| p.name == pd.name) {
+                        return Err(self.err(&format!(
+                            "duplicate partial '{}'",
+                            pd.name
+                        )));
+                    }
+                    partials.push(pd);
+                }
                 Tok::Fact => {
                     self.bump();
                     let name = if let Tok::Ident(_) = self.peek() {
                         Some(match self.bump().tok {
-                            Tok::Ident(n) => n,
+                            Tok::Ident(n) => {
+                                self.nod(&n)?;
+                                n
+                            }
                             _ => unreachable!(),
                         })
                     } else {
@@ -247,7 +270,10 @@ impl Parser {
                 Tok::Assert => {
                     self.bump();
                     let name = match self.bump().tok {
-                        Tok::Ident(n) => n,
+                        Tok::Ident(n) => {
+                            self.nod(&n)?;
+                            n
+                        }
                         other => {
                             return Err(self
                                 .err(&format!("expected assert name, got {}", other.describe())))
@@ -282,6 +308,82 @@ impl Parser {
             paras,
             commands,
             opens,
+            partials,
+        })
+    }
+
+    /// `partial name { R = S, L in R, ... }`: a named partial-instance
+    /// block (diagram). Entries compare a relation side against a
+    /// label-set side with `=` (exact) or `in` (lower/upper by orientation).
+    fn partial_def(&mut self) -> PResult<PartialDef> {
+        let pos = self.pos();
+        match self.bump().tok {
+            Tok::Ident(n) if n == "partial" => {}
+            _ => unreachable!(),
+        }
+        let name = self.bind_name()?;
+        self.expect(&Tok::LBrace)?;
+        let mut entries = Vec::new();
+        if !matches!(self.peek(), Tok::RBrace) {
+            loop {
+                entries.push(self.partial_entry()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        if entries.is_empty() {
+            return Err(self.err("partial block must have at least one entry"));
+        }
+        Ok(PartialDef { name, entries, pos })
+    }
+
+    /// One `partial` entry: `<expr> (=|in) <expr>`. Both sides must use
+    /// the restricted label-set shape; which side is the relation is
+    /// decided at lowering by label presence and comparison orientation.
+    fn partial_entry(&mut self) -> PResult<PartialEntry> {
+        let pos = self.pos();
+        let left = self.rel_expr_top(false)?;
+        let op = match self.peek() {
+            Tok::Eq => {
+                self.bump();
+                PartialOp::Eq
+            }
+            Tok::In => {
+                self.bump();
+                PartialOp::In
+            }
+            Tok::NotEq => {
+                return Err(self.err(
+                    "partial entries use `=` or `in` only (`!=` is not supported; use `avoid`)",
+                ))
+            }
+            Tok::Not => {
+                return Err(self.err(
+                    "partial entries use `=` or `in` only (`not in` is not supported; use `avoid`)",
+                ))
+            }
+            other => {
+                return Err(self.err(&format!(
+                    "expected `=` or `in` in partial entry, got {}",
+                    other.describe()
+                )))
+            }
+        };
+        let right = self.rel_expr_top(false)?;
+        for side in [&left, &right] {
+            if !partial_set_shape(side) {
+                return Err(self.err(
+                    "partial entries allow only labels (`A$x`), int literals, `none`, `{}`, `+`, `->`",
+                ));
+            }
+        }
+        Ok(PartialEntry {
+            op,
+            left,
+            right,
+            pos,
         })
     }
 
@@ -316,9 +418,9 @@ impl Parser {
             }
         }
         self.expect(&Tok::Sig)?;
-        let mut names = vec![self.ident()?];
+        let mut names = vec![self.bind_name()?];
         while self.eat(&Tok::Comma) {
-            names.push(self.ident()?);
+            names.push(self.bind_name()?);
         }
         let mut extends = None;
         let mut rel = SigRel::None;
@@ -418,6 +520,25 @@ impl Parser {
         Ok(n)
     }
 
+    /// Java parity (`Alloy.cup` `nod`): declaration-bound names may not
+    /// contain `$`. Atom names (`A$0`) are universe members, not language
+    /// bindings; only references (expressions, `:query`) may use them.
+    fn nod(&self, name: &str) -> PResult<()> {
+        if name.contains('$') {
+            return Err(self.err("The name cannot contain the '$' symbol."));
+        }
+        Ok(())
+    }
+
+    /// A binding occurrence of a name: `ident` plus the `$` check.
+    fn bind_name(&mut self) -> PResult<String> {
+        let n = self.ident()?;
+        // Only the head segment is user-declared (`alias/name` qualified
+        // references never occur in binding position).
+        self.nod(n.split('/').next().unwrap_or(&n))?;
+        Ok(n)
+    }
+
     // ------------------------------------------------------------------
     // declarations: names : [mult] type-expr (with arrow multiplicities)
     // ------------------------------------------------------------------
@@ -436,13 +557,13 @@ impl Parser {
                 break;
             }
         }
-        let mut names = vec![self.ident()?];
+        let mut names = vec![self.bind_name()?];
         while matches!(self.peek(), Tok::Comma)
             && matches!(self.peek_at(1), Tok::Ident(_))
             && (matches!(self.peek_at(2), Tok::Colon) || matches!(self.peek_at(2), Tok::Comma))
         {
             self.bump();
-            names.push(self.ident()?);
+            names.push(self.bind_name()?);
         }
         if self.eat(&Tok::Colon) {
             let expr = self.arrow_type()?;
@@ -540,7 +661,7 @@ impl Parser {
 
     fn para(&mut self, is_fun: bool) -> PResult<Para> {
         self.expect(if is_fun { &Tok::Fun } else { &Tok::Pred })?;
-        let name = self.ident()?;
+        let name = self.bind_name()?;
         let mut params = Vec::new();
         let open = if self.eat(&Tok::LParen) {
             Some(Tok::RParen)
@@ -972,7 +1093,7 @@ impl Parser {
             self.bump();
             let mut binds = Vec::new();
             loop {
-                let name = self.ident()?;
+                let name = self.bind_name()?;
                 self.expect(&Tok::Eq)?;
                 let e = self.rel_expr_top(in_sig)?;
                 binds.push((name, e));
@@ -1048,7 +1169,13 @@ impl Parser {
                 // set literal (extension: Java rejects the latter).
                 // Declarations win when parseable (`{x: X, y: Y}` binds two
                 // names); otherwise rewind and read a union list.
+                // `{}` is the empty set literal (needed so the REPL's
+                // `{...}` display/save format round-trips); `none`
+                // stays accepted as before.
                 self.bump();
+                if self.eat(&Tok::RBrace) {
+                    return Ok(Expr::None_);
+                }
                 let after_brace = self.pos;
                 match self.quant_decls() {
                     Ok(ds) => {
@@ -1238,6 +1365,28 @@ impl Parser {
     }
 
     fn parse_not_level(&mut self) -> PResult<Formula> {
+        // `pin P` / `avoid P`: partial-instance embedding (AST-level).
+        // Every formula position funnels through here. Two adjacent
+        // identifiers are never valid Alloy, so `pin|avoid` followed by a
+        // bare name is unambiguous (`pin[x]`, `pin in A`, a `sig pin`,
+        // etc. keep their existing readings).
+        if let Tok::Ident(kw) = self.peek() {
+            if (kw == "pin" || kw == "avoid") && matches!(self.peek_at(1), Tok::Ident(_)) {
+                let pos = self.pos();
+                let neg = kw == "avoid";
+                self.bump();
+                let name = match self.bump().tok {
+                    Tok::Ident(n) => n,
+                    _ => unreachable!(),
+                };
+                let pin = Formula::Pin(name, pos);
+                return Ok(if neg {
+                    Formula::Not(Box::new(pin))
+                } else {
+                    pin
+                });
+            }
+        }
         // parenthesized formula: try, rewind on failure so set-comparison
         // paths like `(a + b) = c` still work.
         if matches!(self.peek(), Tok::LParen) {
@@ -1252,7 +1401,7 @@ impl Parser {
             self.bump();
             let mut binds = Vec::new();
             loop {
-                let n = self.ident()?;
+                let n = self.bind_name()?;
                 self.expect(&Tok::Eq)?;
                 let e = self.rel_expr_top(false)?;
                 binds.push((n, e));
@@ -1423,7 +1572,7 @@ impl Parser {
         while self.eat(&Tok::Disj) {
             disj = true;
         }
-        let mut names = vec![self.ident()?];
+        let mut names = vec![self.bind_name()?];
         // continue the SAME group only when a comma joins two bare names
         // (`x, y: S`); a group boundary looks like `x: S, y: T` where the
         // colon arrives before any comma.
@@ -1436,7 +1585,7 @@ impl Parser {
             // it means the group ends with this name: `x, y: S`
             // But if peek_at(1) (after the comma) is a name followed by Colon
             // and we've already consumed a Colon for a prior name, stop.
-            names.push(self.ident()?);
+            names.push(self.bind_name()?);
             // If next is Colon, the group is complete — don't add more
             if matches!(self.peek(), Tok::Colon) {
                 break;
@@ -1773,6 +1922,42 @@ impl Parser {
                 other.describe()
             ))),
         }
+    }
+}
+
+/// Restricted label-set shape for `partial` entries: bare names (labels,
+/// relation references, int literals), `none`/`{}`, dotted relation
+/// references (`B.f`), and `+`/`->` combinations thereof. Everything
+/// else (quantifiers, `#`, `sum`, closures, calls, label-carrying joins,
+/// ...) is rejected here; label-vs-relation roles are decided at lowering.
+fn partial_set_shape(e: &crate::ast::Expr) -> bool {
+    match e {
+        crate::ast::Expr::Name(..) | crate::ast::Expr::None_ => true,
+        crate::ast::Expr::Bin(
+            crate::ast::BinOp::Union | crate::ast::BinOp::Product,
+            a,
+            b,
+        ) => partial_set_shape(a) && partial_set_shape(b),
+        // Dotted pool reference (`B.f`): joins of label-free plain names.
+        crate::ast::Expr::Bin(crate::ast::BinOp::Join, a, b) => {
+            dotted_rel_shape(a) && dotted_rel_shape(b)
+        }
+        _ => false,
+    }
+}
+
+/// A dotted relation reference: plain names (no labels, no int
+/// literals) joined by `.`. Label-carrying joins (`A$x.f`) are not
+/// partial shapes.
+fn dotted_rel_shape(e: &crate::ast::Expr) -> bool {
+    match e {
+        crate::ast::Expr::Name(n, _) => {
+            !n.contains('$') && n != "none" && n.parse::<i64>().is_err()
+        }
+        crate::ast::Expr::Bin(crate::ast::BinOp::Join, a, b) => {
+            dotted_rel_shape(a) && dotted_rel_shape(b)
+        }
+        _ => false,
     }
 }
 
