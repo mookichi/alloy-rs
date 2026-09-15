@@ -99,8 +99,10 @@ pub enum Tok {
     OrOp,
     AndOp,
     ShArrow,
+    RevArrow,
     At,
     ColonLt,
+    ColonGt,
     Eof,
 }
 
@@ -201,8 +203,10 @@ impl Tok {
             Tok::OrOp => "'||'",
             Tok::AndOp => "'&&'",
             Tok::ShArrow => "'=>'",
+            Tok::RevArrow => "'-<'",
             Tok::At => "'@'",
             Tok::ColonLt => "'<:'",
+            Tok::ColonGt => "':>'",
             Tok::Eof => "end of input",
         }
     }
@@ -275,6 +279,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, crate::FrontError> {
             } else if two(b'<', b':') {
                 i += 2;
                 Some((Tok::ColonLt, "<:"))
+            } else if two(b':', b'>') {
+                i += 2;
+                Some((Tok::ColonGt, ":>"))
             } else if two(b'=', b'<') {
                 i += 2;
                 Some((Tok::LtEq, "=<"))
@@ -302,6 +309,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, crate::FrontError> {
             } else if two(b'+', b'+') {
                 i += 2;
                 Some((Tok::PlusPlus, "++"))
+            } else if two(b'-', b'<') {
+                // Reverse product `-<`: `a -< b` means `b -> a`. Only
+                // matches when glued; `a - <b` (spaces) still lexes as
+                // minus plus comparison.
+                i += 2;
+                Some((Tok::RevArrow, "-<"))
             } else if two(b'-', b'>') {
                 i += 2;
                 Some((Tok::Arrow, "->"))

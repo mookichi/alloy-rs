@@ -1,6 +1,8 @@
 //! Tests for the REPL snippet API: fragments, bare expressions, eval, query.
 
-use alloy_front_rs::{eval, fragment_keys, parse_expr, query, run, solve};
+use alloy_front_rs::{
+    eval, fragment_keys, parse_expr, parse_int_expr, query, query_value, run, solve, QueryValue,
+};
 
 const DEMO: &str = r#"
     module demo
@@ -78,6 +80,29 @@ fn solved_demo() -> (alloy_front_rs::Module, alloy_front_rs::Cnf, alloy_front_rs
     (m, cnf, inst)
 }
 
+/// DEMO variant with Int atoms materialized (explicit `4 Int` scope):
+/// A-plan allocates int atoms lazily, so set-position Int queries
+/// (`Int`, `{x: Int}`, `{1+1}`, `5 + A`) need this model.
+const DEMO_INT: &str = r#"
+    module demo
+    sig A { f: lone B }
+    sig B {}
+    pred someA { some A }
+    fun fa: set A { A }
+    run someA for 3, 4 Int
+"#;
+
+fn solved_demo_int() -> (
+    alloy_front_rs::Module,
+    alloy_front_rs::Cnf,
+    alloy_front_rs::Instance,
+) {
+    let m = alloy_front_rs::parse_module(DEMO_INT).expect("parse");
+    let cnf = run(&m, 0).expect("run");
+    let inst = solve(&cnf).expect("solve").expect("SAT");
+    (m, cnf, inst)
+}
+
 #[test]
 fn query_reads_against_instance() {
     let (m, cnf, inst) = solved_demo();
@@ -96,6 +121,109 @@ fn query_reads_against_instance() {
     assert_eq!(arity3, 1);
     // unknown name is a clean error, not a panic
     assert!(query(&m, scope, &cnf, "Nope", &inst).is_err());
+}
+
+#[test]
+fn query_int_cardinality() {
+    let (m, cnf, inst) = solved_demo();
+    let scope = &m.commands[0].scope;
+    let r = inst.find_relation_by_name("A").unwrap();
+    let n = inst.tuples(r).unwrap().len() as i64;
+    assert!(parse_int_expr("#A").is_ok());
+    match query_value(&m, scope, &cnf, "#A", &inst).expect("query #A") {
+        QueryValue::Int(v) => assert_eq!(v, n),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
+    // integer arithmetic over a query
+    match query_value(&m, scope, &cnf, "#A + 1", &inst).expect("query #A + 1") {
+        QueryValue::Int(v) => assert_eq!(v, n + 1),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
+    // relational input still yields a set through query_value
+    match query_value(&m, scope, &cnf, "A", &inst).expect("query A") {
+        QueryValue::Set(arity, ts) => {
+            assert_eq!(arity, 1);
+            assert_eq!(ts.len() as i64, n);
+        }
+        QueryValue::Int(..) => panic!("expected Set"),
+    }
+    // garbage reports the relational parse error, not the int one
+    assert!(query_value(&m, scope, &cnf, "A +", &inst).is_err());
+    // the set-only entry point stays set-only
+    assert!(query(&m, scope, &cnf, "#A", &inst).is_err());
+}
+
+#[test]
+fn query_int_universe() {
+    // `Int` (and `int`) denote every in-scope integer: default bitwidth 4
+    // covers -8..7 (explicit scope materializes the atoms).
+    let (m, cnf, inst) = solved_demo_int();
+    let scope = &m.commands[0].scope;
+    for src in ["Int", "int"] {
+        match query_value(&m, scope, &cnf, src, &inst).expect("query Int") {
+            QueryValue::Set(arity, ts) => {
+                assert_eq!(arity, 1);
+                assert_eq!(ts.len(), 16, "bitwidth 4 covers -8..7");
+            }
+            QueryValue::Int(..) => panic!("expected Set"),
+        }
+    }
+    // the set-only entry point accepts it too
+    let (_, ts) = query(&m, scope, &cnf, "Int", &inst).expect("query Int");
+    assert_eq!(ts.len(), 16);
+}
+
+#[test]
+fn query_int_universe_lazy_when_unused() {
+    // A-plan lazy allocation: an Int-free model materializes no int
+    // atoms, so `Int` denotes the empty set there (use `for N Int` or
+    // mention Int to get the range).
+    let (m, cnf, inst) = solved_demo();
+    let scope = &m.commands[0].scope;
+    match query_value(&m, scope, &cnf, "Int", &inst).expect("query Int") {
+        QueryValue::Set(arity, ts) => {
+            assert_eq!(arity, 1);
+            assert_eq!(ts.len(), 0, "Int-free model has no int atoms");
+        }
+        QueryValue::Int(..) => panic!("expected Set"),
+    }
+    // `#Int` is likewise 0 without materialized atoms.
+    match query_value(&m, scope, &cnf, "#Int", &inst).expect("query #Int") {
+        QueryValue::Int(v) => assert_eq!(v, 0),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
+}
+
+#[test]
+fn query_int_literal_wraps_like_java() {
+    let (m, cnf, inst) = solved_demo();
+    let scope = &m.commands[0].scope;
+    // in-range literals (unary minus folds at parse time)
+    match query_value(&m, scope, &cnf, "-8", &inst).expect("query -8") {
+        QueryValue::Int(v) => assert_eq!(v, -8),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
+    match query_value(&m, scope, &cnf, "7", &inst).expect("query 7") {
+        QueryValue::Int(v) => assert_eq!(v, 7),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
+    // out-of-range literals wrap (two's complement truncation at the
+    // query Cnf's bitwidth 4), matching Java's evaluator: 100 -> 4,
+    // -9 -> 7.
+    match query_value(&m, scope, &cnf, "100", &inst).expect("query 100") {
+        QueryValue::Int(v) => assert_eq!(v, 4),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
+    match query_value(&m, scope, &cnf, "-9", &inst).expect("query -9") {
+        QueryValue::Int(v) => assert_eq!(v, 7),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
+    let r = inst.find_relation_by_name("A").unwrap();
+    let n = inst.tuples(r).unwrap().len() as i64;
+    match query_value(&m, scope, &cnf, "#A + 100", &inst).expect("query #A + 100") {
+        QueryValue::Int(v) => assert_eq!(v, n + 4),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
 }
 
 #[test]
@@ -133,4 +261,140 @@ fn let_separator_parity_with_java() {
     // End-to-end through eval.
     let sat = eval(DEMO, "let x = A | some x").expect("eval let");
     assert!(sat.satisfiable);
+}
+
+/// Reported REPL session: with X pinned to three int atoms, a filtered
+/// comprehension query returns the qualifying subset.
+#[test]
+fn query_comprehension_int_filter() {
+    let src = r#"
+        module demo
+        sig X in Int {}
+        fact pin { X = -128 + -127 + -126 }
+        run {} for 3, 8 Int
+    "#;
+    let m = alloy_front_rs::parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("build cnf");
+    let inst = solve(&cnf).expect("solve").expect("SAT instance");
+    let scope = &m.commands[0].scope;
+    match query_value(&m, scope, &cnf, "{x: X | x < -126}", &inst).expect("query") {
+        QueryValue::Set(arity, ts) => {
+            assert_eq!(arity, 1);
+            assert_eq!(ts.len(), 2);
+        }
+        QueryValue::Int(..) => panic!("expected Set"),
+    }
+    // unfiltered, the whole pinned set comes back
+    let (_, all) = query(&m, scope, &cnf, "X", &inst).expect("query X");
+    assert_eq!(all.len(), 3);
+}
+
+/// Reported case: `:query {x: X}` enumerates the whole domain.
+#[test]
+fn query_bare_comprehension() {
+    let src = r#"
+        module demo
+        sig X in Int {}
+        fact pin { X = -128 + -127 + -126 }
+        run {} for 3, 8 Int
+    "#;
+    let m = alloy_front_rs::parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("build cnf");
+    let inst = solve(&cnf).expect("solve").expect("SAT instance");
+    let scope = &m.commands[0].scope;
+    let (_, ts) = query(&m, scope, &cnf, "{x: X}", &inst).expect("query {x: X}");
+    assert_eq!(ts.len(), 3);
+}
+
+/// `{A, B, ...}` set literal (extension: Java rejects it) equals `A + B`.
+#[test]
+fn query_set_literal() {
+    let (m, cnf, inst) = solved_demo();
+    let scope = &m.commands[0].scope;
+    let (_, plus) = query(&m, scope, &cnf, "A + B", &inst).expect("query A + B");
+    let (_, lit) = query(&m, scope, &cnf, "{A, B}", &inst).expect("query {A, B}");
+    assert_eq!(lit.len(), plus.len());
+    // single-element and nested forms
+    let (_, one) = query(&m, scope, &cnf, "{A}", &inst).expect("query {A}");
+    let (_, a) = query(&m, scope, &cnf, "A", &inst).expect("query A");
+    assert_eq!(one.len(), a.len());
+    // multi-decl comprehension still wins over literal reading
+    let (_, all) = query(&m, scope, &cnf, "{x: A}", &inst).expect("query {x: A}");
+    assert_eq!(all.len(), a.len());
+}
+
+/// Purely integer-shaped input queries as an integer: `1+1` is `2`
+/// (arithmetic), not the `{1}` union.
+#[test]
+fn query_arith_over_literals() {
+    let (m, cnf, inst) = solved_demo();
+    let scope = &m.commands[0].scope;
+    match query_value(&m, scope, &cnf, "1+1", &inst).expect("query 1+1") {
+        QueryValue::Int(v) => assert_eq!(v, 2),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
+    // mixed set/int stays relational: `5 + A` is the union set
+    // (needs materialized atoms, so it is covered on the Int model).
+    let (mi, cnfi, insti) = solved_demo_int();
+    let scopei = &mi.commands[0].scope;
+    match query_value(&mi, scopei, &cnfi, "5 + A", &insti).expect("query 5 + A") {
+        QueryValue::Set(..) => {}
+        QueryValue::Int(..) => panic!("expected Set"),
+    }
+    // on the Int-free model the set-position literal is out of scope
+    assert!(query_value(&m, scope, &cnf, "5 + A", &inst).is_err());
+}
+
+/// `{1+1}` folds pure literal arithmetic: `{2}`, not the `{1}` union.
+/// (Set-position literals need materialized Int atoms.)
+#[test]
+fn query_set_literal_folds_arith() {
+    let (m, cnf, inst) = solved_demo_int();
+    let scope = &m.commands[0].scope;
+    let (_, two) = query(&m, scope, &cnf, "{1+1}", &inst).expect("query {1+1}");
+    assert_eq!(two.len(), 1);
+    let (_, sum) = query(&m, scope, &cnf, "{1+1, 5}", &inst).expect("query {1+1, 5}");
+    assert_eq!(sum.len(), 2);
+}
+
+/// `{x : 1+2}` binds the folded domain `{3}`, not `{1, 2}`.
+/// (Set-position literals need materialized Int atoms.)
+#[test]
+fn query_domain_fold() {
+    let (m, cnf, inst) = solved_demo_int();
+    let scope = &m.commands[0].scope;
+    let (_, ts) = query(&m, scope, &cnf, "{x : 1+2}", &inst).expect("query {x : 1+2}");
+    assert_eq!(ts.len(), 1);
+}
+
+/// `:query (sum X)` evaluates the set form.
+#[test]
+fn query_sum_of_set() {
+    let src = r#"
+        module demo
+        sig X in Int {}
+        fact pin { X = 1 + 2 + 3 }
+        run {} for 3
+    "#;
+    let m = alloy_front_rs::parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("build cnf");
+    let inst = solve(&cnf).expect("solve").expect("SAT instance");
+    let scope = &m.commands[0].scope;
+    match query_value(&m, scope, &cnf, "sum X", &inst).expect("query sum X") {
+        QueryValue::Int(v) => assert_eq!(v, 6),
+        QueryValue::Set(..) => panic!("expected Int"),
+    }
+}
+
+/// Reported case: `:query {x: Int}` enumerates every in-scope integer.
+/// (Needs materialized Int atoms: explicit scope here.)
+#[test]
+fn query_comprehension_over_int() {
+    let (m, cnf, inst) = solved_demo_int();
+    let scope = &m.commands[0].scope;
+    let (_, ts) = query(&m, scope, &cnf, "{x: Int}", &inst).expect("query {x: Int}");
+    assert_eq!(ts.len(), 16, "bitwidth 4 covers -8..7");
+    // `Int` inside larger set expressions routes through the evaluator too
+    let (_, union) = query(&m, scope, &cnf, "none + Int", &inst).expect("query none + Int");
+    assert_eq!(union.len(), 16);
 }

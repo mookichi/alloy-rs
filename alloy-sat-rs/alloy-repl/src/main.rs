@@ -9,7 +9,9 @@
 //!   model fragments (re-enter a name to replace it); multi-line input
 //!   continues on `... ` until braces balance.
 //! - `:eval <expr|formula>` checks satisfiability (`run { ... }` wrap).
-//! - Bare expression lines are `:eval` (never stored).
+//! - Bare expression lines follow the bare mode (`:mode eval|query`,
+//!   default `eval`): `:eval` in eval mode, `:query` against the default
+//!   solution in query mode (never stored either way).
 //! - `:save <file>` writes a solution as an Alloy pin fact;
 //!   `:add <file>` loads a file back as a fragment. Atom names (`A$0`)
 //!   resolve as singleton sets, so pins round-trip.
@@ -17,8 +19,8 @@
 use std::collections::HashMap;
 
 use alloy_front_rs::{
-    check, eval, fragment_keys, parse_module, query, run, solve, validate, Cnf, CnfKind,
-    CommandKind, IncrementalSession, Instance, Module, PartialInstance,
+    check, eval, fragment_keys, parse_module, query_value, run, solve, validate, Cnf, CnfKind,
+    CommandKind, IncrementalSession, Instance, Module, PartialInstance, QueryValue,
 };
 
 mod fmt;
@@ -42,6 +44,24 @@ enum InputKind {
     Bare,
     Eval,
     Query,
+}
+
+/// How a bare expression line is interpreted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BareMode {
+    /// Satisfiability check (default; never stored).
+    Eval,
+    /// Evaluate against the default solution (`:query <expr>`).
+    Query,
+}
+
+impl BareMode {
+    fn prompt(self) -> &'static str {
+        match self {
+            BareMode::Eval => "alloy> ",
+            BareMode::Query => "alloy?> ",
+        }
+    }
 }
 
 struct Pending {
@@ -73,6 +93,7 @@ struct Session {
     default_cnf: Option<String>,
     default_sol: Option<String>,
     pending: Option<Pending>,
+    bare: BareMode,
 }
 
 impl Session {
@@ -90,6 +111,7 @@ impl Session {
             default_cnf: None,
             default_sol: None,
             pending: None,
+            bare: BareMode::Eval,
         }
     }
 
@@ -670,8 +692,11 @@ impl Session {
                 return;
             }
         };
-        match query(m, scope, &cnf_owned, expr, &inst_owned) {
-            Ok((arity, ts)) => println!("{}", fmt::set_alloy(ts.universe(), arity, &ts)),
+        match query_value(m, scope, &cnf_owned, expr, &inst_owned) {
+            Ok(QueryValue::Set(arity, ts)) => {
+                println!("{}", fmt::set_alloy(ts.universe(), arity, &ts))
+            }
+            Ok(QueryValue::Int(v)) => println!("{v}"),
             Err(e) => println!("query error: {e}"),
         }
     }
@@ -681,7 +706,42 @@ impl Session {
             println!("no module loaded");
             return;
         }
-        self.do_eval_text(expr, None);
+        match self.bare {
+            BareMode::Eval => self.do_eval_text(expr, None),
+            BareMode::Query => self.do_query_text(expr, None),
+        }
+    }
+
+    /// Switch how bare expression lines are interpreted.
+    fn do_mode(&mut self, arg: Option<&str>) {
+        match arg {
+            // No argument toggles between the two bare modes.
+            None => {
+                self.bare = match self.bare {
+                    BareMode::Eval => BareMode::Query,
+                    BareMode::Query => BareMode::Eval,
+                };
+                self.print_bare_mode();
+            }
+            Some("eval") => {
+                self.bare = BareMode::Eval;
+                self.print_bare_mode();
+            }
+            Some("query") => {
+                self.bare = BareMode::Query;
+                self.print_bare_mode();
+            }
+            Some(other) => println!("unknown mode `{other}` (usage: :mode [eval|query])"),
+        }
+    }
+
+    fn print_bare_mode(&self) {
+        match self.bare {
+            BareMode::Eval => println!("bare mode: eval (bare lines run :eval)"),
+            BareMode::Query => {
+                println!("bare mode: query (bare lines run :query against the default solution)")
+            }
+        }
     }
 
     fn do_validate(&self, sol_arg: Option<&str>, cnf_arg: Option<&str>) {
@@ -1306,19 +1366,22 @@ fn print_help() {
     println!("  :check <i|name> [as <cnf>]  build negated Cnf, save it");
     println!("  :solve [<cnf>] [as <sol>]   solve named Cnf (no arg = *default), save solution");
     println!("  :query <expr> [in <sol>]    evaluate against named solution (no in = *default)");
+    println!("                              sets print as tuples, int exprs (`#A`) as numbers");
     println!("    NOTE: `in` collides with Alloy `in`; the trailing `in <sol>` is used only");
     println!("    when <sol> names a stored solution, else the whole text is the expression.");
     println!("    Use `@ <sol>` as an unambiguous alternative: `:query A @ someA`.");
     println!("  :validate <sol> [in <cnf>]  validate solution vs Cnf (no in = its origin Cnf)");
     println!("  :show [name] [N]            show Cnf clauses and/or solution (no arg = defaults)");
     println!("  :eval <expr> [as <sol>]     satisfiability check (bare expr lifts with some)");
-    println!("  <expr>                    bare line: :eval (never stored)");
+    println!("  <expr>                    bare line: :eval in eval mode, :query in query");
+    println!("                            mode (never stored; switch via :mode)");
     println!("commands:");
     println!("  :load <file>        load .als model (fragments + stores cleared)");
     println!("  :list               list run/check commands in the module");
     println!("  :cnfs               list saved Cnfs (* = default)");
     println!("  :sols               list saved solutions (* = default)");
     println!("  :use <name>         switch default to a Cnf and/or solution");
+    println!("  :mode [eval|query]  toggle/switch how bare lines read (:m; no arg toggles)");
     println!("  :fragments          list entered fragments");
     println!("  :drop <i>           delete fragment by index, rebuild (stores cleared)");
     println!("  :save <file> [in <sol>] [rels...]  write solution as Alloy pin fact");
@@ -1333,6 +1396,12 @@ fn print_help() {
     println!("  :help               this help");
     println!("  :quit               exit (Ctrl-D also exits)");
     println!("notes: `let` works inside pred/fun bodies and :eval/:query expressions.");
+    println!("notes: integers are bitvectors: `Int[w]` declares a w-bit wide");
+    println!("  integer type (bare `Int` = command default from `for N Int`, else");
+    println!("  4 bits). Effective width = max(default, every Int[w]). Int atoms");
+    println!("  are allocated lazily: models that never use Int as a set carry");
+    println!("  none (queries like `Int` then read empty; add `for N Int` to");
+    println!("  materialize the range).");
 }
 
 /// Reference form for a pool relation name inside an emitted pin fact.
@@ -1604,6 +1673,8 @@ const BARE_COMMANDS: &[&str] = &[
     "cnfs",
     "sols",
     "use",
+    "mode",
+    "m",
     "query",
     "eval",
 ];
@@ -1627,7 +1698,7 @@ fn main() {
         let prompt = if sess.pending.is_some() {
             "... "
         } else {
-            "alloy> "
+            sess.bare.prompt()
         };
         let line = match rl.readline(prompt) {
             Ok(l) => l,
@@ -1691,6 +1762,7 @@ fn main() {
                     Some(n) => sess.do_use(n),
                     None => println!("usage: :use <cnf|sol>"),
                 },
+                "mode" | "m" => sess.do_mode(arg),
                 "fragments" => sess.list_fragments(),
                 "drop" => {
                     if rest.len() != 1 {
@@ -1830,6 +1902,7 @@ fn main() {
                     Some(n) => sess.do_use(n),
                     None => println!("usage: :use <cnf|sol>"),
                 },
+                "mode" | "m" => sess.do_mode(arg),
                 "fragments" => sess.list_fragments(),
                 "drop" => {
                     if rest.len() != 1 {

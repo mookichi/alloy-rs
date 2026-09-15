@@ -354,3 +354,272 @@ fn let_expr_multi_bind() {
     "#;
     assert_eq!(outcome(src, 0), "SAT");
 }
+
+/// `sig X in Int` parses (Java parity: accepted, `extends Int` rejected).
+#[test]
+fn sig_in_int_parses() {
+    let m = parse_module("sig X in Int {}\nrun {} for 3").unwrap();
+    assert_eq!(m.sigs.len(), 1);
+    assert_eq!(m.sigs[0].extends.as_deref(), Some("Int"));
+}
+
+/// `sig X in Int` is a subset of the builtin Int: nonempty is SAT.
+#[test]
+fn sig_in_int_some_sat() {
+    let src = r#"
+        module t
+        sig X in Int {}
+        run { some X } for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// `sig X in Int` is flexible: empty is SAT too.
+#[test]
+fn sig_in_int_empty_sat() {
+    let src = r#"
+        module t
+        sig X in Int {}
+        run { no X } for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// X is a subset of the int atoms: it is disjoint from any plain sig,
+// so `some (X & A)` is UNSAT. (Cardinality literals would wrap at the
+// default bitwidth 4, so intersection is used instead.)
+#[test]
+fn sig_in_int_subset_holds() {
+    let src = r#"
+        module t
+        sig A {}
+        sig X in Int {}
+        run { some (X & A) } for 3
+    "#;
+    assert_eq!(outcome(src, 0), "UNSAT");
+}
+
+/// Transitive subset through an Int subset: `sig Y in X`, `X in Int`.
+#[test]
+fn sig_in_int_transitive() {
+    let src = r#"
+        module t
+        sig X in Int {}
+        sig Y in X {}
+        run { some Y } for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// Java parity: `sig X extends Int` is rejected with a builtin error.
+#[test]
+fn sig_extends_int_rejected() {
+    let src = r#"
+        module t
+        sig X extends Int {}
+        run {} for 3
+    "#;
+    let out = outcome(src, 0);
+    assert!(
+        out.contains("cannot extend the builtin \"Int\" signature"),
+        "unexpected: {out}"
+    );
+}
+
+/// Java parity: a set-typed operand in integer position lowers via the SUM
+/// cast (`typecheck_as_int`), so `{x: X | x < -126}` parses as `IntCmp`.
+#[test]
+fn int_var_lt_parses_as_int_cmp() {
+    let f = alloy_front_rs::parse_formula("all x: X | x < -126").expect("parse");
+    let dbg = format!("{f:?}");
+    assert!(dbg.contains("IntCmp"), "got: {dbg}");
+    assert!(dbg.contains("Val"), "got: {dbg}");
+}
+
+/// `=`/`!=` stay relational (Java: no int casts): `x = 5` is set equality
+/// against the `{5}` singleton, and `A = B` is untouched.
+#[test]
+fn int_eq_stays_relational() {
+    let f = alloy_front_rs::parse_formula("x = 5").expect("parse");
+    assert!(format!("{f:?}").starts_with("Cmp("), "got: {f:?}");
+    let f = alloy_front_rs::parse_formula("A = B").expect("parse");
+    assert!(format!("{f:?}").starts_with("Cmp("), "got: {f:?}");
+    // genuinely int-typed `=` keeps the int route (`#A` is cardinality)
+    let f = alloy_front_rs::parse_formula("#A = 4").expect("parse");
+    assert!(format!("{f:?}").contains("IntCmp"), "got: {f:?}");
+}
+
+/// Integer literal in set position: `some 5` (the `{5}` singleton).
+#[test]
+fn int_literal_singleton_some() {
+    let src = r#"
+        module t
+        sig A {}
+        run { some 5 } for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// `some x: X | x < 0` over an Int subset is SAT.
+#[test]
+fn int_var_lt_some_sat() {
+    let src = r#"
+        module t
+        sig X in Int {}
+        run { some x: X | x < 0 } for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// Above the bitwidth-4 maximum (7), no X atom qualifies: UNSAT.
+#[test]
+fn int_var_gt_unsat() {
+    let src = r#"
+        module t
+        sig X in Int {}
+        run { some x: X | x > 7 } for 3
+    "#;
+    assert_eq!(outcome(src, 0), "UNSAT");
+}
+
+/// Relational `x = 0` against the `{0}` singleton is SAT.
+#[test]
+fn int_var_eq_zero_sat() {
+    let src = r#"
+        module t
+        sig X in Int {}
+        run { some x: X | x = 0 } for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// Java parity: `{x: X}` without `| body` enumerates the whole domain.
+#[test]
+fn comprehension_without_filter() {
+    let src = r#"
+        module t
+        sig X in Int {}
+        fact pin { X = 1 + 2 + 3 }
+        pred p { {x: X} = X }
+        run p for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+    let src2 = r#"
+        module t
+        sig A {}
+        run { some {x: A} } for 3
+    "#;
+    assert_eq!(outcome(src2, 0), "SAT");
+}
+
+/// `{A, B}` set literal in formula position.
+#[test]
+fn set_literal_formula() {
+    let src = r#"
+        module t
+        sig A {} sig B {}
+        pred p { {A, B} = (A + B) }
+        run p for 3
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// `{1+1}` is `{2}` (folded), not `{1}`.
+#[test]
+fn set_literal_fold_eq() {
+    let sat = r#"
+        module t
+        sig A {}
+        pred p { {1+1} = {2} }
+        run p for 3
+    "#;
+    assert_eq!(outcome(sat, 0), "SAT");
+    let unsat = r#"
+        module t
+        sig A {}
+        pred p { {1+1} = {1} }
+        run p for 3
+    "#;
+    assert_eq!(outcome(unsat, 0), "UNSAT");
+}
+
+/// Binding domains fold pure literal arithmetic: `{x: 1+2}` is `{3}`.
+#[test]
+fn quant_domain_fold_eq() {
+    let sat = r#"
+        module t
+        sig A {}
+        pred p { {x: 1+2} = {3} }
+        run p for 3
+    "#;
+    assert_eq!(outcome(sat, 0), "SAT");
+    let unsat = r#"
+        module t
+        sig A {}
+        pred p { {x: 1+2} = {1, 2} }
+        run p for 3
+    "#;
+    assert_eq!(outcome(unsat, 0), "UNSAT");
+}
+
+/// `sum e` over a unary set (Java parity), incl. braced comprehension.
+#[test]
+fn sum_of_set() {
+    let sat = r#"
+        module t
+        sig X in Int {}
+        fact pin { X = 1 + 2 + 3 }
+        pred p { (sum X) = 6 }
+        run p for 3
+    "#;
+    assert_eq!(outcome(sat, 0), "SAT");
+    let unsat = r#"
+        module t
+        sig X in Int {}
+        fact pin { X = 1 + 2 + 3 }
+        pred p { (sum X) = 7 }
+        run p for 3
+    "#;
+    assert_eq!(outcome(unsat, 0), "UNSAT");
+    let braced = r#"
+        module t
+        sig X in Int {}
+        fact pin { X = 1 + 2 + 3 }
+        pred p { (sum {x: X | some x}) = 6 }
+        run p for 3
+    "#;
+    assert_eq!(outcome(braced, 0), "SAT");
+}
+
+/// `set = int-expr`: the int side denotes its singleton (Java `toSet`).
+/// `X = sum {1,2}` holds iff X is `{3}`.
+#[test]
+fn set_eq_sum_singleton() {
+    let sat = r#"
+        module t
+        sig X in Int {}
+        fact pin { X = 1 + 2 + 3 }
+        pred p { X = sum {1, 2} }
+        run p for 3
+    "#;
+    // X = {1,2,3}, sum{1,2} = 3: {1,2,3} != {3}
+    assert_eq!(outcome(sat, 0), "UNSAT");
+    let sat2 = r#"
+        module t
+        sig X in Int {}
+        fact pin { X = 3 }
+        pred p { X = sum {1, 2} }
+        run p for 3
+    "#;
+    assert_eq!(outcome(sat2, 0), "SAT");
+    // mirrored form and `!=`
+    let mirror = r#"
+        module t
+        sig X in Int {}
+        sig Y in Int {}
+        fact pin { X = 3  Y = 1 + 2 }
+        pred p { (sum Y) = X and X != sum {1} }
+        run p for 3
+    "#;
+    assert_eq!(outcome(mirror, 0), "SAT");
+}

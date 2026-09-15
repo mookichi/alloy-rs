@@ -533,7 +533,9 @@ mod tests {
 
     fn model_cnf() -> crate::cnf::Cnf {
         // `A` free over 2 atoms (4 models), `B` fixed by `exactly`.
-        let src = "sig A {}\none sig B {}\nrun { A = A } for 2";
+        // Explicit `4 Int` keeps int bounds materialized (int atoms are
+        // otherwise allocated lazily, only when Int is used as a set).
+        let src = "sig A {}\none sig B {}\nrun { A = A } for 2, 4 Int";
         let m = crate::parse_module(src).expect("parse");
         crate::cnf::run(&m, 0).expect("build")
     }

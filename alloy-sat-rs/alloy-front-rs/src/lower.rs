@@ -59,10 +59,16 @@ impl<'m> Lowerer<'m> {
                     }
                 }
             }
-            // sig `in` constraints: sig A in B  =>  A in B (subset)
+            // sig `in` constraints: sig A in B  =>  A in B (subset).
+            // A builtin `Int` parent needs no formula: the child's upper
+            // bound is already exactly the int atoms (the solver's integer
+            // layer cannot take an Ints constant in a formula).
             for sd in &ctx.module.sigs {
                 if sd.rel == crate::ast::SigRel::In {
                     if let Some(parent_name) = &sd.extends {
+                        if parent_name == "Int" {
+                            continue;
+                        }
                         for child_name in &sd.names {
                             let child_rel = ctx.lookup_rel(child_name).ok_or_else(|| {
                                 FrontError::Resolve(format!("unknown sig '{child_name}'"))
@@ -135,6 +141,34 @@ impl<'m> Lowerer<'m> {
         arena: &mut kk::AstArena,
         e: &Expr,
     ) -> LResult<(kk::ExprId, u32)> {
+        self.with_query_ctx(scope, arena, |ctx, arena| {
+            ctx.lower_expr(arena, e, &mut Vec::new())
+        })
+    }
+
+    /// Lower a bare integer expression reusing a caller-provided arena
+    /// (REPL `:query`, e.g. `#A`). Same setup/contract as
+    /// [`Self::lower_expr_in_scope`].
+    pub fn lower_int_in_scope(
+        &mut self,
+        scope: &Scope,
+        arena: &mut kk::AstArena,
+        ie: &IntExpr,
+    ) -> LResult<kk::IntId> {
+        self.with_query_ctx(scope, arena, |ctx, arena| {
+            ctx.lower_int(arena, ie, &mut Vec::new())
+        })
+    }
+
+    /// Shared query-time setup: resolve the scope, re-intern relation names
+    /// into the caller-provided arena, and run `f` with the lowering
+    /// context. Typing info only; no bounds are (re)built here.
+    fn with_query_ctx<R>(
+        &mut self,
+        scope: &Scope,
+        arena: &mut kk::AstArena,
+        f: impl FnOnce(&Ctx<'_>, &mut kk::AstArena) -> LResult<R>,
+    ) -> LResult<R> {
         let res = bounds::resolve(self.module, scope).map_err(FrontError::Resolve)?;
         // Re-intern only: names already present keep their IDs.
         let mut rels: HashMap<String, RelationId> = HashMap::new();
@@ -189,7 +223,7 @@ impl<'m> Lowerer<'m> {
             expr_binds: std::cell::RefCell::new(HashMap::new()),
             let_binds: std::cell::RefCell::new(Vec::new()),
         };
-        ctx.lower_expr(arena, e, &mut Vec::new())
+        f(&ctx, arena)
     }
 
     /// Shared bounds/arena setup for one scope; runs `f` with the lowering
@@ -310,19 +344,23 @@ impl<'m> Lowerer<'m> {
             ordering_info.insert(alias.clone(), (first_rel, next_rel));
         }
 
-        // int atom exact bounds
-        let half = 1i64 << (res.bitwidth - 1);
-        for v in (-half)..half {
-            let name = v.to_string();
-            let idx = res
-                .universe
-                .index(&name)
-                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-            let mut ts = alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 1)
-                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-            ts.insert_index(idx as i64);
-            b.bound_exactly_int(v, &ts)
-                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+        // int atom exact bounds (lazy: skipped entirely when the module
+        // never mentions Int as a set, so Int-free models carry no int
+        // atoms in either the universe or the bounds).
+        if crate::ast::module_needs_int_atoms(self.module, scope) {
+            let half = 1i64 << (res.bitwidth - 1);
+            for v in (-half)..half {
+                let name = v.to_string();
+                let idx = res
+                    .universe
+                    .index(&name)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let mut ts = alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 1)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                ts.insert_index(idx as i64);
+                b.bound_exactly_int(v, &ts)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            }
         }
 
         // Insert ordering relations into rels so name resolution can find them
@@ -463,7 +501,7 @@ impl<'m> Lowerer<'m> {
                     });
                 }
             }
-            Expr::Univ | Expr::None_ | Expr::IntAtom => 1,
+            Expr::Univ | Expr::None_ | Expr::IntAtom(_) => 1,
             other => {
                 let _ = other;
                 return self.unsup("complex expression in field declaration");
@@ -505,8 +543,11 @@ impl<'m> Lowerer<'m> {
                 Ok(all.into_iter().map(|a| vec![a]).collect())
             }
             Expr::None_ | Expr::Iden => Ok(Vec::new()),
-            Expr::IntAtom => {
-                // Int atoms: named by their numeric value
+            Expr::IntAtom(_) => {
+                // Int atoms: named by their numeric value, over the
+                // RESOLVED (effective) bitwidth. Per-occurrence `Int[w]`
+                // widths feed that max at resolve time; by lowering the
+                // universe already covers every declared width.
                 let half = 1i64 << (res.bitwidth - 1);
                 let int_atoms: Vec<Vec<String>> =
                     ((-half)..half).map(|v| vec![v.to_string()]).collect();
@@ -1299,7 +1340,7 @@ impl<'a> Ctx<'a> {
             Expr::Univ => (arena.constant(kk::ConstantExpr::Univ), 1),
             Expr::None_ => (arena.constant(kk::ConstantExpr::Empty), 1),
             Expr::Iden => (arena.constant(kk::ConstantExpr::Iden), 2),
-            Expr::IntAtom => (arena.constant(kk::ConstantExpr::Ints), 1),
+            Expr::IntAtom(_) => (arena.constant(kk::ConstantExpr::Ints), 1),
             Expr::Name(n, pos) => {
                 // Check let-binding scopes (innermost first)
                 {
@@ -1389,6 +1430,15 @@ impl<'a> Ctx<'a> {
                 if let Ok(idx) = self.res.universe.index(n) {
                     return Ok((arena.expr_atoms(vec![idx]), 1));
                 }
+                // A-plan lazy allocation: integer literals in set position need
+                // materialized int atoms. On Int-free models the universe
+                // has none, so explain instead of a bare "unresolved".
+                if n.parse::<i64>().is_ok() {
+                    return Err(FrontError::Parse {
+                        pos: *pos,
+                        msg: format!("integer '{n}' is not in scope (this model materializes no Int atoms; mention Int in the model or add `for N Int` / `Int[w]` to the scope)"),
+                    });
+                }
                 return Err(FrontError::Parse {
                     pos: *pos,
                     msg: format!("unresolved name '{}' (env has: {:?})", n, env.iter().map(|(n,_,_)| n.as_str()).collect::<Vec<_>>()),
@@ -1418,6 +1468,19 @@ impl<'a> Ctx<'a> {
                                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
                         }
                         arena.binary_expr(kk::BinaryOp::Intersection, ax, eb)
+                    }
+                    BinOp::RangeRestrict => {
+                        // A :> B = (univ^(a-1) × B) & A
+                        // This restricts A to tuples whose last column is in B
+                        let ax_ar = aa;
+                        let mut bx = eb;
+                        let univ = arena.constant(kk::ConstantExpr::Univ);
+                        for _ in 1..ax_ar {
+                            bx = arena
+                                .binary_expr(kk::BinaryOp::Product, univ, bx)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        }
+                        arena.binary_expr(kk::BinaryOp::Intersection, bx, ea)
                     }
                     _ => {
                         // For Union, Intersect, Difference, Override, Product:
@@ -1664,6 +1727,21 @@ impl<'a> Ctx<'a> {
             IntExpr::Card(e, _) => {
                 let (ee, _) = self.lower_expr(arena, e, env)?;
                 arena.cast_to_int(CastToIntOp::Cardinality, ee).unwrap()
+            }
+            IntExpr::Val(e, _) => {
+                // Set-typed operand in integer position: SUM cast (Java
+                // `typecheck_as_int`). A singleton evaluates to its value.
+                let (ee, _) = self.lower_expr(arena, e, env)?;
+                arena
+                    .cast_to_int(CastToIntOp::Sum, ee)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?
+            }
+            IntExpr::SumOf(e, _) => {
+                // Explicit `sum e`: same SUM cast as `Val`.
+                let (ee, _) = self.lower_expr(arena, e, env)?;
+                arena
+                    .cast_to_int(CastToIntOp::Sum, ee)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?
             }
             IntExpr::Sum(decls, body, _) => {
                 if decls.iter().any(|d| d.disj && d.names.len() > 1) {
@@ -2127,7 +2205,7 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
 fn subst_expr(e: &Expr, from: &str, to: &str) -> Expr {
     match e {
         Expr::Name(n, p) if n == from => Expr::Name(to.to_string(), *p),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom => e.clone(),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom(_) => e.clone(),
         Expr::Bin(op, a, b) => Expr::Bin(
             *op,
             Box::new(subst_expr(a, from, to)),
@@ -2209,6 +2287,8 @@ fn subst_int(i: &IntExpr, from: &str, to: &str) -> IntExpr {
             Box::new(subst_int(a, from, to)),
             Box::new(subst_int(b, from, to)),
         ),
+        IntExpr::Val(e, p) => IntExpr::Val(Box::new(subst_expr(e, from, to)), *p),
+        IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(subst_expr(e, from, to)), *p),
     }
 }
 
@@ -2243,7 +2323,7 @@ fn strip_mult(e: &Expr) -> Expr {
         Expr::Prime(x) => Expr::Prime(Box::new(strip_mult(x))),
         Expr::AtExpr(x) => Expr::AtExpr(Box::new(strip_mult(x))),
         Expr::LetBind(binds, body) => Expr::LetBind(binds.clone(), Box::new(strip_mult(body))),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom => e.clone(),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom(_) => e.clone(),
     }
 }
 
@@ -2252,7 +2332,7 @@ fn strip_mult(e: &Expr) -> Expr {
 /// (`none`/`iden` lower and evaluate fine and are kept.)
 fn mentions_int_expr(e: &Expr) -> bool {
     match e {
-        Expr::IntAtom => true,
+        Expr::IntAtom(_) => true,
         Expr::Name(n, _) => n == "int" || n == "Int",
         Expr::ArrowMult(_, inner) | Expr::LeadMult(_, inner) => mentions_int_expr(inner),
         Expr::Bin(_, a, b) => mentions_int_expr(a) || mentions_int_expr(b),
@@ -2415,7 +2495,7 @@ fn field_mult_constraint(
                 walk(b, offset + aa as usize, markers, total_cols)?;
                 Ok(())
             }
-            Expr::Name(..) | Expr::Univ | Expr::IntAtom | Expr::None_ | Expr::Iden => {
+            Expr::Name(..) | Expr::Univ | Expr::IntAtom(_) | Expr::None_ | Expr::Iden => {
                 *total_cols += 1;
                 Ok(())
             }
@@ -2579,7 +2659,7 @@ fn field_mult_constraint(
 fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
     match e {
         Expr::Name(n, _) if n == from => to.clone(),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom => e.clone(),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom(_) => e.clone(),
         Expr::Bin(op, a, b) => Expr::Bin(
             *op,
             Box::new(replace_var_expr(a, from, to)),
@@ -2770,6 +2850,8 @@ fn replace_var_int(i: &IntExpr, from: &str, to: &Expr) -> IntExpr {
             Box::new(replace_var_int(a, from, to)),
             Box::new(replace_var_int(b, from, to)),
         ),
+        IntExpr::Val(e, p) => IntExpr::Val(Box::new(replace_var_expr(e, from, to)), *p),
+        IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(replace_var_expr(e, from, to)), *p),
     }
 }
 

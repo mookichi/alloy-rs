@@ -70,7 +70,28 @@ impl<'a> Evaluator<'a> {
                         .map_err(|_| EvalError::UnboundVariable)
                 }
                 ConstantExpr::Empty => Ok(self.dims(1)?),
-                ConstantExpr::Ints => Err(EvalError::UnboundInteger(i64::MIN)),
+                ConstantExpr::Ints => {
+                    // Every in-scope integer: the instance integer layer
+                    // plus int atoms resolved by universe name (int atoms
+                    // are named by their numeric value; solve-derived
+                    // instances leave the integer layer empty).
+                    let mut out = IntSet::new();
+                    for (_, ts) in self.instance.int_tuples() {
+                        for idx in ts.index_view().iter() {
+                            out.insert(idx);
+                        }
+                    }
+                    let n = self.univ() as usize;
+                    for i in 0..n {
+                        if let Ok(atom) = self.instance.universe().atom(i) {
+                            if atom.parse::<i64>().is_ok() {
+                                out.insert(i as Int);
+                            }
+                        }
+                    }
+                    TupleSet::from_indices(self.instance.universe(), 1, out)
+                        .map_err(|_| EvalError::UnboundVariable)
+                },
                 ConstantExpr::Iden => {
                     let mut ts = self.dims(2)?;
                     let n = self.univ() as usize;
@@ -247,10 +268,24 @@ impl<'a> Evaluator<'a> {
                     CastToIntOp::Cardinality => Ok(m.len() as i64),
                     CastToIntOp::Sum => {
                         let mut total = 0i64;
+                        let mut layered = false;
                         for (val, ts) in self.instance.int_tuples() {
+                            layered = true;
                             for idx in ts.index_view().iter() {
                                 if m.contains_index(idx) {
                                     total += val;
+                                }
+                            }
+                        }
+                        if !layered {
+                            // Solve-derived instances leave the integer layer
+                            // empty; resolve int atoms by universe name
+                            // (int atoms are named by their numeric value).
+                            for idx in m.index_view().iter() {
+                                if let Ok(atom) = self.instance.universe().atom(idx as usize) {
+                                    if let Ok(v) = atom.parse::<i64>() {
+                                        total += v;
+                                    }
                                 }
                             }
                         }

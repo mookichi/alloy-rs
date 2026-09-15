@@ -28,14 +28,17 @@ mod parser;
 pub use ast::Scope;
 pub use ast::{
     BinOp, CmpKind, Command, CommandKind, Decl, Expr, Formula, IntBinOp, IntCmpOp, IntExpr, Module,
-    Open, OpenParam, QuantKind, SigDecl, SigMult,
+    Open, OpenParam, QuantKind, SigDecl, SigMult, DEFAULT_INT_BITWIDTH, effective_bitwidth,
+    module_needs_int_atoms,
 };
 pub use lower::{Lowerer, LoweredProblem};
 pub use cnf::{check, run, solve, validate, Cnf, CnfKind};
 pub use incremental::{IncrementalSession, MultKind, SessionStats};
 pub use partial::{verifier_pin_from_partial, PartialInstance, PartialInt, PartialRel};
 pub use cegis::{run_cegis, CegisConfig, CegisOutcome, CegisReport};
-pub use snippet::{eval, fragment_keys, parse_expr, parse_formula, query};
+pub use snippet::{
+    eval, fragment_keys, parse_expr, parse_formula, parse_int_expr, query, query_value, QueryValue,
+};
 pub use alloy_kodkod_rs::tupleset::TupleSet;
 pub use alloy_kodkod_rs::instance::Instance;
 

@@ -1,7 +1,8 @@
 //! Alloy6 operator precedence and associativity (shape tests).
 //!
-//! - Expressions (loosest first): `+ -`, `++`, `&`, `->` (`<->` same
-//!   level), `<:`, unary/`'`/`.`/`[]`. Binary operators are left-associative.
+//! - Expressions (loosest first): `+ -`, `++`, `&`, `->` (`<->`, `-<`
+//!   same level), `<:`/`:>`, unary/`'`/`.`/`[]`. Binary operators are
+//!   left-associative.
 //! - Formulas: binary temporal connectives (weakest, non-associative), then
 //!   `||`, `<=>` (left-assoc), `=>` (right-assoc), `&&`, unary/`!`/`not`.
 
@@ -179,11 +180,49 @@ fn temporal_unary_tight() {
     }
 }
 
+// `a -< b` == `b->a`: the `-<` spelling shares the arrow loop.
+// Glued only: `a - <b` (spaces) stays minus plus comparison.
+#[test]
+fn revarrow_is_reverse_product() {
+    let e = ex("a-<b");
+    let (op, l, r) = as_bin(&e);
+    assert_eq!(op, BinOp::Product);
+    assert!(is_name(l, "b") && is_name(r, "a"));
+    // Spaced `- <` must not become a product.
+    assert!(parse_expr("a - <b").is_err());
+}
+
+// `:>` parses at the `<:` level: `a:>b->c` == `(a:>b)->c`.
+#[test]
+fn range_restrict_level() {
+    let e = ex("a:>b");
+    let (op, l, r) = as_bin(&e);
+    assert_eq!(op, BinOp::RangeRestrict);
+    assert!(is_name(l, "a") && is_name(r, "b"));
+    let e2 = ex("a:>b->c");
+    let (op2, l2, r2) = as_bin(&e2);
+    assert_eq!(op2, BinOp::Product);
+    assert!(is_name(r2, "c"));
+    assert_eq!(as_bin(l2).0, BinOp::RangeRestrict);
+}
+
 // Declaration types keep their own arrow loop with multiplicity placement.
 #[test]
 fn decl_types_unaffected() {
     let m = parse_module("sig A {} sig B { f: A -> lone B, g: A + B }").expect("parse");
     assert_eq!(m.sigs.len(), 2);
+}
+
+// End to end: range restriction keeps tuples whose last column is in range.
+#[test]
+fn range_restrict_solves() {
+    let src = "sig A {}\nsig B { f: A }\nrun { f :> A$1 = B$0->A$1 + B$1->A$1 } for 2";
+    let m = parse_module(src).expect("parse");
+    let sol = run_command(&m, 0).expect("run");
+    assert!(sol.satisfiable, "range restriction must be SAT");
+    let inst = sol.instance.expect("instance");
+    let r = inst.find_relation_by_name("B.f").expect("B.f");
+    assert_eq!(inst.tuples(r).unwrap().len(), 2);
 }
 
 // End to end: an unparenthesized multi-tuple pin now parses Alloy-style

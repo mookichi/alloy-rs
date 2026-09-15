@@ -91,6 +91,14 @@ impl Parser {
         Ok(f)
     }
 
+    /// Parse a single bare integer expression (REPL `:query` input,
+    /// e.g. `#A` or `#A + 1`).
+    pub fn int_expr_top(mut self) -> PResult<IntExpr> {
+        let e = self.int_expr()?;
+        self.expect(&Tok::Eof)?;
+        Ok(e)
+    }
+
     pub fn module(mut self) -> PResult<Module> {
         let mut header = String::new();
         if self.eat(&Tok::Module) {
@@ -320,11 +328,11 @@ impl Parser {
         }
         if matches!(self.peek(), Tok::Extends) {
             self.bump();
-            extends = Some(self.ident()?);
+            extends = Some(self.sig_parent()?);
             rel = SigRel::Extends;
         } else if matches!(self.peek(), Tok::In) {
             self.bump();
-            extends = Some(self.ident()?);
+            extends = Some(self.sig_parent()?);
             rel = SigRel::In;
         }
         let mut fields = Vec::new();
@@ -374,6 +382,19 @@ impl Parser {
             fact,
             is_var: saw_var,
         })
+    }
+
+    /// Parent name in a sig header: a plain identifier or the builtin
+    /// `Int` (Java accepts `sig X in Int` / `sig X extends Int` at parse
+    /// time; `extends Int` is rejected later with a Java-compatible error).
+    fn sig_parent(&mut self) -> PResult<String> {
+        match self.peek() {
+            Tok::IntKw => {
+                self.bump();
+                Ok("Int".to_string())
+            }
+            _ => self.ident(),
+        }
     }
 
     fn ident(&mut self) -> PResult<String> {
@@ -634,21 +655,46 @@ impl Parser {
 
     fn scope_clause(&mut self, scope: &mut Scope) -> PResult<()> {
         if self.eat(&Tok::Exactly) {
+            // `for exactly Int 8`: bitwidth form (exactness is meaningless
+            // for bitwidth, accepted for symmetry with `for exactly 8 Int`).
+            if matches!(self.peek(), Tok::IntKw | Tok::IntTy) {
+                self.bump();
+                let n = self.int_lit()? as u32;
+                scope.int_scope = Some(n);
+                return Ok(());
+            }
             let n = self.int_lit()? as u32;
             if matches!(self.peek(), Tok::Ident(_)) {
                 let name = self.ident()?;
                 scope.entries.push((name, ScopeEntry::Exactly(n)));
+            } else if matches!(self.peek(), Tok::IntKw | Tok::IntTy) {
+                // `for exactly 8 Int`: bitwidth form.
+                self.bump();
+                scope.int_scope = Some(n);
             } else {
                 scope.overall = Some(n);
                 scope.overall_exact = true;
             }
             return Ok(());
         }
+        // `for Int 8`: bitwidth form, mirroring the comma/`but` entry style.
+        if matches!(self.peek(), Tok::IntKw | Tok::IntTy) {
+            self.bump();
+            let n = self.int_lit()? as u32;
+            scope.int_scope = Some(n);
+            // Fall through to comma-separated entries below.
+            return self.scope_rest(scope, 0);
+        }
         let first = self.int_lit()? as u32;
         // `for 10 steps` form: temporal step count
         if matches!(self.peek(), Tok::Steps) {
             self.bump();
             scope.steps = Some(first);
+        } else if matches!(self.peek(), Tok::IntKw | Tok::IntTy) {
+            // `for 8 Int`: bitwidth form. This is a width, not a scope, so
+            // `overall` is left untouched.
+            self.bump();
+            scope.int_scope = Some(first);
         } else if matches!(self.peek(), Tok::Ident(_)) {
             // `for 8 State` form: a bare trailing name scopes that one sig
             let name = self.ident()?;
@@ -656,6 +702,13 @@ impl Parser {
         } else {
             scope.overall = Some(first);
         }
+        self.scope_rest(scope, first)
+    }
+
+    /// Comma-separated scope entries and the `but` clause shared by the
+    /// non-`exactly` bare forms. `first` feeds `, steps` (mirroring the
+    /// existing comma-entry behavior).
+    fn scope_rest(&mut self, scope: &mut Scope, first: u32) -> PResult<()> {
         // handle comma-separated entries: `for 2 State, 1 Assignment, ...`
         while self.eat(&Tok::Comma) {
             let exact = self.eat(&Tok::Exactly);
@@ -669,7 +722,11 @@ impl Parser {
                 scope.steps = Some(n);
             } else {
                 let n = self.int_lit()? as u32;
-                if matches!(self.peek(), Tok::Ident(_)) {
+                if matches!(self.peek(), Tok::IntKw | Tok::IntTy) {
+                    // `, 8 Int`: bitwidth form (a width, not a scope).
+                    self.bump();
+                    scope.int_scope = Some(n);
+                } else if matches!(self.peek(), Tok::Ident(_)) {
                     let name = self.ident()?;
                     scope.entries.push((
                         name,
@@ -738,7 +795,7 @@ impl Parser {
     /// Top-level relational expression (union/difference loosest).
     ///
     /// Alloy6 precedence, loosest first: `+ -`, then `++`, then `&`, then
-    /// `->` (and the non-standard `<->` reverse product), then `<:`,
+    /// `->` (and the reverse products `<->`, `-<`), then `<:`,
     /// then unary/`'`/`.`/`[]`. All binary operators are left-associative.
     fn rel_expr_top(&mut self, in_sig: bool) -> PResult<Expr> {
         let e = self.parse_plusminus(in_sig)?;
@@ -747,8 +804,9 @@ impl Parser {
 
     fn parse_arrow(&mut self, in_sig: bool) -> PResult<Expr> {
         let mut l = self.parse_colon_lt(in_sig)?;
-        // `<->` is a non-standard reverse product: a <-> b == b -> a.
-        // It shares `->`'s level and left associativity.
+        // `<->` and `-<` are non-standard reverse products: a <-> b and
+        // a -< b both mean b -> a. They share `->`'s level and left
+        // associativity.
         // In sig-field types (`in_sig`, via `arrow_type`) arrows belong to
         // `arrow_type`'s own loop (multiplicity placement like `A lone -> B`),
         // so stop here and let it consume them.
@@ -759,7 +817,7 @@ impl Parser {
             if self.eat(&Tok::Arrow) {
                 let r = self.parse_colon_lt(in_sig)?;
                 l = Expr::Bin(BinOp::Product, Box::new(l), Box::new(r));
-            } else if matches!(self.peek(), Tok::ShArrow) {
+            } else if matches!(self.peek(), Tok::ShArrow | Tok::RevArrow) {
                 self.bump();
                 let r = self.parse_colon_lt(in_sig)?;
                 l = Expr::Bin(BinOp::Product, Box::new(r), Box::new(l));
@@ -814,9 +872,16 @@ impl Parser {
 
     fn parse_colon_lt(&mut self, in_sig: bool) -> PResult<Expr> {
         let mut l = self.parse_unary(in_sig)?;
-        while self.eat(&Tok::ColonLt) {
-            let r = self.parse_unary(in_sig)?;
-            l = Expr::Bin(BinOp::DomainRestrict, Box::new(l), Box::new(r));
+        loop {
+            if self.eat(&Tok::ColonLt) {
+                let r = self.parse_unary(in_sig)?;
+                l = Expr::Bin(BinOp::DomainRestrict, Box::new(l), Box::new(r));
+            } else if self.eat(&Tok::ColonGt) {
+                let r = self.parse_unary(in_sig)?;
+                l = Expr::Bin(BinOp::RangeRestrict, Box::new(l), Box::new(r));
+            } else {
+                break;
+            }
         }
         Ok(l)
     }
@@ -882,6 +947,23 @@ impl Parser {
         Ok(l)
     }
 
+    /// One `{...}` set-literal element: pure literal arithmetic folds to
+    /// its value (`{1+1}` is `{2}`, not the `{1}` union), anything else
+    /// parses as a relational expression.
+    fn set_literal_element(&mut self, in_sig: bool) -> PResult<Expr> {
+        let save = self.pos;
+        let byte = self.pos();
+        if let Ok(ie) = self.int_expr() {
+            if matches!(self.peek(), Tok::Comma | Tok::RBrace) {
+                if let Some(v) = fold_int_literal(&ie) {
+                    return Ok(Expr::Name(v.to_string(), byte));
+                }
+            }
+            self.pos = save;
+        }
+        self.rel_expr_top(in_sig)
+    }
+
     fn parse_primary(&mut self, in_sig: bool) -> PResult<Expr> {
         let pos = self.pos();
         // let binding in expression context: `let x = expr | expr`
@@ -917,16 +999,78 @@ impl Parser {
             }
             Tok::IntTy | Tok::IntKw => {
                 self.bump();
-                Ok(Expr::IntAtom)
+                // Optional per-occurrence bitwidth: `Int[8]` / `int[8]`
+                // (A-plan: declaration-side widths). Only a plain integer
+                // literal counts; anything else (e.g. `Int[x]`) falls
+                // through to the join/bracket path below.
+                if matches!(self.peek(), Tok::LBracket)
+                    && matches!(self.peek_at(1), Tok::Int(_))
+                    && matches!(self.peek_at(2), Tok::RBracket)
+                {
+                    self.bump(); // [
+                    let w = match self.bump().tok {
+                        Tok::Int(v) => v,
+                        _ => unreachable!(),
+                    };
+                    self.bump(); // ]
+                    if !(1..=32).contains(&w) {
+                        return Err(self.err(&format!(
+                            "Int bitwidth must be 1..32, got {w}"
+                        )));
+                    }
+                    Ok(Expr::IntAtom(Some(w as u32)))
+                } else if matches!(self.peek(), Tok::LBracket) {
+                    // `Int[` with a non-literal or malformed width:
+                    // report the width error directly instead of a
+                    // confusing join-arity failure downstream.
+                    return Err(self.err("Int bitwidth must be a literal 1..32, e.g. Int[8]"));
+                } else {
+                    Ok(Expr::IntAtom(None))
+                }
+            }
+            Tok::Int(v) => {
+                // Integer literal in set position: a singleton int-atom set
+                // (Java: literals are singleton sets of int atoms, so
+                // `x = 5` typechecks relationally).
+                self.bump();
+                Ok(Expr::Name(v.to_string(), pos))
+            }
+            Tok::Minus if matches!(self.peek_at(1), Tok::Int(_)) => {
+                // Negative literal in set position (`-5` = `{-5}`).
+                self.bump();
+                match self.bump().tok {
+                    Tok::Int(v) => Ok(Expr::Name(v.wrapping_neg().to_string(), pos)),
+                    _ => unreachable!(),
+                }
             }
             Tok::LBrace => {
-                // comprehension without keyword
+                // `{x: D | F}` / `{x: D}` comprehension, or `{a, b, ...}`
+                // set literal (extension: Java rejects the latter).
+                // Declarations win when parseable (`{x: X, y: Y}` binds two
+                // names); otherwise rewind and read a union list.
                 self.bump();
-                let ds = self.quant_decls()?;
-                self.expect(&Tok::Bar)?;
-                let f = self.formula()?;
-                self.expect(&Tok::RBrace)?;
-                Ok(Expr::Comprehension(ds, Box::new(f)))
+                let after_brace = self.pos;
+                match self.quant_decls() {
+                    Ok(ds) => {
+                        let f = if self.eat(&Tok::Bar) {
+                            self.formula()?
+                        } else {
+                            Formula::Const(true)
+                        };
+                        self.expect(&Tok::RBrace)?;
+                        Ok(Expr::Comprehension(ds, Box::new(f)))
+                    }
+                    Err(_) => {
+                        self.pos = after_brace;
+                        let mut e = self.set_literal_element(in_sig)?;
+                        while self.eat(&Tok::Comma) {
+                            let r = self.set_literal_element(in_sig)?;
+                            e = Expr::Bin(BinOp::Union, Box::new(e), Box::new(r));
+                        }
+                        self.expect(&Tok::RBrace)?;
+                        Ok(e)
+                    }
+                }
             }
             Tok::If => {
                 self.bump();
@@ -1182,7 +1326,20 @@ impl Parser {
                 // sum formula? not a formula starter; error out naturally
                 self.parse_quant_or_cmp()
             }
-            Tok::LBrace => self.braced_formula(),
+            Tok::LBrace => {
+                // A `{` in formula position usually opens a brace block,
+                // but it can also open a comprehension expression
+                // (`{x: X} = X`, `some {x: A}` via quantifiers): try the
+                // comparison route first, rewind to a block on failure.
+                let save = self.pos;
+                match self.parse_comparison() {
+                    Ok(f) => Ok(f),
+                    Err(_) => {
+                        self.pos = save;
+                        self.braced_formula()
+                    }
+                }
+            }
             _ => self.parse_comparison(),
         }
     }
@@ -1286,7 +1443,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::Colon)?;
-        let expr = self.rel_expr_top(false)?;
+        let expr = self.quant_domain()?;
         Ok(Decl {
             disj,
             names,
@@ -1296,17 +1453,70 @@ impl Parser {
         })
     }
 
+    /// Binding domain (`x: D` in quantifiers, comprehensions, `sum`):
+    /// pure literal arithmetic folds (`x: 1+2` binds `{3}`), anything
+    /// else parses relationally (`x: A + B` stays a union).
+    fn quant_domain(&mut self) -> PResult<Expr> {
+        let save = self.pos;
+        let byte = self.pos();
+        if let Ok(ie) = self.int_expr() {
+            if matches!(
+                self.peek(),
+                Tok::Comma | Tok::Bar | Tok::RBrace | Tok::LBrace
+            ) {
+                if let Some(v) = fold_int_literal(&ie) {
+                    return Ok(Expr::Name(v.to_string(), byte));
+                }
+            }
+            self.pos = save;
+        }
+        self.rel_expr_top(false)
+    }
+
     fn parse_comparison(&mut self) -> PResult<Formula> {
         // Int vs set comparisons are disambiguated by shape; for ambiguous
         // leading '(' try int first, then rewind to set parsing.
+        // `=`/`!=` stay relational (Java: no int casts since [AM]); an int
+        // attempt that used a set-typed operand (`Val`) is rewound so e.g.
+        // `x = 5` parses as set equality against the `{5}` singleton.
+        // `<`/`>`/`<=`/`>=` are never set operators (Java casts both sides
+        // via `typecheck_as_int`), so they always take the int route.
         if self.starts_int_expr() || matches!(self.peek(), Tok::LParen) {
             let save = self.pos;
             match self.int_cmp_tail() {
+                Ok(Formula::IntCmp(IntCmpOp::Eq | IntCmpOp::Neq, ref l, ref r, _))
+                    if !l.int_typed() || !r.int_typed() =>
+                {
+                    self.pos = save;
+                }
                 Ok(f) => return Ok(f),
                 Err(_) => self.pos = save,
             }
         }
+        let start = self.pos;
         let pos = self.pos();
+        // Int-typed LHS in `=`/`!=` (Java `toSet`: the int side becomes
+        // the singleton set). `sum X = Y` desugars to `#Y = 1 and
+        // sum(Y) = sum(X)`. Full int comparisons (`#A = 4`) commit above
+        // and never reach here; literals keep the singleton path below.
+        // Parenthesized int heads (`(sum Y) = X`) are covered as well;
+        // anything else rewinds untouched.
+        if matches!(self.peek(), Tok::Hash | Tok::Sum | Tok::LParen) {
+            let save = self.pos;
+            if let Ok(ie) = self.int_expr() {
+                if ie.int_typed()
+                    && !matches!(ie, IntExpr::Lit(..))
+                    && matches!(self.peek(), Tok::Eq | Tok::NotEq)
+                {
+                    let neg = matches!(self.peek(), Tok::NotEq);
+                    self.bump();
+                    if let Ok(r) = self.rel_expr_top(false) {
+                        return Ok(set_eq_int(r, ie, pos, neg));
+                    }
+                }
+            }
+            self.pos = save;
+        }
         // dotted call chain in formula position: a.b.P[x, y] == P[a, b, x, y]
         // (also plain P[x]); resolution decides pred vs field later.
         if matches!(self.peek(), Tok::Ident(_)) {
@@ -1348,6 +1558,15 @@ impl Parser {
             self.pos = save;
         }
         let l = self.rel_expr_top(false)?;
+        // `<`/`>`/`<=`/`>=` can never continue a set comparison: rewind and
+        // take the integer route (operands lower via the SUM cast).
+        if matches!(
+            self.peek(),
+            Tok::Lt | Tok::Gt | Tok::LtEq | Tok::GtEq
+        ) {
+            self.pos = start;
+            return self.int_cmp_tail();
+        }
         if let Expr::Name(n, ppos) = &l {
             // bare identifier in formula position: zero-arg predicate call,
             // valid when a formula operator follows (=> <=> || and or,
@@ -1386,6 +1605,24 @@ impl Parser {
                 return Err(self.err(&format!("expected comparison, got {}", other.describe())))
             }
         };
+        // `set = int-expr` (Java `toSet`: the int side becomes the
+        // singleton set). `X = sum {1,2}` desugars to `#X = 1 and
+        // sum(X) = sum({1,2})`. `#`/`sum` never start a set expression,
+        // so attempting int-first here cannot regress: on failure the
+        // original error surfaces unchanged. (The operator itself is
+        // still next; the int operand starts one token later.)
+        if matches!(kind, CmpKind::Eq | CmpKind::Neq)
+            && matches!(self.peek_at(1), Tok::Hash | Tok::Sum | Tok::LParen)
+        {
+            let save = self.pos;
+            self.bump(); // consume `=` / `!=`
+            if let Ok(ie) = self.int_expr() {
+                if ie.int_typed() && !matches!(ie, IntExpr::Lit(..)) {
+                    return Ok(set_eq_int(l, ie, pos, matches!(kind, CmpKind::Neq)));
+                }
+            }
+            self.pos = save;
+        }
         self.bump();
         let r = self.rel_expr_top(false)?;
         Ok(Formula::Cmp(kind, l, r, pos))
@@ -1413,7 +1650,7 @@ impl Parser {
     }
 
     fn starts_int_expr(&self) -> bool {
-        matches!(self.peek(), Tok::Hash | Tok::Sum | Tok::Int(_))
+        matches!(self.peek(), Tok::Hash | Tok::Sum | Tok::Int(_) | Tok::Minus)
     }
 
     fn int_expr(&mut self) -> PResult<IntExpr> {
@@ -1472,6 +1709,20 @@ impl Parser {
                 self.bump();
                 Ok(IntExpr::Lit(v, pos))
             }
+            Tok::Minus => {
+                // Unary minus. A literal folds immediately (`-8` is one
+                // literal, so bitwidth range checks see `-8`, not `8`);
+                // anything else desugars to `0 - x` (no Neg node exists).
+                self.bump();
+                match self.int_primary()? {
+                    IntExpr::Lit(v, _) => Ok(IntExpr::Lit(v.wrapping_neg(), pos)),
+                    inner => Ok(IntExpr::Bin(
+                        IntBinOp::Sub,
+                        Box::new(IntExpr::Lit(0, pos)),
+                        Box::new(inner),
+                    )),
+                }
+            }
             Tok::Hash => {
                 self.bump();
                 let e = self.parse_unary(false)?;
@@ -1479,19 +1730,43 @@ impl Parser {
             }
             Tok::Sum => {
                 self.bump();
-                let ds = {
-                    // sum x: D | ie   or   sum[...] unsupported bracket form
-                    self.quant_decls()?
-                };
-                self.expect(&Tok::Bar)?;
-                let ie = self.int_expr()?;
-                Ok(IntExpr::Sum(ds, Box::new(ie), pos))
+                // Quantified `sum x: D | ie`, or `sum e` over a unary set
+                // (Java accepts both; the latter is the SUM cast).
+                let save = self.pos;
+                match self.quant_decls() {
+                    Ok(ds) => {
+                        self.expect(&Tok::Bar)?;
+                        let ie = self.int_expr()?;
+                        Ok(IntExpr::Sum(ds, Box::new(ie), pos))
+                    }
+                    Err(_) => {
+                        self.pos = save;
+                        let e = self.parse_unary(false)?;
+                        Ok(IntExpr::SumOf(Box::new(e), pos))
+                    }
+                }
             }
             Tok::LParen => {
                 self.bump();
                 let e = self.int_expr()?;
                 self.expect(&Tok::RParen)?;
                 Ok(e)
+            }
+            // Set-typed operand in integer position (variable, join, ...):
+            // Java casts it via `typecheck_as_int` (Kodkod SUM cast).
+            Tok::Ident(_)
+            | Tok::Univ
+            | Tok::None_
+            | Tok::Iden
+            | Tok::IntTy
+            | Tok::IntKw
+            | Tok::This
+            | Tok::At
+            | Tok::Tilde
+            | Tok::Hat
+            | Tok::Star => {
+                let e = self.parse_unary(false)?;
+                Ok(IntExpr::Val(Box::new(e), pos))
             }
             other => Err(self.err(&format!(
                 "expected int expression, got {}",
@@ -1501,8 +1776,49 @@ impl Parser {
     }
 }
 
-fn mult3(t: &Tok) -> crate::ast::Mult3 {
-    match t {
+/// `set = int` (Java `toSet`: the int side denotes its singleton set).
+/// Desugared as `#set = 1 and sum(set) = int`, equivalent for int atoms.
+fn set_eq_int(set: Expr, ie: IntExpr, pos: usize, neg: bool) -> Formula {
+    let one = Formula::IntCmp(
+        IntCmpOp::Eq,
+        IntExpr::Card(Box::new(set.clone()), pos),
+        IntExpr::Lit(1, pos),
+        pos,
+    );
+    let sum = Formula::IntCmp(
+        IntCmpOp::Eq,
+        IntExpr::SumOf(Box::new(set), pos),
+        ie,
+        pos,
+    );
+    let and = Formula::And(Box::new(one), Box::new(sum));
+    if neg {
+        Formula::Not(Box::new(and))
+    } else {
+        and
+    }
+}
+
+/// Fold pure literal integer arithmetic to its value (`{1+1}` is `{2}`)./// Anything needing a solution (`#A`, `sum`, variables) yields `None`, as
+/// does division by zero (the caller falls back to relational parsing).
+fn fold_int_literal(ie: &crate::ast::IntExpr) -> Option<i64> {
+    match ie {
+        crate::ast::IntExpr::Lit(v, _) => Some(*v),
+        crate::ast::IntExpr::Bin(op, a, b) => {
+            let (x, y) = (fold_int_literal(a)?, fold_int_literal(b)?);
+            Some(match op {
+                crate::ast::IntBinOp::Add => x.wrapping_add(y),
+                crate::ast::IntBinOp::Sub => x.wrapping_sub(y),
+                crate::ast::IntBinOp::Mul => x.wrapping_mul(y),
+                crate::ast::IntBinOp::Div => x.checked_div(y)?,
+                crate::ast::IntBinOp::Rem => x.checked_rem(y)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn mult3(t: &Tok) -> crate::ast::Mult3 {    match t {
         Tok::Lone => crate::ast::Mult3::Lone,
         Tok::One => crate::ast::Mult3::One,
         _ => crate::ast::Mult3::Some,
