@@ -296,6 +296,32 @@ impl<'a> Evaluator<'a> {
                         }
                         Ok(total)
                     }
+                    CastToIntOp::Bits => {
+                        // Bit-vector value: Σ 2^v over int atoms in the
+                        // set (same truncation rule as the solver path).
+                        let mut total = 0i64;
+                        let mut layered = false;
+                        for (val, ts) in self.instance.int_tuples() {
+                            layered = true;
+                            for idx in ts.index_view().iter() {
+                                if m.contains_index(idx) && val >= 0 && val < 63 {
+                                    total += 1i64 << val;
+                                }
+                            }
+                        }
+                        if !layered {
+                            for idx in m.index_view().iter() {
+                                if let Ok(atom) = self.instance.universe().atom(idx as usize) {
+                                    if let Ok(v) = atom.parse::<i64>() {
+                                        if v >= 0 && v < 63 {
+                                            total += 1i64 << v;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(total)
+                    }
                 }
             }
             IntNode::Binary { op, left, right } => {

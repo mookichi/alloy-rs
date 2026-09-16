@@ -827,6 +827,7 @@ impl Session {
                 println!("{}", fmt::set_alloy(ts.universe(), arity, &ts))
             }
             Ok(QueryValue::Int(v)) => println!("{v}"),
+            Ok(QueryValue::Bool(v)) => println!("{v}"),
             Err(e) => println!("query error: {e}"),
         }
     }
@@ -1397,9 +1398,11 @@ fn print_help() {
     println!("  :help               this help");
     println!("  :quit               exit (Ctrl-D also exits)");
     println!("notes: `let` works inside pred/fun bodies and :eval/:query expressions.");
-    println!("notes: integers are bitvectors: `Int[w]` declares a w-bit wide");
-    println!("  integer type (bare `Int` = command default from `for N Int`, else");
-    println!("  4 bits). Effective width = max(default, every Int[w]). Int atoms");
+    println!("notes: integers are bitvectors: `for W Int` gives W atoms");
+    println!("  {{0, .., W-1}} (bare `Int` = command default, else 4) with");
+    println!("  W-bit circuits capped at 30. `Int[w]` widths are gone.");
+    println!("  `7 = {{0, 1, 2}}` holds (bitset comparison); `sig X in Signed`");
+    println!("  and `MSB` (= W-1) mirror `Int`. Int atoms");
     println!("  are allocated lazily: models that never use Int as a set carry");
     println!("  none (queries like `Int` then read empty; add `for N Int` to");
     println!("  materialize the range).");

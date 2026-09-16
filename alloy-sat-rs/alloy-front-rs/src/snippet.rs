@@ -118,14 +118,18 @@ pub fn query(
         QueryValue::Int(_) => Err(FrontError::Resolve(format!(
             "`{expr_src}` is an integer expression, not a set"
         ))),
+        QueryValue::Bool(_) => Err(FrontError::Resolve(format!(
+            "`{expr_src}` is a formula, not a set"
+        ))),
     }
 }
 
-/// A `:query` result: either a tuple set or an integer.
+/// A `:query` result: either a tuple set, an integer, or a formula verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValue {
     Set(u32, TupleSet),
     Int(i64),
+    Bool(bool),
 }
 
 /// Evaluate a bare expression against a solved instance, accepting both
@@ -144,13 +148,16 @@ pub fn query_value(
     instance: &Instance,
 ) -> Result<QueryValue, FrontError> {
     if let Ok(ie) = parse_int_expr(expr_src) {
-        if ie.int_typed() {
+        // A bare `{...}` (or `+`/`-` over one) keeps the set reading,
+        // mirroring the parser's `=`/`!=` rewind rule; pure `*`/`/`/`%`
+        // trees read as integers.
+        if ie.int_typed() && !ie.rewind_bitsval_eq() {
             return query_int_parsed(module, scope, cnf, &ie, instance);
         }
     }
     match parse_expr(expr_src) {
         Ok(e) => {
-            if matches!(e, Expr::IntAtom(_)) {
+            if matches!(e, Expr::IntAtom) {
                 // `Int` (or `int`): every in-scope integer, i.e. the union
                 // of the Cnf's exact int bounds. Handled here because the
                 // evaluator only sees instance tuples, not bounds.
@@ -173,8 +180,47 @@ pub fn query_value(
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
             Ok(QueryValue::Set(arity, ts))
         }
-        Err(expr_err) => Err(expr_err),
+        Err(expr_err) => {
+            // Not an expression: try a closed formula (`1 = 1`, `A = A`).
+            // Garbage reports the relational parse error, not the
+            // formula one.
+            match parse_formula(expr_src) {
+                Ok(_) => query_formula(module, scope, cnf, expr_src, instance),
+                Err(_) => Err(expr_err),
+            }
+        }
     }
+}
+
+/// Evaluate a bare formula against a solved instance (REPL `:query` of
+/// closed formulas such as `1 = 1` or `7 = {0, 1, 2}`).
+fn query_formula(
+    module: &Module,
+    scope: &Scope,
+    cnf: &Cnf,
+    form_src: &str,
+    instance: &Instance,
+) -> Result<QueryValue, FrontError> {
+    let f = parse_formula(form_src)?;
+    // Same lazy-allocation guard as the int path: a formula mentioning
+    // Int atoms cannot evaluate against an atom-free instance.
+    {
+        let mut needs = false;
+        crate::ast::scan_formula_int_set(&f, &mut needs);
+        if needs && cnf.bounds.int_bounds().count() == 0 {
+            return Err(FrontError::Resolve(
+                "integer set is not in scope (this model materializes no Int atoms; mention Int in the model or add `for N Int` to the scope)".to_string(),
+            ));
+        }
+    }
+    let mut arena = cnf.arena.clone();
+    let mut lower = Lowerer::new(module);
+    let fid = lower.lower_formula_in_scope(scope, &mut arena, &f)?;
+    let empty_env = Vec::new();
+    let v = alloy_kodkod_rs::eval::Evaluator::new(instance)
+        .formula_bool(&arena, fid, &empty_env)
+        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+    Ok(QueryValue::Bool(v))
 }
 
 /// Evaluate an already-parsed integer expression against `instance`.
@@ -187,8 +233,20 @@ fn query_int_parsed(
 ) -> Result<QueryValue, FrontError> {
     // `#Int` (or `#int`): the int-atom count is known from the
     // Cnf's exact int bounds; no solving or evaluation needed.
-    if matches!(&ie, IntExpr::Card(e, _) if matches!(e.as_ref(), Expr::IntAtom(_))) {
+    if matches!(&ie, IntExpr::Card(e, _) if matches!(e.as_ref(), Expr::IntAtom)) {
         return Ok(QueryValue::Int(cnf.bounds.int_bounds().count() as i64));
+    }
+    // A bit-value over atoms the model never materialized cannot
+    // evaluate: report the out-of-scope error instead of a silent 0
+    // (mirrors the set-position literal path).
+    {
+        let mut needs = false;
+        crate::ast::scan_intexpr_int_set(&ie, &mut needs);
+        if needs && cnf.bounds.int_bounds().count() == 0 {
+            return Err(FrontError::Resolve(
+                "integer set is not in scope (this model materializes no Int atoms; mention Int in the model or add `for N Int` to the scope)".to_string(),
+            ));
+        }
     }
     // Out-of-range literals wrap (two's complement truncation), matching
     // both the solve path and Java's evaluator.
@@ -232,6 +290,8 @@ fn wrap_int_literals(ie: &IntExpr, bitwidth: u32) -> IntExpr {
             Box::new(wrap_int_literals(body, bitwidth)),
             *p,
         ),
-        IntExpr::Card(..) | IntExpr::Val(..) | IntExpr::SumOf(..) => ie.clone(),
+        IntExpr::Card(..) | IntExpr::Val(..) | IntExpr::SumOf(..) | IntExpr::BitsVal(..) => {
+            ie.clone()
+        }
     }
 }

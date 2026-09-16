@@ -41,7 +41,7 @@ fn bitwidth_combines_with_entries() {
 
 #[test]
 fn bitwidth_takes_effect() {
-    // bitwidth 8 admits 100 and covers 256 int atoms.
+    // W = 8 admits 100 and covers 8 int atoms {0, .., 7}.
     let src = "sig A {}\nrun { some A } for 1, 8 Int";
     let m = parse_module(src).expect("parse");
     let cnf = run(&m, 0).expect("run");
@@ -49,11 +49,15 @@ fn bitwidth_takes_effect() {
     let inst = solve(&cnf).expect("solve").expect("SAT");
     let scope = &m.commands[0].scope;
     match query_value(&m, scope, &cnf, "#Int", &inst).expect("query #Int") {
-        QueryValue::Int(v) => assert_eq!(v, 256),
+        QueryValue::Int(v) => assert_eq!(v, 8),
         QueryValue::Set(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
     }
     match query_value(&m, scope, &cnf, "100", &inst).expect("query 100") {
         QueryValue::Int(v) => assert_eq!(v, 100),
         QueryValue::Set(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
     }
 }

@@ -120,13 +120,13 @@ impl<'m> Lowerer<'m> {
                 }
             }
             // sig `in` constraints: sig A in B  =>  A in B (subset).
-            // A builtin `Int` parent needs no formula: the child's upper
-            // bound is already exactly the int atoms (the solver's integer
-            // layer cannot take an Ints constant in a formula).
+            // A builtin `Int`/`Signed` parent needs no formula: the child's
+            // upper bound is already exactly the int atoms (the solver's
+            // integer layer cannot take an Ints constant in a formula).
             for sd in &ctx.module.sigs {
                 if sd.rel == crate::ast::SigRel::In {
                     if let Some(parent_name) = &sd.extends {
-                        if parent_name == "Int" {
+                        if parent_name == "Int" || parent_name == "Signed" {
                             continue;
                         }
                         for child_name in &sd.names {
@@ -266,6 +266,20 @@ impl<'m> Lowerer<'m> {
     ) -> LResult<kk::IntId> {
         self.with_query_ctx(scope, arena, |ctx, arena| {
             ctx.lower_int(arena, ie, &mut Vec::new())
+        })
+    }
+
+    /// Lower a bare formula reusing a caller-provided arena (REPL `:query`
+    /// of closed formulas such as `1 = 1`). Same setup/contract as
+    /// [`Self::lower_expr_in_scope`].
+    pub fn lower_formula_in_scope(
+        &mut self,
+        scope: &Scope,
+        arena: &mut kk::AstArena,
+        f: &Formula,
+    ) -> LResult<kk::FormulaId> {
+        self.with_query_ctx(scope, arena, |ctx, arena| {
+            ctx.lower_formula(arena, f, &mut Vec::new())
         })
     }
 
@@ -459,10 +473,10 @@ impl<'m> Lowerer<'m> {
 
         // int atom exact bounds (lazy: skipped entirely when the module
         // never mentions Int as a set, so Int-free models carry no int
-        // atoms in either the universe or the bounds).
+        // atoms in either the universe or the bounds). Bit-vector model:
+        // W atoms `{0, .., W-1}`.
         if crate::ast::module_needs_int_atoms(self.module, scope) {
-            let half = 1i64 << (res.bitwidth - 1);
-            for v in (-half)..half {
+            for v in 0..res.int_count {
                 let name = v.to_string();
                 let idx = res
                     .universe
@@ -471,7 +485,7 @@ impl<'m> Lowerer<'m> {
                 let mut ts = alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 1)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?;
                 ts.insert_index(idx as i64);
-                b.bound_exactly_int(v, &ts)
+                b.bound_exactly_int(v.into(), &ts)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?;
             }
         }
@@ -609,7 +623,7 @@ impl<'m> Lowerer<'m> {
             }
             Expr::Bin(_, a, _) => self.type_arity(a, res)?,
             Expr::Name(n, pos) => {
-                if res.sigs.contains_key(n) || n == "univ" || n == "int" || n == "Int" {
+                if res.sigs.contains_key(n) || n == "univ" || n == "int" || n == "Int" || n == "Signed" {
                     1
                 } else {
                     return Err(FrontError::Parse {
@@ -618,7 +632,7 @@ impl<'m> Lowerer<'m> {
                     });
                 }
             }
-            Expr::Univ | Expr::None_ | Expr::IntAtom(_) => 1,
+            Expr::Univ | Expr::None_ | Expr::IntAtom => 1,
             other => {
                 let _ = other;
                 return self.unsup("complex expression in field declaration");
@@ -640,10 +654,10 @@ impl<'m> Lowerer<'m> {
                     all.sort();
                     all.dedup();
                     all
-                } else if n == "int" || n == "Int" {
-                    // Int atoms: named by their numeric value
-                    let half = 1i64 << (res.bitwidth - 1);
-                    ((-half)..half).map(|v| v.to_string()).collect()
+                } else if n == "int" || n == "Int" || n == "Signed" {
+                    // Int/Signed atoms: named by their numeric value
+                    // (`{0, .., W-1}` in the bit-vector model).
+                    (0..res.int_count).map(|v| v.to_string()).collect()
                 } else {
                     res.atoms_of(n)
                 };
@@ -660,14 +674,12 @@ impl<'m> Lowerer<'m> {
                 Ok(all.into_iter().map(|a| vec![a]).collect())
             }
             Expr::None_ | Expr::Iden => Ok(Vec::new()),
-            Expr::IntAtom(_) => {
-                // Int atoms: named by their numeric value, over the
-                // RESOLVED (effective) bitwidth. Per-occurrence `Int[w]`
-                // widths feed that max at resolve time; by lowering the
-                // universe already covers every declared width.
-                let half = 1i64 << (res.bitwidth - 1);
-                let int_atoms: Vec<Vec<String>> =
-                    ((-half)..half).map(|v| vec![v.to_string()]).collect();
+            Expr::IntAtom => {
+                // Int atoms: named by their numeric value over the
+                // resolved atom count (`{0, .., W-1}`).
+                let int_atoms: Vec<Vec<String>> = (0..res.int_count)
+                    .map(|v| vec![v.to_string()])
+                    .collect();
                 Ok(int_atoms)
             }
             Expr::Bin(BinOp::Product, a, b) => {
@@ -1456,6 +1468,24 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Exact singleton set of the int atom `v` (bit-vector model: int
+    /// atoms are named by value, `{0, .., W-1}`). Errors when the atom was
+    /// not materialized (lazy Int allocation).
+    fn int_atom_singleton(
+        &self,
+        arena: &mut kk::AstArena,
+        v: i64,
+    ) -> LResult<ExprId> {
+        let name = v.to_string();
+        match self.res.universe.index(&name) {
+            Ok(idx) => Ok(arena.expr_atoms(vec![idx])),
+            Err(e) => Err(FrontError::Resolve(format!(
+                "int atom '{name}' is not in scope (W = {} int atoms; mention Int in the model or add `for N Int`): {e}",
+                self.res.int_count
+            ))),
+        }
+    }
+
     fn lower_expr(
         &self,
         arena: &mut kk::AstArena,
@@ -1466,7 +1496,54 @@ impl<'a> Ctx<'a> {
             Expr::Univ => (arena.constant(kk::ConstantExpr::Univ), 1),
             Expr::None_ => (arena.constant(kk::ConstantExpr::Empty), 1),
             Expr::Iden => (arena.constant(kk::ConstantExpr::Iden), 2),
-            Expr::IntAtom(_) => (arena.constant(kk::ConstantExpr::Ints), 1),
+            Expr::IntAtom => {
+                // Bare `Int` as a set value: the union of materialized int
+                // atoms (same reading as `:query Int`). Int-as-a-set
+                // implies lazy allocation, so the atoms always exist here.
+                let w = self.res.int_count;
+                let mut acc: Option<ExprId> = None;
+                for v in 0..w {
+                    let s = self.int_atom_singleton(arena, v as i64)?;
+                    acc = Some(match acc {
+                        Some(a) => arena
+                            .binary_expr(kk::BinaryOp::Union, a, s)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?,
+                        None => s,
+                    });
+                }
+                match acc {
+                    Some(a) => (a, 1),
+                    None => (arena.constant(kk::ConstantExpr::Empty), 1),
+                }
+            }
+            Expr::Bits(n, _) => {
+                // Bitset of an integer literal: `{i < W : bit i of the
+                // E-bit wrap of n is set}` (mirrors
+                // `IntCircuit::constant` truncation).
+                let w = self.res.int_count as usize;
+                let e = self.res.bitwidth;
+                let mask: i64 = if e >= 63 { -1 } else { (1i64 << e) - 1 };
+                let mut rest = (*n & mask) as u64;
+                let mut acc: Option<ExprId> = None;
+                while rest != 0 {
+                    let i = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    if i >= w {
+                        continue;
+                    }
+                    let s = self.int_atom_singleton(arena, i as i64)?;
+                    acc = Some(match acc {
+                        Some(a) => arena
+                            .binary_expr(kk::BinaryOp::Union, a, s)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?,
+                        None => s,
+                    });
+                }
+                match acc {
+                    Some(a) => (a, 1),
+                    None => (arena.constant(kk::ConstantExpr::Empty), 1),
+                }
+            }
             Expr::Name(n, pos) => {
                 // Check let-binding scopes (innermost first)
                 {
@@ -1548,6 +1625,17 @@ impl<'a> Ctx<'a> {
                     self.depth.set(d);
                     return Ok(out);
                 }
+                // Bit-vector builtins (fallback: declared names win since
+                // sigs/fields/lets were checked above).
+                if n == "Signed" {
+                    return Ok((arena.constant(kk::ConstantExpr::Ints), 1));
+                }
+                if n == "MSB" {
+                    // Sign-bit alias: the top atom index `W - 1`.
+                    let w = self.res.int_count;
+                    let s = self.int_atom_singleton(arena, (w as i64) - 1)?;
+                    return Ok((s, 1));
+                }
                 // Atom literal (`A$0` in `:query`): a universe atom name
                 // denotes its singleton set. Declared names win (checked
                 // above), so this is strictly a fallback. Positions are
@@ -1573,7 +1661,7 @@ impl<'a> Ctx<'a> {
                 if n.parse::<i64>().is_ok() {
                     return Err(FrontError::Parse {
                         pos: *pos,
-                        msg: format!("integer '{n}' is not in scope (this model materializes no Int atoms; mention Int in the model or add `for N Int` / `Int[w]` to the scope)"),
+                        msg: format!("integer '{n}' is not in scope (this model materializes no Int atoms; mention Int in the model or add `for N Int` to the scope)"),
                     });
                 }
                 return Err(FrontError::Parse {
@@ -1883,6 +1971,13 @@ impl<'a> Ctx<'a> {
                 let (ee, _) = self.lower_expr(arena, e, env)?;
                 arena
                     .cast_to_int(CastToIntOp::Sum, ee)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?
+            }
+            IntExpr::BitsVal(e, _) => {
+                // Bit-vector value of a set: Σ 2^v over int atoms.
+                let (ee, _) = self.lower_expr(arena, e, env)?;
+                arena
+                    .cast_to_int(CastToIntOp::Bits, ee)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?
             }
             IntExpr::Sum(decls, body, _) => {
@@ -2617,7 +2712,7 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
 fn subst_expr(e: &Expr, from: &str, to: &str) -> Expr {
     match e {
         Expr::Name(n, p) if n == from => Expr::Name(to.to_string(), *p),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom(_) => e.clone(),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => e.clone(),
         Expr::Bin(op, a, b) => Expr::Bin(
             *op,
             Box::new(subst_expr(a, from, to)),
@@ -2701,6 +2796,7 @@ fn subst_int(i: &IntExpr, from: &str, to: &str) -> IntExpr {
         ),
         IntExpr::Val(e, p) => IntExpr::Val(Box::new(subst_expr(e, from, to)), *p),
         IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(subst_expr(e, from, to)), *p),
+        IntExpr::BitsVal(e, p) => IntExpr::BitsVal(Box::new(subst_expr(e, from, to)), *p),
     }
 }
 
@@ -2735,7 +2831,7 @@ fn strip_mult(e: &Expr) -> Expr {
         Expr::Prime(x) => Expr::Prime(Box::new(strip_mult(x))),
         Expr::AtExpr(x) => Expr::AtExpr(Box::new(strip_mult(x))),
         Expr::LetBind(binds, body) => Expr::LetBind(binds.clone(), Box::new(strip_mult(body))),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom(_) => e.clone(),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => e.clone(),
     }
 }
 
@@ -2744,8 +2840,8 @@ fn strip_mult(e: &Expr) -> Expr {
 /// (`none`/`iden` lower and evaluate fine and are kept.)
 fn mentions_int_expr(e: &Expr) -> bool {
     match e {
-        Expr::IntAtom(_) => true,
-        Expr::Name(n, _) => n == "int" || n == "Int",
+        Expr::IntAtom | Expr::Bits(..) => true,
+        Expr::Name(n, _) => n == "int" || n == "Int" || n == "Signed",
         Expr::ArrowMult(_, inner) | Expr::LeadMult(_, inner) => mentions_int_expr(inner),
         Expr::Bin(_, a, b) => mentions_int_expr(a) || mentions_int_expr(b),
         Expr::Transpose(x) | Expr::TClosure(x) | Expr::RClosure(x) => mentions_int_expr(x),
@@ -2913,7 +3009,7 @@ fn field_mult_constraint(
                 walk(b, offset + aa as usize, markers, total_cols)?;
                 Ok(())
             }
-            Expr::Name(..) | Expr::Univ | Expr::IntAtom(_) | Expr::None_ | Expr::Iden => {
+            Expr::Name(..) | Expr::Univ | Expr::IntAtom | Expr::Bits(..) | Expr::None_ | Expr::Iden => {
                 *total_cols += 1;
                 Ok(())
             }
@@ -3077,7 +3173,7 @@ fn field_mult_constraint(
 fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
     match e {
         Expr::Name(n, _) if n == from => to.clone(),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom(_) => e.clone(),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => e.clone(),
         Expr::Bin(op, a, b) => Expr::Bin(
             *op,
             Box::new(replace_var_expr(a, from, to)),
@@ -3287,6 +3383,9 @@ fn replace_var_int(i: &IntExpr, from: &str, to: &Expr) -> IntExpr {
         ),
         IntExpr::Val(e, p) => IntExpr::Val(Box::new(replace_var_expr(e, from, to)), *p),
         IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(replace_var_expr(e, from, to)), *p),
+        IntExpr::BitsVal(e, p) => {
+            IntExpr::BitsVal(Box::new(replace_var_expr(e, from, to)), *p)
+        }
     }
 }
 

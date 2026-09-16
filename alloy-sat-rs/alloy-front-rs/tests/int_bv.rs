@@ -1,14 +1,16 @@
-//! A-plan Phase 1: parameterized `Int[w]` + lazy int-atom allocation.
+//! Bit-vector `Int`: unsigned atoms + lazy int-atom allocation.
 //!
-//! - `Int[8]` / `int[8]` parse to a sized `Int` type; bare `Int` keeps the
-//!   command default (`for N Int`, else 4).
-//! - The effective bitwidth is `max(default, every Int[w])`.
+//! - `for W Int` gives W atoms `{0, .., W-1}` and W-bit circuits capped at
+//!   30 (`E = min(W, 30)`); bare `Int` keeps the command default (else 4).
+//! - `Int[w]` per-occurrence widths are gone: `Int[8]` is the join `8.Int`
+//!   (arity 1 vs 1) and fails.
 //! - Int atoms exist in the universe/bounds only when Int is used as a
 //!   set (or an explicit `for N Int` scope requests them); Int-free
 //!   models pay zero universe cost.
 
 use alloy_front_rs::{
-    effective_bitwidth, module_needs_int_atoms, parse_module, query_value, run, solve, QueryValue,
+    effective_bitwidth, effective_int_count, module_needs_int_atoms, parse_module, query_value,
+    run, solve, QueryValue,
 };
 
 fn scope_of(src: &str) -> alloy_front_rs::Scope {
@@ -17,48 +19,51 @@ fn scope_of(src: &str) -> alloy_front_rs::Scope {
 }
 
 #[test]
-fn parse_sized_int() {
-    let m = parse_module("sig A { x: Int[8] }\nrun {} for 3").expect("parse Int[8]");
-    let scope = &m.commands[0].scope;
-    assert_eq!(effective_bitwidth(&m, scope), 8);
-    assert!(module_needs_int_atoms(&m, scope));
+fn int_brackets_rejected() {
+    // `Int[8]` is the join `8.Int` (arity 1 vs 1): an error, either at
+    // parse time or at lowering.
+    for src in [
+        "sig A { x: Int[8] }\nrun {} for 3",
+        "sig A { x: int[5] }\nrun {} for 3",
+        "sig A { x: Int[0] }\nrun {} for 3",
+        "sig A { x: Int[33] }\nrun {} for 3",
+        "sig A { x: Int[x] }\nrun {} for 3",
+    ] {
+        let parsed = parse_module(src);
+        assert!(
+            parsed.is_err() || parsed.map(|m| run(&m, 0)).expect("parse").is_err(),
+            "Int[...] must fail: {src}"
+        );
+    }
 
-    let m = parse_module("sig A { x: int[5] }\nrun {} for 3").expect("parse int[5]");
-    let scope = &m.commands[0].scope;
-    assert_eq!(effective_bitwidth(&m, scope), 5);
-
-    // bare Int still defaults to the command scope (else 4)
+    // bare Int still defaults to the command scope (else 4 atoms)
     let m = parse_module("sig A { x: Int }\nrun {} for 3").expect("parse bare Int");
     let scope = &m.commands[0].scope;
     assert_eq!(effective_bitwidth(&m, scope), 4);
+    assert_eq!(effective_int_count(scope), 4);
     assert!(module_needs_int_atoms(&m, scope));
-
-    // malformed widths are parse errors, not downstream join failures
-    assert!(parse_module("sig A { x: Int[0] }\nrun {} for 3").is_err());
-    assert!(parse_module("sig A { x: Int[33] }\nrun {} for 3").is_err());
-    assert!(parse_module("sig A { x: Int[x] }\nrun {} for 3").is_err());
 }
 
 #[test]
-fn effective_width_is_max_of_scope_and_decls() {
-    // decl width wins over a narrower scope default
-    let m = parse_module("sig A { x: Int[8] }\nrun {} for 3, 4 Int").expect("parse");
-    assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 8);
+fn scope_sets_width_and_atoms() {
+    let m = parse_module("sig A { x: Int }\nrun {} for 3, 4 Int").expect("parse");
+    assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 4);
+    assert_eq!(effective_int_count(&m.commands[0].scope), 4);
     let cnf = run(&m, 0).expect("build");
-    assert_eq!(cnf.bitwidth, 8);
+    assert_eq!(cnf.bitwidth, 4);
 
-    // scope wins over narrower decls
-    let m = parse_module("sig A { x: Int[4] }\nrun {} for 3, 8 Int").expect("parse");
+    let m = parse_module("sig A { x: Int }\nrun {} for 3, 8 Int").expect("parse");
     assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 8);
+    assert_eq!(effective_int_count(&m.commands[0].scope), 8);
 
-    // quantified domains count too
-    let m = parse_module("pred p { all x: Int[6] | x = x }\nrun p for 3").expect("parse");
+    // quantified domains observe the same scope
+    let m = parse_module("pred p { all x: Int | x = x }\nrun p for 3, 6 Int").expect("parse");
     assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 6);
 }
 
 #[test]
 fn lazy_no_atoms_when_int_free() {
-    // Int-free model: universe holds only the 3 user atoms (was 3+16).
+    // Int-free model: universe holds only the 3 user atoms.
     let m = parse_module("sig A {}\nrun {} for 3").expect("parse");
     let scope = m.commands[0].scope.clone();
     assert!(!module_needs_int_atoms(&m, &scope));
@@ -80,21 +85,23 @@ fn pure_int_arithmetic_needs_no_atoms() {
     match query_value(&m, &scope, &cnf, "#A", &inst).expect("query #A") {
         QueryValue::Int(v) => assert_eq!(v, 2),
         QueryValue::Set(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
     }
 }
 
 #[test]
 fn atoms_materialize_on_use() {
-    // explicit scope always materializes
+    // explicit scope always materializes W atoms
     let m = parse_module("sig A {}\nrun {} for 3, 4 Int").expect("parse");
     let cnf = run(&m, 0).expect("build");
-    assert_eq!(cnf.bounds.universe().size(), 3 + 16);
-    assert_eq!(cnf.bounds.int_bounds().count(), 16);
+    assert_eq!(cnf.bounds.universe().size(), 3 + 4);
+    assert_eq!(cnf.bounds.int_bounds().count(), 4);
 
-    // `sig in Int` materializes at the effective width
+    // `sig in Int` materializes at the default count
     let m = parse_module("sig X in Int {}\nrun {} for 3").expect("parse");
     let cnf = run(&m, 0).expect("build");
-    assert_eq!(cnf.bounds.int_bounds().count(), 16);
+    assert_eq!(cnf.bounds.int_bounds().count(), 4);
 
     // set-position literals materialize
     let m = parse_module("sig A {}\nrun { 5 in A } for 3").expect("parse");
@@ -103,29 +110,33 @@ fn atoms_materialize_on_use() {
 }
 
 #[test]
-fn sized_int_field_solves() {
-    let src = "sig C { v: Int[8] }\nrun { some C and some C.v } for 3";
+fn int_field_solves_unsigned() {
+    let src = "sig C { v: Int }\nrun { some C and some C.v } for 3, 8 Int";
     let m = parse_module(src).expect("parse");
     let cnf = run(&m, 0).expect("build");
     assert_eq!(cnf.bitwidth, 8);
-    assert_eq!(cnf.bounds.int_bounds().count(), 256);
+    assert_eq!(cnf.bounds.int_bounds().count(), 8);
     let inst = solve(&cnf).expect("solve").expect("SAT");
     let scope = &m.commands[0].scope;
     match query_value(&m, scope, &cnf, "#Int", &inst).expect("query #Int") {
-        QueryValue::Int(v) => assert_eq!(v, 256),
+        QueryValue::Int(v) => assert_eq!(v, 8),
         QueryValue::Set(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
     }
-    // out-of-range literals wrap at the effective width 8: 300 -> 44
+    // out-of-range literals wrap at the circuit width 8: 300 -> 44
     match query_value(&m, scope, &cnf, "300", &inst).expect("query 300") {
         QueryValue::Int(v) => assert_eq!(v, 44),
         QueryValue::Set(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
     }
 }
 
 #[test]
-fn sized_int_in_arrow_type() {
-    // `Int[w]` also works on the right of `->` in field declarations.
-    let src = "sig B {}\nsig A { f: B -> Int[8] }\nrun { some f } for 3";
+fn int_in_arrow_type() {
+    // `Int` works on the right of `->` in field declarations.
+    let src = "sig B {}\nsig A { f: B -> Int }\nrun { some f } for 3, 8 Int";
     let m = parse_module(src).expect("parse");
     let scope = m.commands[0].scope.clone();
     assert_eq!(effective_bitwidth(&m, &scope), 8);
@@ -137,7 +148,7 @@ fn sized_int_in_arrow_type() {
 
 #[test]
 fn scope_clause_forms_unchanged() {
-    // pre-existing `for N Int` spellings keep working alongside `Int[w]`
+    // pre-existing `for N Int` spellings keep working
     for src in [
         "sig A {}\nrun {} for 8 Int",
         "sig A {}\nrun {} for Int 8",
@@ -146,6 +157,7 @@ fn scope_clause_forms_unchanged() {
         let m = parse_module(src).expect("parse scope form");
         let scope = scope_of(src);
         assert_eq!(effective_bitwidth(&m, &scope), 8);
+        assert_eq!(effective_int_count(&scope), 8);
         assert!(module_needs_int_atoms(&m, &scope));
     }
 }

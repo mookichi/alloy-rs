@@ -29,7 +29,7 @@ pub use ast::Scope;
 pub use ast::{
     BinOp, CmpKind, Command, CommandKind, Decl, Expr, Formula, IntBinOp, IntCmpOp, IntExpr, Module,
     Open, OpenParam, OptSpec, PartialDef, PartialEntry, PartialOp, QuantKind, SigDecl, SigMult,
-    DEFAULT_INT_BITWIDTH, effective_bitwidth, module_needs_int_atoms,
+    DEFAULT_INT_BITWIDTH, effective_bitwidth, effective_int_count, module_needs_int_atoms,
 };
 pub use lower::{LoweredOpt, LoweredTarget, Lowerer, LoweredProblem};
 pub use cnf::{check, run, solve, validate, Cnf, CnfKind};

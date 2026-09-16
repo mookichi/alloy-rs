@@ -652,6 +652,32 @@ impl<'a> FolTranslator<'a> {
                         }
                         acc
                     }
+                    CastToIntOp::Bits => {
+                        // Bit-vector value: Σ 2^v for int atoms v in the
+                        // set. Only bits below the circuit width exist;
+                        // higher atoms are truncated (same rule as the
+                        // frontend bitset lowering).
+                        let mut positions: Vec<(i64, usize)> = Vec::new();
+                        for (val, ts) in self.bounds.int_bounds() {
+                            for idx in ts.index_view().iter() {
+                                positions.push((val, idx as usize));
+                            }
+                        }
+                        positions.sort_by_key(|p| p.1);
+                        let mut acc = IntCircuit::constant(0, bw, &self.ctx);
+                        for &(val, pos) in &positions {
+                            if val >= 0 && (val as u64) < bw as u64 {
+                                if let Some(cell) = m.get(pos) {
+                                    let c = IntCircuit::constant(1i64 << val, bw, &self.ctx);
+                                    acc = acc.add(
+                                        &c.choice(cell, &IntCircuit::zero(&self.ctx)),
+                                        bw,
+                                    );
+                                }
+                            }
+                        }
+                        acc
+                    }
                 }
             }
             IntNode::Binary { op, left, right } => {

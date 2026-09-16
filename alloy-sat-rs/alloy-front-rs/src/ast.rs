@@ -56,12 +56,15 @@ pub enum Expr {
     Univ,
     None_,
     Iden,
-    /// The `int`/`Int` type used in declarations, with an optional
-    /// per-occurrence bitwidth (`Int[8]`). `None` means the command's
-    /// effective bitwidth (global `for N Int` scope, default 4).
-    /// The effective problem bitwidth is the max of the default and
-    /// every `Some(w)` in the module (A-plan: declaration-side widths).
-    IntAtom(Option<u32>),
+    /// The `int`/`Int` type used in declarations. Bit-vector model: `run
+    /// ... for W Int` gives W atoms `{0, .., W-1}` (default W = 4) and
+    /// W-bit circuits capped at 30 (`E = min(W, 30)`); `Int[w]` widths are
+    /// no longer supported (parsed as a join, i.e. an arity error).
+    IntAtom,
+    /// Bitset of an integer literal: `Bits(n)` denotes `{i < W : bit i of
+    /// the E-bit wrap of n is set}`, so `Bits(7)` is `{0, 1, 2}`. Built by
+    /// the parser for `=`/`!=` with a numeric-literal side.
+    Bits(i64, usize),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Transpose(Box<Expr>),
     TClosure(Box<Expr>),
@@ -139,6 +142,11 @@ pub enum IntExpr {
     /// (Kodkod `ExprToIntCast` with `SUM`): a singleton's value, else the
     /// sum of the contained int atoms.
     Val(Box<Expr>, usize),
+    /// Bit-vector value of a set in integer position (`{0, 1} * 2` reads
+    /// `{0, 1}` as 3 = Σ 2^i). Lowers via the BITS cast: non-Int atoms
+    /// contribute 0, bits at/above the circuit width are truncated.
+    /// Unlike `sum e` (Σ atom values), this is Σ 2^value.
+    BitsVal(Box<Expr>, usize),
     /// Explicit `sum e` over a unary set expression (Java: `sum A`,
     /// `sum A.f`, `sum {x: A | ...}`). Lowers identically to [`IntExpr::Val`];
     /// kept distinct so query routing treats it as integer-shaped.
@@ -158,7 +166,44 @@ impl IntExpr {
             IntExpr::Bin(_, a, b) => a.int_typed() && b.int_typed(),
             IntExpr::Val(..) => false,
             IntExpr::SumOf(..) => true,
+            IntExpr::BitsVal(..) => true,
         }
+    }
+
+    /// True when the tree contains a `{...}` bit-value node.
+    fn has_bitsval(&self) -> bool {
+        match self {
+            IntExpr::BitsVal(..) => true,
+            IntExpr::Bin(_, a, b) => a.has_bitsval() || b.has_bitsval(),
+            IntExpr::Sum(_, body, _) => body.has_bitsval(),
+            _ => false,
+        }
+    }
+
+    /// True when the tree has `+`/`-` with a bit-value descendant. A bare
+    /// `{...}` nested under `*`/`/`/`%` does not count (integer-only shape).
+    fn plusminus_bitsval(&self) -> bool {
+        match self {
+            IntExpr::Bin(op, a, b) => {
+                if matches!(op, IntBinOp::Add | IntBinOp::Sub) {
+                    a.has_bitsval()
+                        || b.has_bitsval()
+                        || a.plusminus_bitsval()
+                        || b.plusminus_bitsval()
+                } else {
+                    a.plusminus_bitsval() || b.plusminus_bitsval()
+                }
+            }
+            IntExpr::Sum(_, body, _) => body.plusminus_bitsval(),
+            _ => false,
+        }
+    }
+
+    /// Rewind-to-relational test for `=`/`!=` (and `:query` routing): a
+    /// bare `{...}` side, or `+`/`-` combining a bit-value, keeps the
+    /// legacy relational set reading. Pure `*`/`/`/`%` trees commit.
+    pub(crate) fn rewind_bitsval_eq(&self) -> bool {
+        matches!(self, IntExpr::BitsVal(..)) || self.plusminus_bitsval()
     }
 }
 
@@ -299,7 +344,7 @@ impl Expr {
             Expr::Bracket(b, args) => b.has_temporal() || args.iter().any(|a| a.has_temporal()),
             Expr::Call(_, args, _) => args.iter().any(|a| a.has_temporal()),
             Expr::ArrowMult(_, x) | Expr::LeadMult(_, x) => x.has_temporal(),
-            Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom(_) => false,
+            Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => false,
             Expr::LetBind(binds, body) => {
                 body.has_temporal() || binds.iter().any(|(_, e)| e.has_temporal())
             }
@@ -331,7 +376,8 @@ impl Expr {
             | Expr::Univ
             | Expr::None_
             | Expr::Iden
-            | Expr::IntAtom(_) => false,
+            | Expr::IntAtom
+            | Expr::Bits(..) => false,
         }
     }
 }
@@ -344,7 +390,9 @@ impl IntExpr {
                 body.has_temporal() || decls.iter().any(|d| d.expr.has_temporal())
             }
             IntExpr::Bin(_, a, b) => a.has_temporal() || b.has_temporal(),
-            IntExpr::Val(e, _) | IntExpr::SumOf(e, _) => e.has_temporal(),
+            IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => {
+                e.has_temporal()
+            }
             IntExpr::Lit(..) => false,
         }
     }
@@ -358,7 +406,7 @@ impl IntExpr {
                 body.has_soft() || decls.iter().any(|d| d.expr.has_soft())
             }
             IntExpr::Bin(_, a, b) => a.has_soft() || b.has_soft(),
-            IntExpr::Val(e, _) | IntExpr::SumOf(e, _) => e.has_soft(),
+            IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => e.has_soft(),
             IntExpr::Lit(..) => false,
         }
     }
@@ -540,53 +588,27 @@ impl Module {
     }
 }
 
-/// Default bitwidth for a bare `Int` (no `for N Int`, no `Int[w]`).
+/// Default Int atom count for a bare `Int` (no `for N Int`).
 pub const DEFAULT_INT_BITWIDTH: u32 = 4;
 
-/// Effective problem bitwidth (A-plan, transitional global-max semantics):
-/// the max of the command's default (`for N Int`, else 4) and every
-/// per-occurrence `Int[w]` width in the module. Bare `Int` atoms and all
-/// integer circuits observe this width.
-pub fn effective_bitwidth(module: &Module, scope: &Scope) -> u32 {
-    let base = scope.int_scope.unwrap_or(DEFAULT_INT_BITWIDTH).max(1);
-    let mut acc = base;
-    let mut visit_expr = Vec::new();
-    for sd in &module.sigs {
-        for d in &sd.fields {
-            visit_expr.push(&d.expr);
-        }
-        if let Some(f) = &sd.fact {
-            collect_int_widths_formula(f, &mut acc);
-        }
-    }
-    for (_, f) in &module.facts {
-        collect_int_widths_formula(f, &mut acc);
-    }
-    for p in &module.paras {
-        collect_int_widths_formula(&p.body, &mut acc);
-        if let Some(e) = &p.body_expr {
-            visit_expr.push(e);
-        }
-        for d in &p.params {
-            visit_expr.push(&d.expr);
-        }
-    }
-    for pd in &module.partials {
-        for e in &pd.entries {
-            visit_expr.push(&e.left);
-            visit_expr.push(&e.right);
-        }
-    }
-    for e in visit_expr {
-        collect_int_widths_expr(e, &mut acc);
-    }
-    acc
+/// Effective problem bitwidth (bit-vector model): the circuit width `E =
+/// min(W, 30)` where `W` is the Int atom count below. `Int[w]`
+/// per-occurrence widths are no longer supported.
+pub fn effective_bitwidth(_module: &Module, scope: &Scope) -> u32 {
+    effective_int_count(scope).clamp(1, 30)
+}
+
+/// Effective Int atom count (bit-vector model): `W` from `for W Int`
+/// (default 4), giving atoms `{0, .., W-1}`.
+pub fn effective_int_count(scope: &Scope) -> u32 {
+    scope.int_scope.unwrap_or(DEFAULT_INT_BITWIDTH).max(1)
 }
 
 /// True when the module needs int atoms materialized in the universe
-/// (A-plan lazy allocation). Int-as-a-*set* requires atoms: `Int`/`Int[w]`
-/// in any relational position, `int`/`Int` names, set-position integer
-/// literals (`x = 5`), `sig X in Int`, or an explicit `for N Int` scope.
+/// (lazy allocation). Int-as-a-*set* requires atoms: `Int` in any
+/// relational position, `int`/`Int`/`Signed` names, `MSB`, bitsets,
+/// set-position integer literals (`x = 5`), `sig X in Int` (or `in
+/// Signed`), or an explicit `for N Int` scope.
 /// Pure integer-position use (`#A`, `sum`, `+ - * / %`, `IntCmp` over
 /// non-Int sets) lowers to BV circuits only and needs no atoms.
 pub fn module_needs_int_atoms(module: &Module, scope: &Scope) -> bool {
@@ -597,7 +619,7 @@ pub fn module_needs_int_atoms(module: &Module, scope: &Scope) -> bool {
     }
     let mut needs = false;
     for sd in &module.sigs {
-        if sd.extends.as_deref() == Some("Int") {
+        if sd.extends.as_deref() == Some("Int") || sd.extends.as_deref() == Some("Signed") {
             return true;
         }
         for d in &sd.fields {
@@ -652,142 +674,16 @@ pub fn module_needs_int_atoms(module: &Module, scope: &Scope) -> bool {
     needs
 }
 
-fn collect_int_widths_expr(e: &Expr, acc: &mut u32) {
-    match e {
-        Expr::IntAtom(Some(w)) => *acc = (*acc).max(*w),
-        Expr::IntAtom(None) => {}
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden => {}
-        Expr::Bin(_, a, b) => {
-            collect_int_widths_expr(a, acc);
-            collect_int_widths_expr(b, acc);
-        }
-        Expr::Transpose(x) | Expr::TClosure(x) | Expr::RClosure(x) => {
-            collect_int_widths_expr(x, acc);
-        }
-        Expr::Comprehension(ds, body) => {
-            for d in ds {
-                collect_int_widths_expr(&d.expr, acc);
-            }
-            collect_int_widths_formula(body, acc);
-        }
-        Expr::If(c, t, el) => {
-            collect_int_widths_formula(c, acc);
-            collect_int_widths_expr(t, acc);
-            collect_int_widths_expr(el, acc);
-        }
-        Expr::Bracket(base, args) => {
-            collect_int_widths_expr(base, acc);
-            for a in args {
-                collect_int_widths_expr(a, acc);
-            }
-        }
-        Expr::Call(_, args, _) => {
-            for a in args {
-                collect_int_widths_expr(a, acc);
-            }
-        }
-        Expr::ArrowMult(_, x) | Expr::LeadMult(_, x) => collect_int_widths_expr(x, acc),
-        Expr::Prime(x) | Expr::AtExpr(x) => collect_int_widths_expr(x, acc),
-        Expr::LetBind(binds, body) => {
-            for (_, ex) in binds {
-                collect_int_widths_expr(ex, acc);
-            }
-            collect_int_widths_expr(body, acc);
-        }
-    }
-}
-
-fn collect_int_widths_formula(f: &Formula, acc: &mut u32) {
-    match f {
-        Formula::Const(_) => {}
-        // `pin` bodies live in `Module::partials`, walked at module level.
-        Formula::Pin(..) => {}
-        Formula::Cmp(_, a, b, _) => {
-            collect_int_widths_expr(a, acc);
-            collect_int_widths_expr(b, acc);
-        }
-        Formula::IntCmp(_, a, b, _) => {
-            collect_int_widths_intexpr(a, acc);
-            collect_int_widths_intexpr(b, acc);
-        }
-        Formula::Quant(_, ds, body) => {
-            for d in ds {
-                collect_int_widths_expr(&d.expr, acc);
-            }
-            collect_int_widths_formula(body, acc);
-        }
-        Formula::Multi(_, e, _) => collect_int_widths_expr(e, acc),
-        Formula::And(a, b)
-        | Formula::Or(a, b)
-        | Formula::Implies(a, b)
-        | Formula::Iff(a, b)
-        | Formula::Until(a, b)
-        | Formula::Releases(a, b)
-        | Formula::Since(a, b)
-        | Formula::Triggered(a, b) => {
-            collect_int_widths_formula(a, acc);
-            collect_int_widths_formula(b, acc);
-        }
-        Formula::Not(x)
-        | Formula::Always(x)
-        | Formula::Eventually(x)
-        | Formula::Before(x)
-        | Formula::Historically(x)
-        | Formula::Once(x)
-        | Formula::Keeping(x)
-        | Formula::Goal(x)
-        | Formula::Restore(x)
-        | Formula::Initially(x)
-        | Formula::Regularly(x)
-        | Formula::Consistently(x) => collect_int_widths_formula(x, acc),
-        Formula::LetBind(binds, body) => {
-            for (_, ex) in binds {
-                collect_int_widths_expr(ex, acc);
-            }
-            collect_int_widths_formula(body, acc);
-        }
-        Formula::Call(_, args, _) => {
-            for a in args {
-                collect_int_widths_expr(a, acc);
-            }
-        }
-        Formula::MaxSome(e) | Formula::MinSome(e) => collect_int_widths_expr(e, acc),
-        Formula::MaxSomeDecl(ds, body) => {
-            for d in ds {
-                collect_int_widths_expr(&d.expr, acc);
-            }
-            collect_int_widths_formula(body, acc);
-        }
-    }
-}
-
-fn collect_int_widths_intexpr(ie: &IntExpr, acc: &mut u32) {
-    match ie {
-        IntExpr::Lit(..) => {}
-        IntExpr::Card(e, _) | IntExpr::Val(e, _) | IntExpr::SumOf(e, _) => {
-            collect_int_widths_expr(e, acc);
-        }
-        IntExpr::Sum(ds, body, _) => {
-            for d in ds {
-                collect_int_widths_expr(&d.expr, acc);
-            }
-            collect_int_widths_intexpr(body, acc);
-        }
-        IntExpr::Bin(_, a, b) => {
-            collect_int_widths_intexpr(a, acc);
-            collect_int_widths_intexpr(b, acc);
-        }
-    }
-}
-
 /// Marks `needs` when `e` references Int as a set (atoms required).
-fn scan_expr_int_set(e: &Expr, needs: &mut bool) {
+pub(crate) fn scan_expr_int_set(e: &Expr, needs: &mut bool) {
     if *needs {
         return;
     }
     match e {
-        Expr::IntAtom(_) => *needs = true,
-        Expr::Name(n, _) if n == "int" || n == "Int" || n.parse::<i64>().is_ok() => {
+        Expr::IntAtom => *needs = true,
+        // A bitset denotes Int atoms by construction.
+        Expr::Bits(..) => *needs = true,
+        Expr::Name(n, _) if n == "int" || n == "Int" || n == "Signed" || n == "MSB" || n.parse::<i64>().is_ok() => {
             *needs = true;
         }
         Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden => {}
@@ -831,7 +727,7 @@ fn scan_expr_int_set(e: &Expr, needs: &mut bool) {
     }
 }
 
-fn scan_formula_int_set(f: &Formula, needs: &mut bool) {
+pub(crate) fn scan_formula_int_set(f: &Formula, needs: &mut bool) {
     if *needs {
         return;
     }
@@ -903,13 +799,13 @@ fn scan_formula_int_set(f: &Formula, needs: &mut bool) {
 /// Marks `needs` when an integer expression draws on Int atoms
 /// (only `Val`/`SumOf`/`Card` over Int-denoting sets do; literals,
 /// plain cardinalities and arithmetic are pure circuits).
-fn scan_intexpr_int_set(ie: &IntExpr, needs: &mut bool) {
+pub(crate) fn scan_intexpr_int_set(ie: &IntExpr, needs: &mut bool) {
     if *needs {
         return;
     }
     match ie {
         IntExpr::Lit(..) => {}
-        IntExpr::Card(e, _) | IntExpr::Val(e, _) | IntExpr::SumOf(e, _) => {
+        IntExpr::Card(e, _) | IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => {
             scan_expr_int_set(e, needs);
         }
         IntExpr::Sum(ds, body, _) => {

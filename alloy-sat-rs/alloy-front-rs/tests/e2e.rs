@@ -450,25 +450,33 @@ fn int_eq_stays_relational() {
 }
 
 /// Integer literal in set position: `some 5` (the `{5}` singleton).
+/// Bit-vector model: atom 5 needs `for 8 Int` (default W = 4 covers 0..3).
 #[test]
 fn int_literal_singleton_some() {
     let src = r#"
         module t
         sig A {}
-        run { some 5 } for 3
+        run { some 5 } for 3, 8 Int
     "#;
     assert_eq!(outcome(src, 0), "SAT");
 }
 
-/// `some x: X | x < 0` over an Int subset is SAT.
+/// Unsigned Int atoms: `some x: X | x < 2` is SAT, while `x < 0` is
+/// UNSAT (nothing in `{0, .., W-1}` is negative).
 #[test]
 fn int_var_lt_some_sat() {
     let src = r#"
         module t
         sig X in Int {}
-        run { some x: X | x < 0 } for 3
+        run { some x: X | x < 2 } for 3
     "#;
     assert_eq!(outcome(src, 0), "SAT");
+    let src = r#"
+        module t
+        sig X in Int {}
+        run { some x: X | x < 0 } for 3
+    "#;
+    assert_eq!(outcome(src, 0), "UNSAT");
 }
 
 /// Above the bitwidth-4 maximum (7), no X atom qualifies: UNSAT.

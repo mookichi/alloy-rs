@@ -1195,6 +1195,41 @@ impl Parser {
         self.rel_expr_top(in_sig)
     }
 
+    /// `{x: D | F}` / `{x: D}` comprehension, or `{a, b, ...}` set
+    /// literal (extension: Java rejects the latter). Declarations win
+    /// when parseable (`{x: X, y: Y}` binds two names); otherwise rewind
+    /// and read a union list. `{}` is the empty set literal (needed so
+    /// the REPL's `{...}` display/save format round-trips); `none` stays
+    /// accepted as before. Called with `{` as the pending token.
+    fn braced_set(&mut self, in_sig: bool) -> PResult<Expr> {
+        self.bump();
+        if self.eat(&Tok::RBrace) {
+            return Ok(Expr::None_);
+        }
+        let after_brace = self.pos;
+        match self.quant_decls() {
+            Ok(ds) => {
+                let f = if self.eat(&Tok::Bar) {
+                    self.formula()?
+                } else {
+                    Formula::Const(true)
+                };
+                self.expect(&Tok::RBrace)?;
+                Ok(Expr::Comprehension(ds, Box::new(f)))
+            }
+            Err(_) => {
+                self.pos = after_brace;
+                let mut e = self.set_literal_element(in_sig)?;
+                while self.eat(&Tok::Comma) {
+                    let r = self.set_literal_element(in_sig)?;
+                    e = Expr::Bin(BinOp::Union, Box::new(e), Box::new(r));
+                }
+                self.expect(&Tok::RBrace)?;
+                Ok(e)
+            }
+        }
+    }
+
     fn parse_primary(&mut self, in_sig: bool) -> PResult<Expr> {
         let pos = self.pos();
         // let binding in expression context: `let x = expr | expr`
@@ -1230,34 +1265,11 @@ impl Parser {
             }
             Tok::IntTy | Tok::IntKw => {
                 self.bump();
-                // Optional per-occurrence bitwidth: `Int[8]` / `int[8]`
-                // (A-plan: declaration-side widths). Only a plain integer
-                // literal counts; anything else (e.g. `Int[x]`) falls
-                // through to the join/bracket path below.
-                if matches!(self.peek(), Tok::LBracket)
-                    && matches!(self.peek_at(1), Tok::Int(_))
-                    && matches!(self.peek_at(2), Tok::RBracket)
-                {
-                    self.bump(); // [
-                    let w = match self.bump().tok {
-                        Tok::Int(v) => v,
-                        _ => unreachable!(),
-                    };
-                    self.bump(); // ]
-                    if !(1..=32).contains(&w) {
-                        return Err(self.err(&format!(
-                            "Int bitwidth must be 1..32, got {w}"
-                        )));
-                    }
-                    Ok(Expr::IntAtom(Some(w as u32)))
-                } else if matches!(self.peek(), Tok::LBracket) {
-                    // `Int[` with a non-literal or malformed width:
-                    // report the width error directly instead of a
-                    // confusing join-arity failure downstream.
-                    return Err(self.err("Int bitwidth must be a literal 1..32, e.g. Int[8]"));
-                } else {
-                    Ok(Expr::IntAtom(None))
-                }
+                // Bit-vector model: `Int[w]` per-occurrence widths are gone.
+                // A bracket after `Int` falls through to the join/bracket
+                // path below, where `Int[8]` (i.e. `8.Int`, arity 1 joined
+                // with arity 1) fails as an arity error.
+                Ok(Expr::IntAtom)
             }
             Tok::Int(v) => {
                 // Integer literal in set position: a singleton int-atom set
@@ -1274,41 +1286,7 @@ impl Parser {
                     _ => unreachable!(),
                 }
             }
-            Tok::LBrace => {
-                // `{x: D | F}` / `{x: D}` comprehension, or `{a, b, ...}`
-                // set literal (extension: Java rejects the latter).
-                // Declarations win when parseable (`{x: X, y: Y}` binds two
-                // names); otherwise rewind and read a union list.
-                // `{}` is the empty set literal (needed so the REPL's
-                // `{...}` display/save format round-trips); `none`
-                // stays accepted as before.
-                self.bump();
-                if self.eat(&Tok::RBrace) {
-                    return Ok(Expr::None_);
-                }
-                let after_brace = self.pos;
-                match self.quant_decls() {
-                    Ok(ds) => {
-                        let f = if self.eat(&Tok::Bar) {
-                            self.formula()?
-                        } else {
-                            Formula::Const(true)
-                        };
-                        self.expect(&Tok::RBrace)?;
-                        Ok(Expr::Comprehension(ds, Box::new(f)))
-                    }
-                    Err(_) => {
-                        self.pos = after_brace;
-                        let mut e = self.set_literal_element(in_sig)?;
-                        while self.eat(&Tok::Comma) {
-                            let r = self.set_literal_element(in_sig)?;
-                            e = Expr::Bin(BinOp::Union, Box::new(e), Box::new(r));
-                        }
-                        self.expect(&Tok::RBrace)?;
-                        Ok(e)
-                    }
-                }
-            }
+            Tok::LBrace => self.braced_set(in_sig),
             Tok::If => {
                 self.bump();
                 let c = self.formula()?;
@@ -1804,7 +1782,10 @@ impl Parser {
             let save = self.pos;
             match self.int_cmp_tail() {
                 Ok(Formula::IntCmp(IntCmpOp::Eq | IntCmpOp::Neq, ref l, ref r, _))
-                    if !l.int_typed() || !r.int_typed() =>
+                    if !l.int_typed()
+                        || !r.int_typed()
+                        || l.rewind_bitsval_eq()
+                        || r.rewind_bitsval_eq() =>
                 {
                     self.pos = save;
                 }
@@ -1825,6 +1806,7 @@ impl Parser {
             if let Ok(ie) = self.int_expr() {
                 if ie.int_typed()
                     && !matches!(ie, IntExpr::Lit(..))
+                    && !ie.rewind_bitsval_eq()
                     && matches!(self.peek(), Tok::Eq | Tok::NotEq)
                 {
                     let neg = matches!(self.peek(), Tok::NotEq);
@@ -1936,7 +1918,7 @@ impl Parser {
             let save = self.pos;
             self.bump(); // consume `=` / `!=`
             if let Ok(ie) = self.int_expr() {
-                if ie.int_typed() && !matches!(ie, IntExpr::Lit(..)) {
+                if ie.int_typed() && !matches!(ie, IntExpr::Lit(..)) && !ie.rewind_bitsval_eq() {
                     return Ok(set_eq_int(l, ie, pos, matches!(kind, CmpKind::Neq)));
                 }
             }
@@ -1944,6 +1926,26 @@ impl Parser {
         }
         self.bump();
         let r = self.rel_expr_top(false)?;
+        // Bit-vector model: `=`/`!=` with an integer-literal side against
+        // a UNION compares the literal's bitset (`7 = {0, 1, 2}` holds
+        // since bits(7) is `{0, 1, 2}`, as does `7 = {0}+{1}+{2}`).
+        // Any other shape keeps the legacy singleton reading, so `x = 5`,
+        // `a.x = 3` and `MSB = 3` are unaffected. `in` is untouched as well.
+        if matches!(kind, CmpKind::Eq | CmpKind::Neq) {
+            let lnum = numeric_name(&l);
+            let rnum = numeric_name(&r);
+            let lun = matches!(l, crate::ast::Expr::Bin(crate::ast::BinOp::Union, _, _));
+            let run = matches!(r, crate::ast::Expr::Bin(crate::ast::BinOp::Union, _, _));
+            let l = match lnum {
+                Some((v, p)) if run => Expr::Bits(v, p),
+                _ => l,
+            };
+            let r = match rnum {
+                Some((v, p)) if lun => Expr::Bits(v, p),
+                _ => r,
+            };
+            return Ok(Formula::Cmp(kind, l, r, pos));
+        }
         Ok(Formula::Cmp(kind, l, r, pos))
     }
 
@@ -1969,7 +1971,10 @@ impl Parser {
     }
 
     fn starts_int_expr(&self) -> bool {
-        matches!(self.peek(), Tok::Hash | Tok::Sum | Tok::Int(_) | Tok::Minus)
+        matches!(
+            self.peek(),
+            Tok::Hash | Tok::Sum | Tok::Int(_) | Tok::Minus | Tok::LBrace
+        )
     }
 
     fn int_expr(&mut self) -> PResult<IntExpr> {
@@ -2071,6 +2076,14 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 Ok(e)
             }
+            Tok::LBrace => {
+                // Bit-vector value of a braced set in integer position
+                // (`{0, 1} * 2` reads `{0, 1}` as 3 = Σ 2^i). Unlike
+                // `sum e` (Σ atom values), this is Σ 2^value over the
+                // int members; anything else in the set contributes 0.
+                let e = self.braced_set(false)?;
+                Ok(IntExpr::BitsVal(Box::new(e), pos))
+            }
             // Set-typed operand in integer position (variable, join, ...):
             // Java casts it via `typecheck_as_int` (Kodkod SUM cast).
             Tok::Ident(_)
@@ -2128,6 +2141,16 @@ fn dotted_rel_shape(e: &crate::ast::Expr) -> bool {
             dotted_rel_shape(a) && dotted_rel_shape(b)
         }
         _ => false,
+    }
+}
+
+/// Integer literal in set position (a lone `Name("7")`): returns its value
+/// and position. Sig/variable names never parse as integers, so this
+/// unambiguously detects literal sides of `=`/`!=` for bitset comparison.
+fn numeric_name(e: &crate::ast::Expr) -> Option<(i64, usize)> {
+    match e {
+        crate::ast::Expr::Name(n, p) => n.parse::<i64>().ok().map(|v| (v, *p)),
+        _ => None,
     }
 }
 

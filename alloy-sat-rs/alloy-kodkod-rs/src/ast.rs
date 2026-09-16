@@ -89,6 +89,10 @@ pub enum TemporalExprOp {
 pub enum CastToIntOp {
     Cardinality,
     Sum,
+    /// Bit-vector value: Σ 2^v over the int atoms `v` in the set
+    /// (non-negative `v` below the circuit width; anything else is
+    /// ignored). Inverse-ish of the frontend's bitset reading.
+    Bits,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -761,7 +765,7 @@ impl AstArena {
     }
 
     pub fn cast_to_int(&mut self, op: CastToIntOp, expr: ExprId) -> Result<IntId, AstError> {
-        if op == CastToIntOp::Sum && self.arity(expr) > 1 {
+        if (op == CastToIntOp::Sum || op == CastToIntOp::Bits) && self.arity(expr) > 1 {
             return Err(AstError::SumRequiresUnary(self.arity(expr)));
         }
         let id = IntId(self.ints.len() as u32);

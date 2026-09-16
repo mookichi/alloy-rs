@@ -31,7 +31,10 @@ pub struct SigInfo {
 
 pub struct Resolved {
     pub universe: Arc<Universe>,
+    /// Circuit width `E = min(W, 30)` (drives Kodkod `set_bitwidth`).
     pub bitwidth: u32,
+    /// Int atom count `W` (atoms `{0, .., W-1}`).
+    pub int_count: u32,
     pub sigs: HashMap<String, SigInfo>,
     /// Every declared sig relation (sig name -> relation).
     #[allow(dead_code)]
@@ -52,7 +55,7 @@ impl Resolved {
 fn build_scope_map(
     module: &Module,
     scope: &Scope,
-) -> (HashMap<String, (u32, bool)>, u32, u32, bool) {
+) -> (HashMap<String, (u32, bool)>, u32, u32, u32, bool) {
     let mut m: HashMap<String, (u32, bool)> = HashMap::new();
     for (name, e) in &scope.entries {
         match e {
@@ -65,18 +68,19 @@ fn build_scope_map(
         }
     }
     let overall = scope.overall.unwrap_or(DEFAULT_SCOPE);
-    // A-plan: the effective bitwidth is the max of the command default
-    // (`for N Int`, else 4) and every per-occurrence `Int[w]` width.
-    // Int atoms are allocated lazily: models that never mention Int as
-    // a set pay zero universe cost.
+    // Bit-vector model: `for W Int` (else 4) gives W atoms `{0, .., W-1}`
+    // with W-bit circuits capped at 30 (`E = min(W, 30)`). Int atoms are
+    // allocated lazily: models that never mention Int as a set pay zero
+    // universe cost.
     let bitwidth = crate::ast::effective_bitwidth(module, scope);
+    let int_count = crate::ast::effective_int_count(scope);
     let needs_int = crate::ast::module_needs_int_atoms(module, scope);
-    (m, overall, bitwidth, needs_int)
+    (m, overall, bitwidth, int_count, needs_int)
 }
 
 /// Resolves scopes into universe + per-sig atom allocations.
 pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
-    let (user, overall, bitwidth, needs_int) = build_scope_map(module, scope);
+    let (user, overall, bitwidth, int_count, needs_int) = build_scope_map(module, scope);
 
     // index declarations
     let mut parents: HashMap<&str, Option<String>> = HashMap::new();
@@ -93,13 +97,14 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             sig_rels.insert(n.as_str(), sd.rel);
             all_names.push(n.clone());
             if let Some(p) = &sd.extends {
-                if p == "Int" {
+                if p == "Int" || p == "Signed" {
                     // Java parity (verified against the Java frontend with
                     // Version.experimental=true): `extends Int` is rejected,
                     // while `in Int` (subset of the builtin Int) is accepted.
+                    // `Signed` mirrors `Int` exactly (same atoms).
                     if sd.rel != SigRel::In {
                         return Err(format!(
-                            "sig {n} cannot extend the builtin \"Int\" signature"
+                            "sig {n} cannot extend the builtin \"{p}\" signature"
                         ));
                     }
                     children.entry(p.clone()).or_default().push(n.clone());
@@ -256,14 +261,14 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         }
     }
     // Second pass: resolve transitively to a root with allocated atoms.
-    // A builtin `Int` ancestor terminates at the int atoms for the
-    // effective bitwidth (same naming as the universe construction
-    // below). With lazy allocation (`needs_int == false`) the range is
-    // empty; that path is unreachable for `in Int` children (which set
-    // `needs_int`), so the empty case only guards the type level.
-    let half = 1i64 << (bitwidth - 1);
+    // A builtin `Int`/`Signed` ancestor terminates at the int atoms
+    // `{0, .., W-1}` for the effective atom count (same naming as the
+    // universe construction below). With lazy allocation (`needs_int ==
+    // false`) the range is empty; that path is unreachable for `in Int`
+    // children (which set `needs_int`), so the empty case only guards
+    // the type level.
     let int_atoms: Vec<String> = if needs_int {
-        ((-half)..half).map(|v| v.to_string()).collect()
+        (0..int_count).map(|v| v.to_string()).collect()
     } else {
         Vec::new()
     };
@@ -273,8 +278,9 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             while let Some(next_parent) = in_direct.get(&cur) {
                 cur = next_parent.clone();
             }
-            // cur is now the root (non-in) ancestor, or builtin `Int`
-            if cur == "Int" {
+            // cur is now the root (non-in) ancestor, or builtin
+            // `Int`/`Signed`
+            if cur == "Int" || cur == "Signed" {
                 in_children_atoms.insert(n.clone(), int_atoms.clone());
             } else {
                 let root_atoms = atoms_of.get(&cur).cloned().unwrap_or_default();
@@ -317,9 +323,8 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     let mut flat: Vec<String> = atoms_of.values().flatten().cloned().collect();
     flat.sort();
     // int atoms (lazy: omitted entirely when Int is never used as a set)
-    let half = 1i64 << (bitwidth - 1);
     let int_names: Vec<String> = if needs_int {
-        ((-half)..(half)).map(|v| v.to_string()).collect()
+        (0..int_count).map(|v| v.to_string()).collect()
     } else {
         Vec::new()
     };
@@ -345,6 +350,7 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     Ok(Resolved {
         universe,
         bitwidth,
+        int_count,
         sigs,
         sig_rel: HashMap::new(),
         closure_atoms: closure,
