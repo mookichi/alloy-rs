@@ -1,6 +1,8 @@
 use std::process;
 
-use alloy_front_rs::{parse_and_run_timed, parse_module, run_command, CommandKind};
+use alloy_front_rs::{
+    parse_and_run_timed, parse_module, run_command, run_opt_command, CommandKind,
+};
 use clap::Parser as ClapParser;
 
 #[derive(ClapParser)]
@@ -51,6 +53,35 @@ fn main() {
     }
 }
 
+/// Display name + kind word for a command (opt commands included).
+fn command_label(cmd: &alloy_front_rs::Command, i: usize) -> (String, &'static str) {
+    match &cmd.kind {
+        CommandKind::Run(n) => (
+            n.clone().unwrap_or_else(|| format!("run${}", i + 1)),
+            "run",
+        ),
+        CommandKind::Check(n) => (
+            n.clone().unwrap_or_else(|| format!("check${}", i + 1)),
+            "check",
+        ),
+        CommandKind::Maximize { name: n, .. } => (
+            n.clone().unwrap_or_else(|| format!("maximize${}", i + 1)),
+            "maximize",
+        ),
+        CommandKind::Minimize { name: n, .. } => (
+            n.clone().unwrap_or_else(|| format!("minimize${}", i + 1)),
+            "minimize",
+        ),
+    }
+}
+
+fn is_opt_command(cmd: &alloy_front_rs::Command) -> bool {
+    matches!(
+        cmd.kind,
+        CommandKind::Maximize { .. } | CommandKind::Minimize { .. }
+    )
+}
+
 fn fmt_dur(d: std::time::Duration) -> String {
     let us = d.as_micros();
     if us < 1000 {
@@ -65,6 +96,7 @@ fn fmt_dur(d: std::time::Duration) -> String {
 fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
     let pick = cli.command.as_deref();
     let mut last_solution = None;
+    let mut last_opt_sat = false;
     let mut ran_any = false;
     let mut total_parse = std::time::Duration::ZERO;
     let mut total_lower = std::time::Duration::ZERO;
@@ -80,15 +112,7 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
     };
 
     for (i, cmd) in module.commands.iter().enumerate() {
-        let name = match &cmd.kind {
-            CommandKind::Run(n) => n.clone().unwrap_or_else(|| format!("run${}", i + 1)),
-            CommandKind::Check(n) => n.clone().unwrap_or_else(|| format!("check${}", i + 1)),
-        };
-        let kind = if matches!(cmd.kind, CommandKind::Run(_)) {
-            "run"
-        } else {
-            "check"
-        };
+        let (name, kind) = command_label(cmd, i);
 
         if let Some(p) = pick {
             if p != &name && p.parse::<usize>().map(|k| k != i).unwrap_or(true) {
@@ -97,6 +121,33 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
         }
 
         ran_any = true;
+        if is_opt_command(cmd) || alloy_front_rs::command_needs_opt(&module, i) {
+            let t0 = std::time::Instant::now();
+            let result = run_opt_command(&module, i);
+            let dt = t0.elapsed();
+            total_solve += dt;
+            match result {
+                Ok(sol) => {
+                    let tag = if sol.satisfiable { "SAT" } else { "UNSAT" };
+                    let models = if sol.satisfiable { "1/1" } else { "0" };
+                    let cost = sol
+                        .cost
+                        .map(|c| format!(" cost={c}"))
+                        .unwrap_or_default();
+                    println!("{i:02}. {kind:<8} {name:<20} {models} {tag}{cost}  solve={}", fmt_dur(dt));
+                    if let Some(ref inst) = sol.instance {
+                        println!("    {inst}");
+                    }
+                    if sol.satisfiable {
+                        last_opt_sat = true;
+                    }
+                }
+                Err(e) => {
+                    println!("{i:02}. {kind:<8} {name:<20} !{e}");
+                }
+            }
+            continue;
+        }
         let timed = parse_and_run_timed(source, i);
         total_parse += timed.parse;
         total_lower += timed.lower;
@@ -196,6 +247,7 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
 
     match last_solution {
         Some(sol) if sol.satisfiable => process::exit(0),
+        _ if last_opt_sat => process::exit(0),
         _ => process::exit(1),
     }
 }
@@ -213,18 +265,11 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
     // Run commands
     let pick = cli.command.as_deref();
     let mut last_solution = None;
+    let mut last_opt_sat = false;
     let mut ran_any = false;
 
     for (i, cmd) in module.commands.iter().enumerate() {
-        let name = match &cmd.kind {
-            CommandKind::Run(n) => n.clone().unwrap_or_else(|| format!("run${}", i + 1)),
-            CommandKind::Check(n) => n.clone().unwrap_or_else(|| format!("check${}", i + 1)),
-        };
-        let kind = if matches!(cmd.kind, CommandKind::Run(_)) {
-            "run"
-        } else {
-            "check"
-        };
+        let (name, kind) = command_label(cmd, i);
 
         if let Some(p) = pick {
             if p != name && p.parse::<usize>().map(|k| k != i).unwrap_or(true) {
@@ -233,6 +278,29 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
         }
 
         ran_any = true;
+        if is_opt_command(cmd) || alloy_front_rs::command_needs_opt(&module, i) {
+            match run_opt_command(&module, i) {
+                Ok(sol) => {
+                    let tag = if sol.satisfiable { "SAT" } else { "UNSAT" };
+                    let models = if sol.satisfiable { "1/1" } else { "0" };
+                    let cost = sol
+                        .cost
+                        .map(|c| format!(" cost={c}"))
+                        .unwrap_or_default();
+                    println!("{i:02}. {kind:<8} {name:<20} {models} {tag}{cost}");
+                    if let Some(ref inst) = sol.instance {
+                        println!("    {inst}");
+                    }
+                    if sol.satisfiable {
+                        last_opt_sat = true;
+                    }
+                }
+                Err(e) => {
+                    println!("{i:02}. {kind:<8} {name:<20} !{e}");
+                }
+            }
+            continue;
+        }
         match run_command(&module, i) {
             Ok(sol) => {
                 let tag = if sol.satisfiable { "SAT" } else { "UNSAT" };
@@ -304,6 +372,7 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
 
     match last_solution {
         Some(sol) if sol.satisfiable => process::exit(0),
+        _ if last_opt_sat => process::exit(0),
         _ => process::exit(1),
     }
 }

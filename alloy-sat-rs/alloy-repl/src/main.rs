@@ -19,8 +19,10 @@
 use std::collections::HashMap;
 
 use alloy_front_rs::{
-    check, eval, fragment_keys, parse_module, query_value, run, solve, validate, Cnf, CnfKind,
-    CommandKind, IncrementalSession, Instance, Module, PartialInstance, QueryValue,
+    check, command_needs_opt, eval, fragment_keys, optimize, parse_int_expr, parse_module,
+    query_value, run, run_opt_command, solve, validate, Cnf, CnfKind, CommandKind,
+    IncrementalSession, Instance, KkOptSense, Module, OptSolution, OptTarget, PartialInstance,
+    QueryValue,
 };
 
 mod fmt;
@@ -76,6 +78,8 @@ struct Pending {
 struct StoredSol {
     sat: bool,
     instance: Option<Instance>,
+    /// Optimum cost for `:max`/`:min`/`:maxw`/`:minw` solutions.
+    cost: Option<i64>,
     /// Origin Cnf store name; empty for `:eval` solutions (no Cnf context).
     from_cnf: String,
 }
@@ -246,6 +250,12 @@ impl Session {
                     let (kind, name) = match &c.kind {
                         CommandKind::Run(n) => ("run", n.clone().unwrap_or_default()),
                         CommandKind::Check(n) => ("check", n.clone().unwrap_or_default()),
+                        CommandKind::Maximize { name: n, .. } => {
+                            ("maximize", n.clone().unwrap_or_default())
+                        }
+                        CommandKind::Minimize { name: n, .. } => {
+                            ("minimize", n.clone().unwrap_or_default())
+                        }
                     };
                     println!("{i:02}. {kind:<6} {name}");
                 }
@@ -283,10 +293,14 @@ impl Session {
             match self.sols.get(name) {
                 Some(s) => {
                     let st = if s.sat { "SAT" } else { "UNSAT" };
+                    let cost = s
+                        .cost
+                        .map(|c| format!(" cost={c}"))
+                        .unwrap_or_default();
                     if s.from_cnf.is_empty() {
-                        println!("{mark} {name}  {st} (from :eval)");
+                        println!("{mark} {name}  {st}{cost} (from :eval)");
                     } else {
-                        println!("{mark} {name}  {st} <- {}", s.from_cnf);
+                        println!("{mark} {name}  {st}{cost} <- {}", s.from_cnf);
                     }
                 }
                 None => println!("{mark} {name}  (gone)"),
@@ -463,6 +477,7 @@ impl Session {
         from_cnf: &str,
         sat: bool,
         instance: Option<Instance>,
+        cost: Option<i64>,
     ) -> String {
         match want {
             Some(n) => {
@@ -475,6 +490,7 @@ impl Session {
                     StoredSol {
                         sat,
                         instance,
+                        cost,
                         from_cnf: from_cnf.to_string(),
                     },
                 );
@@ -497,6 +513,7 @@ impl Session {
                     StoredSol {
                         sat,
                         instance,
+                        cost,
                         from_cnf: from_cnf.to_string(),
                     },
                 );
@@ -610,11 +627,124 @@ impl Session {
             Ok(inst) => {
                 let sat = inst.is_some();
                 self.print_solution(&inst, cnf.is_check());
-                let sol_name = self.store_sol(as_name, &cnf_name, sat, inst);
+                let sol_name = self.store_sol(as_name, &cnf_name, sat, inst, None);
                 println!("saved solution `{sol_name}` <- `{cnf_name}` *default");
             }
             Err(e) => println!("solve error: {e}"),
         }
+    }
+
+    /// Optimize over a stored Cnf (`:max`/`:min`/`:maxw`/`:minw`).
+    /// Prints the optimum cost with the model and saves the solution
+    /// (with cost) under `as_name` or an auto name.
+    fn do_optimize(&mut self, target: OptTarget, cnf_arg: Option<&str>, as_name: Option<&str>) {
+        if let Some(n) = as_name {
+            if !is_valid_name(n) {
+                println!("bad name `{n}` (use [A-Za-z0-9_.#-]+)");
+                return;
+            }
+        }
+        let module = match &self.module {
+            Some(m) => m,
+            None => {
+                println!("no module loaded");
+                return;
+            }
+        };
+        let cnf_name = match cnf_arg {
+            Some(n) => n.to_string(),
+            None => match self.default_cnf_name() {
+                Some(n) => n,
+                None => {
+                    println!("no cnf selected (use :run|:check first, :cnfs to list)");
+                    return;
+                }
+            },
+        };
+        let cnf = match self.resolve_cnf(&cnf_name) {
+            Some(c) => c.clone(),
+            None => {
+                println!("no cnf named `{cnf_name}` (:cnfs to list)");
+                return;
+            }
+        };
+        match optimize(module, &cnf, &target) {
+            Ok(sol) => {
+                self.print_store_opt_solution(sol, &cnf_name, as_name);
+            }
+            Err(e) => println!("optimize error: {e}"),
+        }
+    }
+
+    /// Run a stored maximize/minimize (or soft-bearing run/check) command
+    /// through the optimizer (`:optimize` and bare `minimize <ref>`).
+    fn do_optimize_command(&mut self, target: Option<&str>, as_name: Option<&str>) {
+        if let Some(n) = as_name {
+            if !is_valid_name(n) {
+                println!("bad name `{n}` (use [A-Za-z0-9_.#-]+)");
+                return;
+            }
+        }
+        let module = match &self.module {
+            Some(m) => m,
+            None => {
+                println!("no module loaded");
+                return;
+            }
+        };
+        let idx = match self.resolve_index(target) {
+            Ok(i) => i,
+            Err(e) => {
+                println!("{e}");
+                return;
+            }
+        };
+        if !command_needs_opt(module, idx) {
+            println!("command is a plain run/check (no optimum to find; use :solve)");
+            return;
+        }
+        // Label for the saved solution: explicit `as` name, else the
+        // command name (or index) with an `opt` marker.
+        let from_label = match module.commands.get(idx) {
+            Some(c) => match &c.kind {
+                CommandKind::Maximize { name: n, .. } | CommandKind::Minimize { name: n, .. } => {
+                    n.clone().unwrap_or_else(|| format!("opt{idx}"))
+                }
+                _ => format!("opt{idx}"),
+            },
+            None => format!("opt{idx}"),
+        };
+        match run_opt_command(module, idx) {
+            Ok(sol) => {
+                self.print_store_opt_solution(sol, &from_label, as_name);
+            }
+            Err(e) => println!("optimize error: {e}"),
+        }
+    }
+
+    /// Print an optimization result and save it as a solution.
+    /// `from_label` names the origin (a Cnf name, or a command label for
+    /// `:optimize`, which carries no Cnf context like `:eval` solutions).
+    fn print_store_opt_solution(
+        &mut self,
+        sol: OptSolution,
+        from_label: &str,
+        as_name: Option<&str>,
+    ) {
+        if sol.satisfiable {
+            match sol.cost {
+                Some(c) => println!("SAT -- optimum found: cost={c}"),
+                None => println!("SAT -- optimum found"),
+            }
+            if let Some(ref inst) = sol.instance {
+                println!("{}", fmt::instance_alloy(inst));
+            }
+        } else {
+            println!("UNSAT -- no model (empty)");
+        }
+        let sat = sol.satisfiable;
+        let sol_name = self.store_sol(as_name, from_label, sat, sol.instance, sol.cost);
+        println!("saved solution `{sol_name}` <- `{from_label}` *default");
     }
 
     fn do_eval_text(&mut self, expr: &str, save_as: Option<&str>) {
@@ -633,7 +763,7 @@ impl Session {
                 self.print_solution(&sol.instance, false);
                 if let Some(n) = save_as {
                     let sat = sol.satisfiable;
-                    let name = self.store_sol(Some(n), "", sat, sol.instance);
+                    let name = self.store_sol(Some(n), "", sat, sol.instance, None);
                     println!("saved solution `{name}` (from :eval; no Cnf context) *default");
                 }
             }
@@ -892,7 +1022,7 @@ impl Session {
                 Ok(inst) => {
                     self.print_solution(&inst, cnf.is_check());
                     let sat = inst.is_some();
-                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst);
+                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None);
                     println!("saved solution `{name}` <- `{cnf_name}` *default");
                 }
                 Err(e) => println!("solve error: {e}"),
@@ -913,7 +1043,7 @@ impl Session {
                 Ok(inst) => {
                     self.print_solution(&inst, cnf.is_check());
                     let sat = inst.is_some();
-                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst);
+                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None);
                     println!("saved solution `{name}` <- `{cnf_name}` *default");
                 }
                 Err(e) => println!("solve error: {e}"),
@@ -991,7 +1121,7 @@ impl Session {
                 Ok(inst) => {
                     self.print_solution(&inst, cnf.is_check());
                     let sat = inst.is_some();
-                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst);
+                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None);
                     println!("saved solution `{name}` <- `{cnf_name}` *default");
                 }
                 Err(e) => println!("solve error: {e}"),
@@ -1013,7 +1143,7 @@ impl Session {
                 Ok(inst) => {
                     self.print_solution(&inst, cnf.is_check());
                     let sat = inst.is_some();
-                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst);
+                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None);
                     println!("saved solution `{name}` <- `{cnf_name}` *default");
                 }
                 Err(e) => println!("solve error: {e}"),
@@ -1230,6 +1360,8 @@ fn print_help() {
     println!("  :run <i|name> [as <cnf>]    build Cnf, save it (auto: command name, else run0..)");
     println!("  :check <i|name> [as <cnf>]  build negated Cnf, save it");
     println!("  :solve [<cnf>] [as <sol>]   solve named Cnf (no arg = *default), save solution");
+    println!("  :optimize [<i|name>] [as <sol>]  run a stored maximize/minimize command, save optimum");
+    println!("  minimize ... / maximize ... (bare line: reference runs optimizer, else a model fragment)");
     println!("  :query <expr> [in <sol>]    evaluate against named solution (no in = *default)");
     println!("                              sets print as tuples, int exprs (`#A`) as numbers");
     println!("    NOTE: `in` collides with Alloy `in`; the trailing `in <sol>` is used only");
@@ -1238,6 +1370,12 @@ fn print_help() {
     println!("  :validate <sol> [in <cnf>]  validate solution vs Cnf (no in = its origin Cnf)");
     println!("  :show [name] [N]            show Cnf clauses and/or solution (no arg = defaults)");
     println!("  :eval <expr> [as <sol>]     satisfiability check (bare expr lifts with some)");
+    println!("  :max <intexpr> [in <cnf>] [as <sol>]   maximize int expr, save optimum+cost");
+    println!("  :min <intexpr> [in <cnf>] [as <sol>]   minimize int expr, save optimum+cost");
+    println!("  :maxw <r>:<w>[, ...] [in <cnf>] [as <sol>]  maximize Σ w·#r");
+    println!("  :minw <r>:<w>[, ...] [in <cnf>] [as <sol>]  minimize Σ w·#r");
+    println!("    NOTE: trailing `in <cnf>` is used only when <cnf> names a stored");
+    println!("    Cnf, else the whole text is the target.");
     println!("  <expr>                    bare line: :eval in eval mode, :query in query");
     println!("                            mode (never stored; switch via :mode)");
     println!("commands:");
@@ -1356,6 +1494,71 @@ fn split_query_in<'a>(sess: &Session, body: &'a str) -> (&'a str, Option<&'a str
         }
     }
     (body, None)
+}
+
+/// Split a trailing `kw <single-token>` off raw text: (head, name).
+/// Returns (raw, None) when the tail does not match.
+fn split_trailing_kw<'a>(raw: &'a str, kw: &str) -> (&'a str, Option<&'a str>) {
+    let toks: Vec<&str> = raw.split_whitespace().collect();
+    if toks.len() >= 2 && toks[toks.len() - 2] == kw {
+        let name = toks[toks.len() - 1];
+        let pat = format!(" {kw} ");
+        if let Some((cut, _)) = raw.rmatch_indices(pat.as_str()).next() {
+            let head = raw[..cut].trim();
+            if !head.is_empty() {
+                return (head, Some(name));
+            }
+        }
+    }
+    (raw, None)
+}
+
+/// Split a `:max`/`:min`/`:maxw`/`:minw` body into (target, cnf, sol).
+/// Forms: `<target> [in <cnf>] [as <sol>]`. The trailing `in <cnf>` is
+/// honored only when `<cnf>` names a stored Cnf (disambiguates Alloy `in`).
+fn split_opt_args<'a>(
+    sess: &Session,
+    raw: &'a str,
+) -> Option<(&'a str, Option<&'a str>, Option<&'a str>)> {
+    if raw.is_empty() {
+        return None;
+    }
+    let (no_as, as_name) = split_trailing_kw(raw, "as");
+    if let Some(n) = as_name {
+        if !is_valid_name(n) {
+            return None;
+        }
+    }
+    let (target, cnf_name) = {
+        let (head, cand) = split_trailing_kw(no_as, "in");
+        match cand {
+            Some(c) if sess.cnfs.contains_key(c) => (head, Some(c)),
+            _ => (no_as, None),
+        }
+    };
+    if target.is_empty() {
+        return None;
+    }
+    Some((target, cnf_name, as_name))
+}
+
+/// Parse a `:maxw`/`:minw` weight list `R1: w1, R2: w2, ...`.
+fn parse_weights_arg(text: &str) -> Option<Vec<(String, i64)>> {
+    let mut out = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        let (name, w) = part.split_once(':')?;
+        let name = name.trim();
+        if name.is_empty() || !is_valid_name(name) {
+            return None;
+        }
+        let w: i64 = w.trim().parse().ok()?;
+        out.push((name.to_string(), w));
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
 }
 
 /// Split `:psave` args into (file, sol, rels).
@@ -1654,6 +1857,50 @@ fn main() {
                         sess.do_solve(head.first().copied(), as_name);
                     }
                 }
+                "optimize" => {
+                    let (head, as_name) = split_as(&rest);
+                    if as_name == Some("__bad_as__") || head.len() > 1 {
+                        println!("usage: :optimize [<index|name>] [as <sol>]");
+                    } else {
+                        sess.do_optimize_command(head.first().copied(), as_name);
+                    }
+                }
+                "max" | "min" => {
+                    let raw = body[cmd.len()..].trim();
+                    let usage = "usage: :max|:min <intexpr> [in <cnf>] [as <sol>]";
+                    match split_opt_args(&sess, raw) {
+                        None => println!("{usage}"),
+                        Some((expr, cnf, sol)) => match parse_int_expr(expr) {
+                            Err(e) => println!("int expr error: {e}"),
+                            Ok(ie) => {
+                                let sense = if cmd == "max" {
+                                    KkOptSense::Maximize
+                                } else {
+                                    KkOptSense::Minimize
+                                };
+                                sess.do_optimize(OptTarget::Int(ie, sense), cnf, sol);
+                            }
+                        },
+                    }
+                }
+                "maxw" | "minw" => {
+                    let raw = body[cmd.len()..].trim();
+                    let usage = "usage: :maxw|:minw <rel>:<w>[, ...] [in <cnf>] [as <sol>]";
+                    match split_opt_args(&sess, raw) {
+                        None => println!("{usage}"),
+                        Some((list, cnf, sol)) => match parse_weights_arg(list) {
+                            None => println!("{usage}"),
+                            Some(pairs) => {
+                                let sense = if cmd == "maxw" {
+                                    KkOptSense::Maximize
+                                } else {
+                                    KkOptSense::Minimize
+                                };
+                                sess.do_optimize(OptTarget::Weights(pairs, sense), cnf, sol);
+                            }
+                        },
+                    }
+                }
                 "validate" | "v" => {
                     let (sol, cnf) = split_validate(&rest);
                     if sol == Some("__bad__") {
@@ -1834,6 +2081,26 @@ fn main() {
                 start_or_submit(&mut sess, InputKind::Decl, trimmed, None);
             } else if sess.module.is_some() && sess.resolve_index(arg_owned.as_deref()).is_ok() {
                 sess.do_build(kind, arg_owned.as_deref(), as_name);
+            } else if sess.module.is_none() {
+                println!("no module loaded");
+            } else {
+                start_or_submit(&mut sess, InputKind::Decl, trimmed, None);
+            }
+            continue;
+        }
+
+        // Bare `minimize`/`maximize`: optimize when it names a stored
+        // optimization command, else a model fragment (mirrors run/check).
+        if head == "minimize" || head == "maximize" {
+            let toks: Vec<&str> = trimmed.split_whitespace().collect();
+            // toks[0] is minimize|maximize; support optional trailing `as <sol>`.
+            let tail = &toks[1..];
+            let (head_t, as_name) = split_as(tail);
+            let arg_owned: Option<String> = head_t.first().map(|s| s.to_string());
+            if as_name == Some("__bad_as__") || head_t.len() > 1 {
+                start_or_submit(&mut sess, InputKind::Decl, trimmed, None);
+            } else if sess.module.is_some() && sess.resolve_index(arg_owned.as_deref()).is_ok() {
+                sess.do_optimize_command(arg_owned.as_deref(), as_name);
             } else if sess.module.is_none() {
                 println!("no module loaded");
             } else {

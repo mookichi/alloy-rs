@@ -3,7 +3,7 @@
 //! Usage: cargo run -p alloy-front-rs --release --example als_solve -- \
 //!          <file.als> [command-name | command-index] [--timing] [--help]
 
-use alloy_front_rs::{parse_and_run_timed, parse_module, run_command, CommandKind};
+use alloy_front_rs::{parse_and_run_timed, parse_module, run_command, run_opt_command, CommandKind};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -86,19 +86,46 @@ fn main() {
         let mut total_solve = std::time::Duration::ZERO;
 
         for (i, cmd) in module.commands.iter().enumerate() {
-            let name = match &cmd.kind {
-                CommandKind::Run(n) => n.clone().unwrap_or_else(|| format!("run${}", i + 1)),
-                CommandKind::Check(n) => n.clone().unwrap_or_else(|| format!("check${}", i + 1)),
+            let (name, kind) = match &cmd.kind {
+                CommandKind::Run(n) => (
+                    n.clone().unwrap_or_else(|| format!("run${}", i + 1)),
+                    "run",
+                ),
+                CommandKind::Check(n) => (
+                    n.clone().unwrap_or_else(|| format!("check${}", i + 1)),
+                    "check",
+                ),
+                CommandKind::Maximize { name: n, .. } => (
+                    n.clone().unwrap_or_else(|| format!("maximize${}", i + 1)),
+                    "maximize",
+                ),
+                CommandKind::Minimize { name: n, .. } => (
+                    n.clone().unwrap_or_else(|| format!("minimize${}", i + 1)),
+                    "minimize",
+                ),
             };
-            let kind = if matches!(cmd.kind, CommandKind::Run(_)) {
-                "run"
-            } else {
-                "check"
-            };
+            let is_opt = matches!(
+                cmd.kind,
+                CommandKind::Maximize { .. } | CommandKind::Minimize { .. }
+            );
             if let Some(p) = &pick {
                 if **p != name && p.parse::<usize>().map(|k| k != i).unwrap_or(true) {
                     continue;
                 }
+            }
+            if is_opt || alloy_front_rs::command_needs_opt(&module, i) {
+                match run_opt_command(&module, i) {
+                    Ok(sol) => {
+                        let tag = if sol.satisfiable { "SAT" } else { "UNSAT" };
+                        let models = if sol.satisfiable { "1/1" } else { "0" };
+                        let cost = sol.cost.map(|c| format!(" cost={c}")).unwrap_or_default();
+                        println!("{i:02}. {kind:<8} {name:<20} {models} {tag}{cost}");
+                    }
+                    Err(e) => {
+                        println!("{i:02}. {kind:<8} {name:<20} !{e}");
+                    }
+                }
+                continue;
             }
             let timed = parse_and_run_timed(&text, i);
             total_parse += timed.parse;
@@ -135,19 +162,46 @@ fn main() {
             }
         };
         for (i, cmd) in module.commands.iter().enumerate() {
-            let name = match &cmd.kind {
-                CommandKind::Run(n) => n.clone().unwrap_or_else(|| format!("run${}", i + 1)),
-                CommandKind::Check(n) => n.clone().unwrap_or_else(|| format!("check${}", i + 1)),
+            let (name, kind) = match &cmd.kind {
+                CommandKind::Run(n) => (
+                    n.clone().unwrap_or_else(|| format!("run${}", i + 1)),
+                    "run",
+                ),
+                CommandKind::Check(n) => (
+                    n.clone().unwrap_or_else(|| format!("check${}", i + 1)),
+                    "check",
+                ),
+                CommandKind::Maximize { name: n, .. } => (
+                    n.clone().unwrap_or_else(|| format!("maximize${}", i + 1)),
+                    "maximize",
+                ),
+                CommandKind::Minimize { name: n, .. } => (
+                    n.clone().unwrap_or_else(|| format!("minimize${}", i + 1)),
+                    "minimize",
+                ),
             };
-            let kind = if matches!(cmd.kind, CommandKind::Run(_)) {
-                "run"
-            } else {
-                "check"
-            };
+            let is_opt = matches!(
+                cmd.kind,
+                CommandKind::Maximize { .. } | CommandKind::Minimize { .. }
+            );
             if let Some(p) = &pick {
                 if **p != name && p.parse::<usize>().map(|k| k != i).unwrap_or(true) {
                     continue;
                 }
+            }
+            if is_opt || alloy_front_rs::command_needs_opt(&module, i) {
+                match run_opt_command(&module, i) {
+                    Ok(sol) => {
+                        let tag = if sol.satisfiable { "SAT" } else { "UNSAT" };
+                        let models = if sol.satisfiable { "1/1" } else { "0" };
+                        let cost = sol.cost.map(|c| format!(" cost={c}")).unwrap_or_default();
+                        println!("{i:02}. {kind:<8} {name:<20} {models} {tag}{cost}");
+                    }
+                    Err(e) => {
+                        println!("{i:02}. {kind:<8} {name:<20} !{e}");
+                    }
+                }
+                continue;
             }
             match run_command(&module, i) {
                 Ok(sol) => {

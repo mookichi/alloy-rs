@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
 use crate::ast::{AstArena, ConstantExpr, ExprNode, FormulaNode, Multiplicity, Quantifier, VarId};
@@ -21,6 +22,119 @@ pub struct FolTranslator<'a> {
     leaves: HashMap<RelationId, Rc<BooleanMatrix>>,
     bitwidth: u32,
     origins: Vec<VarOrigin>,
+    /// Translation counters (reported under `ALLOY_TIMING`).
+    pub stats: FolStats,
+    /// (Expression, bound-variable-values) → matrix memo. Quantifier
+    /// bodies rebuild identical join/union subcircuits per binding
+    /// (e.g. `c1.lectures` is rebuilt per enclosing binding although it
+    /// only depends on `c1`); memoizing collapses them. Sound: the matrix
+    /// is a pure function of the inputs. Keys project the environment
+    /// onto the expression's free variables.
+    matrix_memo: HashMap<MemoKey, Rc<BooleanMatrix>, BuildHasherDefault<Fnv>>,
+    /// Free-variable sets per ExprId (memoized). `None` = conservative
+    /// (all env entries participate in the key).
+    free_memo: HashMap<u32, Option<Vec<u32>>>,
+    /// (Formula, free-env-values) → BoolRef memo. Nested quantifiers
+    /// whose free variables are a strict subset of the enclosing
+    /// bindings (e.g. `some l1,l2: Lecture` inside `all stu,c1,c2`
+    /// depending only on `(c1,c2)`) are translated once per distinct
+    /// value combination instead of once per enclosing iteration.
+    formula_memo: HashMap<MemoKey, BoolRef, BuildHasherDefault<Fnv>>,
+    /// Free-variable sets per FormulaId (memoized).
+    ffree_memo: HashMap<u32, Option<Vec<u32>>>,
+    /// Matrix/formula memo hit/miss counters.
+    pub memo_hits: u64,
+    pub memo_miss: u64,
+    /// Translation-collected soft unit sources (AlloyMax `maxsome` /
+    /// `minsome` / `soft fact`). Each entry is maximized by the
+    /// core-guided loop; the hard translation contributes `true`.
+    pub softs: Vec<SoftEntry>,
+}
+
+/// One collected soft: circuit root plus maximize-direction weight.
+#[derive(Clone, Copy, Debug)]
+pub struct SoftEntry {
+    pub root: BoolRef,
+    pub weight: i64,
+    /// True for `minsome` cells: the loop maximizes the negation, and
+    /// cost accounting complements the model value back.
+    pub minimize: bool,
+}
+
+/// Zero-dependency FNV-1a hasher for the translation memos (std
+/// `HashMap` uses SipHash, measurably slower at millions of lookups).
+#[derive(Default)]
+struct Fnv(u64);
+
+impl Hasher for Fnv {
+    fn write(&mut self, bytes: &[u8]) {
+        const PRIME: u64 = 0x100000001b3;
+        let mut h = if self.0 == 0 {
+            0xcbf29ce484222325
+        } else {
+            self.0
+        };
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(PRIME);
+        }
+        self.0 = h;
+    }
+
+    fn finish(&self) -> u64 {
+        if self.0 == 0 {
+            0xcbf29ce484222325
+        } else {
+            self.0
+        }
+    }
+}
+
+/// Memo key: expression id + FREE bound-variable values.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MemoKey {
+    expr: u32,
+    env: Vec<(u32, Vec<u32>)>,
+}
+
+impl MemoKey {
+    /// `free`: sorted free-var ids of the expression (`None` = all).
+    fn new(e: crate::ast::ExprId, env: &[(VarId, Vec<u32>)], free: Option<&[u32]>) -> MemoKey {
+        let env = match free {
+            Some(set) => env
+                .iter()
+                .filter(|(v, _)| set.binary_search(&v.0).is_ok())
+                .map(|(v, x)| (v.0, x.clone()))
+                .collect(),
+            None => env.iter().map(|(v, x)| (v.0, x.clone())).collect(),
+        };
+        MemoKey { expr: e.0, env }
+    }
+
+    /// Formula variant (separate id namespace, separate map).
+    fn new_formula(
+        f: crate::ast::FormulaId,
+        env: &[(VarId, Vec<u32>)],
+        free: Option<&[u32]>,
+    ) -> MemoKey {
+        let env = match free {
+            Some(set) => env
+                .iter()
+                .filter(|(v, _)| set.binary_search(&v.0).is_ok())
+                .map(|(v, x)| (v.0, x.clone()))
+                .collect(),
+            None => env.iter().map(|(v, x)| (v.0, x.clone())).collect(),
+        };
+        MemoKey { expr: f.0, env }
+    }
+}
+
+/// Translation counters (reported under `ALLOY_TIMING`).
+#[derive(Default, Debug, Clone, Copy)]
+pub struct FolStats {
+    pub matrix_join: u64,
+    pub quant_bodies: u64,
+    pub formula_refs: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,11 +192,63 @@ impl<'a> FolTranslator<'a> {
             leaves: HashMap::new(),
             bitwidth: 4,
             origins: Vec::new(),
+            stats: FolStats::default(),
+            matrix_memo: HashMap::default(),
+            free_memo: HashMap::new(),
+            formula_memo: HashMap::default(),
+            ffree_memo: HashMap::new(),
+            memo_hits: 0,
+            memo_miss: 0,
+            softs: Vec::new(),
         }
+    }
+
+    /// Sorted free-variable ids of an expression. `None` = conservative
+    /// fallback (anything beyond plain relation/variable/constant/atom
+    /// nodes and boolean-algebra connectives).
+    fn free_vars_of(&mut self, arena: &AstArena, e: crate::ast::ExprId) -> Option<Vec<u32>> {
+        if let Some(v) = self.free_memo.get(&e.0) {
+            return v.clone();
+        }
+        let out: Option<Vec<u32>> = match arena.expr(e) {
+            ExprNode::Variable(v) => Some(vec![v.0]),
+            ExprNode::Relation(_) | ExprNode::Constant(_) | ExprNode::Atoms(_) => {
+                Some(Vec::new())
+            }
+            ExprNode::Unary { child, .. } => self.free_vars_of(arena, *child),
+            ExprNode::Binary { left, right, .. } => {
+                let mut l = self.free_vars_of(arena, *left)?;
+                let r = self.free_vars_of(arena, *right)?;
+                l.extend(r);
+                l.sort_unstable();
+                l.dedup();
+                Some(l)
+            }
+            ExprNode::Nary { children, .. } => {
+                let mut acc = Vec::new();
+                for &c in children {
+                    acc.extend(self.free_vars_of(arena, c)?);
+                }
+                acc.sort_unstable();
+                acc.dedup();
+                Some(acc)
+            }
+            _ => None,
+        };
+        self.free_memo.insert(e.0, out.clone());
+        out
     }
 
     pub fn var_origins(&self) -> &[VarOrigin] {
         &self.origins
+    }
+
+    /// Materializes the leaf circuit for `r` if absent. Used by the
+    /// optimizer to give weighted relations primary slots even when the
+    /// formula never mentions them (origins are otherwise only recorded
+    /// for relations visited during translation).
+    pub fn ensure_relation(&mut self, r: RelationId) -> Result<(), TranslateError> {
+        self.leaf_relation(r).map(|_| ())
     }
 
     pub fn materialize(&self, truth: impl Fn(u32) -> bool) -> crate::instance::Instance {
@@ -198,6 +364,40 @@ impl<'a> FolTranslator<'a> {
         e: crate::ast::ExprId,
         env: &[(VarId, Vec<u32>)],
     ) -> Result<Rc<BooleanMatrix>, TranslateError> {
+        // Memoize composite nodes by (expression, free env values).
+        // Leaves (Relation/Variable/Constant/Atoms) are cheap or cached.
+        // `ALLOY_NOMATRIXMEMO=1` disables the matrix memo (diagnostics).
+        let no_mmemo = std::env::var_os("ALLOY_NOMATRIXMEMO").is_some();
+        let memoize = !no_mmemo
+            && matches!(
+                arena.expr(e),
+                ExprNode::Binary { .. }
+                    | ExprNode::Nary { .. }
+                    | ExprNode::Unary { .. }
+                    | ExprNode::If { .. }
+                    | ExprNode::Comprehension { .. }
+            );
+        if memoize {
+            let free = self.free_vars_of(arena, e);
+            let key = MemoKey::new(e, env, free.as_deref());
+            if let Some(m) = self.matrix_memo.get(&key) {
+                self.memo_hits += 1;
+                return Ok(Rc::clone(m));
+            }
+            self.memo_miss += 1;
+            let m = self.expr_matrix_uncached(arena, e, env)?;
+            self.matrix_memo.insert(key, Rc::clone(&m));
+            return Ok(m);
+        }
+        self.expr_matrix_uncached(arena, e, env)
+    }
+
+    fn expr_matrix_uncached(
+        &mut self,
+        arena: &AstArena,
+        e: crate::ast::ExprId,
+        env: &[(VarId, Vec<u32>)],
+    ) -> Result<Rc<BooleanMatrix>, TranslateError> {
         match arena.expr(e).clone() {
             ExprNode::Relation(r) => self.leaf_relation(r),
             ExprNode::Variable(v) => {
@@ -245,7 +445,10 @@ impl<'a> FolTranslator<'a> {
                     }),
                     Override => a.override_values(&b)?,
                     Product => a.cross(&b)?,
-                    Join => a.join(&b)?,
+                    Join => {
+                        self.stats.matrix_join += 1;
+                        a.join(&b)?
+                    }
                 };
                 Ok(Rc::new(out))
             }
@@ -262,7 +465,10 @@ impl<'a> FolTranslator<'a> {
                         }
                         Override => self.pointwise(&acc, &m, |ctx, x, y| ctx.ite(y, y, x)),
                         Product => acc.cross(&m)?,
-                        Join => acc.join(&m)?,
+                        Join => {
+                            self.stats.matrix_join += 1;
+                            acc.join(&m)?
+                        }
                     };
                 }
                 Ok(Rc::new(acc))
@@ -497,6 +703,95 @@ impl<'a> FolTranslator<'a> {
         f: crate::ast::FormulaId,
         env: &[(VarId, Vec<u32>)],
     ) -> Result<BoolRef, TranslateError> {
+        self.stats.formula_refs += 1;
+        // Memoize composite formulas by (formula, free env values):
+        // repeated nested expansions under different outer bindings
+        // collapse to one translation each.
+        // `ALLOY_NOFORMULAMEMO=1` disables the formula memo (diagnostics).
+        let no_fmemo = std::env::var_os("ALLOY_NOFORMULAMEMO").is_some();
+        let memoize = !no_fmemo && !matches!(arena.formula(f), FormulaNode::Constant(_));
+        if memoize {
+            let free = self.ffree_vars_of(arena, f);
+            let key = MemoKey::new_formula(f, env, free.as_deref());
+            if let Some(&b) = self.formula_memo.get(&key) {
+                self.memo_hits += 1;
+                return Ok(b);
+            }
+            self.memo_miss += 1;
+            let b = self.formula_ref_uncached(arena, f, env)?;
+            self.formula_memo.insert(key, b);
+            return Ok(b);
+        }
+        self.formula_ref_uncached(arena, f, env)
+    }
+
+    /// Sorted free-variable ids of a formula. `None` = conservative
+    /// fallback (quantifier domains included: omitting them collapses
+    /// distinct instantiations — see `fol_memo` regression test).
+    fn ffree_vars_of(
+        &mut self,
+        arena: &AstArena,
+        f: crate::ast::FormulaId,
+    ) -> Option<Vec<u32>> {
+        if let Some(v) = self.ffree_memo.get(&f.0) {
+            return v.clone();
+        }
+        let out: Option<Vec<u32>> = match arena.formula(f) {
+            FormulaNode::Constant(_) => Some(Vec::new()),
+            FormulaNode::Not(c) => self.ffree_vars_of(arena, *c),
+            FormulaNode::Nary { children, .. } => {
+                let mut acc = Vec::new();
+                for &c in children {
+                    acc.extend(self.ffree_vars_of(arena, c)?);
+                }
+                acc.sort_unstable();
+                acc.dedup();
+                Some(acc)
+            }
+            FormulaNode::Comparison { left, right, .. } => {
+                let mut l = self.free_vars_of(arena, *left)?;
+                let r = self.free_vars_of(arena, *right)?;
+                l.extend(r);
+                l.sort_unstable();
+                l.dedup();
+                Some(l)
+            }
+            FormulaNode::Multiplicity { expr, .. } => self.free_vars_of(arena, *expr),
+            // Soft nodes are transparent for free variables.
+            FormulaNode::MaxSome(e) | FormulaNode::MinSome(e) => {
+                self.free_vars_of(arena, *e)
+            }
+            FormulaNode::SoftFact(inner) => self.ffree_vars_of(arena, *inner),
+            FormulaNode::Quantified { decls, body, .. } => {
+                // Free vars = body frees + DOMAIN frees, minus bound vars.
+                // Dropping the domain part (e.g. `stu` in
+                // `all c1: stu.courses | ...`) collapses distinct
+                // instantiations: unsound sharing. A domain with
+                // uncomputable frees poisons the whole set (full env).
+                let mut acc = self.ffree_vars_of(arena, *body)?;
+                let mut bound = Vec::new();
+                for d in arena.decls(*decls) {
+                    bound.push(d.variable.0);
+                    acc.extend(self.free_vars_of(arena, d.expr)?);
+                }
+                acc.sort_unstable();
+                acc.dedup();
+                acc.retain(|v| !bound.contains(v));
+                self.ffree_memo.insert(f.0, Some(acc.clone()));
+                return Some(acc);
+            }
+            _ => None,
+        };
+        self.ffree_memo.insert(f.0, out.clone());
+        out
+    }
+
+    fn formula_ref_uncached(
+        &mut self,
+        arena: &AstArena,
+        f: crate::ast::FormulaId,
+        env: &[(VarId, Vec<u32>)],
+    ) -> Result<BoolRef, TranslateError> {
         match arena.formula(f).clone() {
             FormulaNode::Constant(v) => Ok(if v { const_true() } else { const_false() }),
             FormulaNode::Not(child) => {
@@ -577,6 +872,7 @@ impl<'a> FolTranslator<'a> {
                 let decl_list = arena.decls(decls).to_vec();
                 let mut refs: Vec<BoolRef> = Vec::new();
                 self.iter_decls(arena, &decl_list, env, &mut |this, binding, lits| {
+                    this.stats.quant_bodies += 1;
                     let body = this.formula_ref(arena, body, &binding)?;
                     let ref_ = if lits.is_empty() {
                         body
@@ -624,6 +920,49 @@ impl<'a> FolTranslator<'a> {
                         got: 0,
                     }),
                 }
+            }
+            // Soft sources (AlloyMax): record unit softs, yield true.
+            // Constant cells fold (always-earned / never-earned need no
+            // soft); MinSome records negated lits so the loop uniformly
+            // maximizes.
+            FormulaNode::MaxSome(e) => {
+                let m = self.expr_matrix(arena, e, env)?;
+                for (_, cell) in m.iter() {
+                    if cell == const_false() || cell == const_true() {
+                        continue;
+                    }
+                    self.softs.push(SoftEntry {
+                        root: cell,
+                        weight: 1,
+                        minimize: false,
+                    });
+                }
+                Ok(const_true())
+            }
+            FormulaNode::MinSome(e) => {
+                let m = self.expr_matrix(arena, e, env)?;
+                for (_, cell) in m.iter() {
+                    if cell == const_false() || cell == const_true() {
+                        continue;
+                    }
+                    self.softs.push(SoftEntry {
+                        root: self.ctx.not(cell),
+                        weight: 1,
+                        minimize: true,
+                    });
+                }
+                Ok(const_true())
+            }
+            FormulaNode::SoftFact(inner) => {
+                let g = self.formula_ref(arena, inner, env)?;
+                if !g.is_const() {
+                    self.softs.push(SoftEntry {
+                        root: g,
+                        weight: 1,
+                        minimize: false,
+                    });
+                }
+                Ok(const_true())
             }
             FormulaNode::TemporalUnary { .. } => Err(TranslateError::UnsupportedTemporal),
             FormulaNode::TemporalBinary { .. } => Err(TranslateError::UnsupportedTemporal),

@@ -7,6 +7,7 @@ use alloy_kodkod_rs::ast::{
     self as kk, CastToIntOp, ExprCompOp, ExprId, FormulaId, IntId, Multiplicity, Quantifier,
 };
 use alloy_kodkod_rs::bounds::Bounds;
+use alloy_kodkod_rs::opt::OptSense;
 use alloy_kodkod_rs::relation::{RelationId, RelationPool};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,27 @@ pub struct LoweredProblem {
     pub bounds: Bounds,
     pub formula: FormulaId,
     pub bitwidth: u32,
+    /// Some for `maximize`/`minimize` commands.
+    pub objective: Option<LoweredOpt>,
+    /// True when the lowered formula contains AlloyMax soft nodes
+    /// (`maxsome` / `minsome` / `soft fact`). Such problems must run
+    /// through the optimizer, never the plain SAT path.
+    pub has_softs: bool,
+}
+
+/// Lowered optimization target of a `maximize`/`minimize` command.
+#[derive(Debug, Clone)]
+pub struct LoweredOpt {
+    pub sense: OptSense,
+    pub target: LoweredTarget,
+}
+
+/// Lowered optimization target: an integer expression id or resolved
+/// relation weights.
+#[derive(Debug, Clone)]
+pub enum LoweredTarget {
+    Int(IntId),
+    Weighted(HashMap<RelationId, i64>),
 }
 
 pub struct Lowerer<'m> {
@@ -45,8 +67,46 @@ impl<'m> Lowerer<'m> {
         // Clone up front: the setup closure below borrows `self` mutably.
         let scope = cmd.scope.clone();
         let kind = cmd.kind.clone();
-        let (arena, bounds, bitwidth, formula) = self.with_setup(&scope, |ctx, arena, _bounds, mut parts| {
-            // global facts
+        let opt_spec = match &kind {
+            CommandKind::Maximize { objective, .. } | CommandKind::Minimize { objective, .. } => {
+                Some(objective.clone())
+            }
+            CommandKind::Run(_) | CommandKind::Check(_) => None,
+        };
+        let opt_sense = match &kind {
+            CommandKind::Maximize { .. } => Some(OptSense::Maximize),
+            CommandKind::Minimize { .. } => Some(OptSense::Minimize),
+            CommandKind::Run(_) | CommandKind::Check(_) => None,
+        };
+        // Soft-bearing commands must run through the optimizer: a
+        // `maximize`/`minimize` command, a `soft fact`, or a `maxsome` /
+        // `minsome` node anywhere in the facts or command body.
+        let body_soft = match &kind {
+            CommandKind::Run(None)
+            | CommandKind::Check(None)
+            | CommandKind::Maximize { name: None, .. }
+            | CommandKind::Minimize { name: None, .. } => false,
+            CommandKind::Run(Some(name))
+            | CommandKind::Check(Some(name))
+            | CommandKind::Maximize { name: Some(name), .. }
+            | CommandKind::Minimize { name: Some(name), .. } => self
+                .module
+                .paras
+                .iter()
+                .find(|p| &p.name == name)
+                .map(|p| p.body.has_soft())
+                .unwrap_or(false),
+        };
+        let has_softs = !self.module.soft_facts.is_empty()
+            || self.module.facts.iter().any(|(_, f)| f.has_soft())
+            || self
+                .module
+                .sigs
+                .iter()
+                .filter_map(|sd| sd.fact.as_ref())
+                .any(|f| f.has_soft())
+            || body_soft;
+        let (arena, bounds, bitwidth, (formula, objective)) = self.with_setup(&scope, |ctx, arena, _bounds, mut parts| {            // global facts
             for (_, f) in &ctx.module.facts {
                 parts.push(ctx.lower_formula(arena, f, &mut Vec::new())?);
             }
@@ -90,10 +150,18 @@ impl<'m> Lowerer<'m> {
                     }
                 }
             }
+            // AlloyMax `soft fact`s: lowered and wrapped as soft
+            // formulas (optimized, not asserted).
+            for (_, f) in &ctx.module.soft_facts {
+                let bf = ctx.lower_formula(arena, f, &mut Vec::new())?;
+                parts.push(arena.soft_fact(bf));
+            }
             // command body
-            let body_name = match &kind {
-                CommandKind::Run(n) => n.clone(),
-                CommandKind::Check(n) => n.clone(),
+            let (body_name, negate) = match &kind {                CommandKind::Run(n) => (n.clone(), false),
+                CommandKind::Check(n) => (n.clone(), true),
+                CommandKind::Maximize { name, .. } | CommandKind::Minimize { name, .. } => {
+                    (name.clone(), false)
+                }
             };
             match body_name {
                 None => parts.push(arena.bool_formula(true)),
@@ -113,19 +181,60 @@ impl<'m> Lowerer<'m> {
                     }
                     let bf = ctx.lower_formula(arena, &para.body, &mut Vec::new())?;
                     // `check F` searches for a counterexample to F
-                    match kind {
-                        CommandKind::Check(_) => parts.push(arena.not(bf)),
-                        CommandKind::Run(_) => parts.push(bf),
+                    if negate {
+                        parts.push(arena.not(bf));
+                    } else {
+                        parts.push(bf);
                     }
                 }
             }
-            Ok(arena.and(&parts))
+            let formula = arena.and(&parts);
+            // Java Simplifier port: shrink uppers (grow lowers) from
+            // top-level `in`/`=` facts before translation. Applies to
+            // run/check/opt alike (and hence REPL Cnfs built from them).
+            let mut formula = formula;
+            match alloy_kodkod_rs::simplify::simplify_bounds(&arena, _bounds, formula)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?
+            {
+                alloy_kodkod_rs::simplify::SimplifyOutcome::Unsat => {
+                    formula = arena.false_formula();
+                }
+                _ => {}
+            }
+            // Optimization target (maximize/minimize only).
+            let objective = match (opt_sense, opt_spec) {
+                (Some(sense), Some(spec)) => {
+                    let target = match spec {
+                        OptSpec::Int(ie) => {
+                            LoweredTarget::Int(ctx.lower_int(arena, &ie, &mut Vec::new())?)
+                        }
+                        OptSpec::Weights(pairs) => {
+                            let mut weights = HashMap::new();
+                            for (name, w) in pairs {
+                                let r = ctx.lookup_rel(&name).ok_or_else(|| {
+                                    FrontError::Resolve(format!(
+                                        "unknown relation '{name}' in weights"
+                                    ))
+                                })?;
+                                weights.insert(r, w);
+                            }
+                            LoweredTarget::Weighted(weights)
+                        }
+                    };
+                    Some(LoweredOpt { sense, target })
+                }
+                (None, None) => None,
+                _ => unreachable!("sense and spec move together"),
+            };
+            Ok((formula, objective))
         })?;
         Ok(LoweredProblem {
             arena,
             bounds,
             formula,
             bitwidth,
+            objective,
+            has_softs,
         })
     }
 
@@ -1740,7 +1849,12 @@ impl<'a> Ctx<'a> {
             let (dom, _da) = self.lower_expr(arena, &d.expr, env)?;
             for n in &d.names {
                 let v = arena.variable(n);
-                let da = arena.decl(v, Multiplicity::One, dom).unwrap();
+                let da = arena.decl(v, Multiplicity::One, dom).map_err(|e| {
+                    FrontError::Resolve(format!(
+                        "quantifier '{n}': {e} (higher-order quantification over \
+                         non-unary domains is not supported)"
+                    ))
+                })?;
                 list.push(da);
                 env.push((n.clone(), v, arena.variable_arity(v)));
                 pushed += 1;
@@ -2081,6 +2195,23 @@ impl<'a> Ctx<'a> {
             // an existential over gensym label variables (`avoid P` is
             // already wrapped in `Not` by the parser).
             Formula::Pin(name, pos) => self.lower_pin(arena, name, *pos, env)?,
+            // AlloyMax soft set optimization: lower the set expression
+            // in the current environment; the kodkod layer records unit
+            // softs per cell during FOL translation. Hard meaning: true.
+            Formula::MaxSome(e) => {
+                let (ee, _) = self.lower_expr(arena, e, env)?;
+                arena.maxsome(ee)
+            }
+            Formula::MaxSomeDecl(..) => {
+                return self.unsup(
+                    "'maxsome x: T | F' declaration form needs free set-valued \
+                     witnesses, which are not supported (use 'maxsome <expr>')",
+                );
+            }
+            Formula::MinSome(e) => {
+                let (ee, _) = self.lower_expr(arena, e, env)?;
+                arena.minsome(ee)
+            }
             Formula::Cmp(kind, l, r, _) => {
                 let (el, al) = self.lower_expr(arena, l, env)?;
                 let (er, ar) = self.lower_expr(arena, r, env)?;
@@ -2374,6 +2505,21 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
         Formula::Const(v) => Formula::Const(*v),
         // `pin` names a partial block, not a variable: untouched.
         Formula::Pin(name, pos) => Formula::Pin(name.clone(), *pos),
+        Formula::MaxSome(e) => Formula::MaxSome(Box::new(subst_expr(e, from, to))),
+        Formula::MinSome(e) => Formula::MinSome(Box::new(subst_expr(e, from, to))),
+        Formula::MaxSomeDecl(ds, body) => {
+            let nd = ds
+                .iter()
+                .map(|d| crate::ast::Decl {
+                    disj: d.disj,
+                    names: d.names.clone(),
+                    expr: subst_expr(&d.expr, from, to),
+                    pos: d.pos,
+                    is_var: d.is_var,
+                })
+                .collect();
+            Formula::MaxSomeDecl(nd, Box::new(subst_formula(body, from, to)))
+        }
         Formula::Not(x) => Formula::Not(Box::new(subst_formula(x, from, to))),
         Formula::And(a, b) => Formula::And(
             Box::new(subst_formula(a, from, to)),
@@ -2627,6 +2773,10 @@ fn mentions_int_formula(f: &Formula) -> bool {
         Formula::Const(_) => false,
         // `pin` bodies live in `Module::partials`, walked at module level.
         Formula::Pin(..) => false,
+        Formula::MaxSome(e) | Formula::MinSome(e) => mentions_int_expr(e),
+        Formula::MaxSomeDecl(ds, body) => {
+            ds.iter().any(|d| mentions_int_expr(&d.expr)) || mentions_int_formula(body)
+        }
         Formula::Cmp(_, a, b, _) => mentions_int_expr(a) || mentions_int_expr(b),
         Formula::Quant(_, ds, body) => {
             ds.iter().any(|d| mentions_int_expr(&d.expr)) || mentions_int_formula(body)
@@ -2991,6 +3141,21 @@ fn replace_var_formula(f: &Formula, from: &str, to: &Expr) -> Formula {
         Formula::Const(v) => Formula::Const(*v),
         // `pin` names a partial block, not a variable: untouched.
         Formula::Pin(name, pos) => Formula::Pin(name.clone(), *pos),
+        Formula::MaxSome(e) => Formula::MaxSome(Box::new(replace_var_expr(e, from, to))),
+        Formula::MinSome(e) => Formula::MinSome(Box::new(replace_var_expr(e, from, to))),
+        Formula::MaxSomeDecl(ds, body) => {
+            let nd = ds
+                .iter()
+                .map(|d| crate::ast::Decl {
+                    disj: d.disj,
+                    names: d.names.clone(),
+                    expr: replace_var_expr(&d.expr, from, to),
+                    pos: d.pos,
+                    is_var: d.is_var,
+                })
+                .collect();
+            Formula::MaxSomeDecl(nd, Box::new(replace_var_formula(body, from, to)))
+        }
         Formula::Not(x) => Formula::Not(Box::new(replace_var_formula(x, from, to))),
         Formula::And(a, b) => Formula::And(
             Box::new(replace_var_formula(a, from, to)),

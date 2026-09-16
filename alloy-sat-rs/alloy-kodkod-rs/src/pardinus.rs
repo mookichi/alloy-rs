@@ -216,6 +216,14 @@ fn collect_int_relations(arena: &AstArena, i: IntId, out: &mut BTreeSet<Relation
 pub fn collect_formula_relations(arena: &AstArena, f: FormulaId, out: &mut BTreeSet<RelationId>) {
     match arena.formula(f).clone() {
         crate::ast::FormulaNode::Constant(_) => {}
+        // Soft nodes: collect relations from the wrapped expression (or
+        // inner formula) so decomposition sees the same footprint.
+        crate::ast::FormulaNode::MaxSome(e) | crate::ast::FormulaNode::MinSome(e) => {
+            collect_expr_relations(arena, e, out);
+        }
+        crate::ast::FormulaNode::SoftFact(inner) => {
+            collect_formula_relations(arena, inner, out);
+        }
         crate::ast::FormulaNode::Not(child) => collect_formula_relations(arena, child, out),
         crate::ast::FormulaNode::Nary { children, .. } => {
             for c in children {

@@ -429,6 +429,22 @@ pub fn collect_witness_specs(
                 counter,
             );
         }
+        // Soft expression sources: expressions are atomic here (cf.
+        // Comparison above); soft formulas are transparent.
+        crate::ast::FormulaNode::MaxSome(_)
+        | crate::ast::FormulaNode::MinSome(_) => {}
+        crate::ast::FormulaNode::SoftFact(child) => {
+            collect_witness_specs(
+                arena,
+                bounds,
+                child,
+                pol,
+                total,
+                under_universal,
+                out,
+                counter,
+            );
+        }
         crate::ast::FormulaNode::Nary { children, .. } => {
             for c in children {
                 collect_witness_specs(arena, bounds, c, pol, total, under_universal, out, counter);
@@ -756,6 +772,20 @@ impl<'a> Ltl2Fol<'a> {
                 let e = self.expr(expr, t)?;
                 let m = self.arena.multiplicity_formula(mult, e)?;
                 Ok(if pol { m } else { self.arena.not(m) })
+            }
+            // Soft nodes: rewrite through, keeping softs positive (the
+            // hard meaning stays true; the caller applies `not` itself).
+            crate::ast::FormulaNode::MaxSome(e) => {
+                let e2 = self.expr(e, t)?;
+                Ok(self.arena.maxsome(e2))
+            }
+            crate::ast::FormulaNode::MinSome(e) => {
+                let e2 = self.expr(e, t)?;
+                Ok(self.arena.minsome(e2))
+            }
+            crate::ast::FormulaNode::SoftFact(inner) => {
+                let b = self.formula(inner, true, t)?;
+                Ok(self.arena.soft_fact(b))
             }
             crate::ast::FormulaNode::Quantified { quant, decls, body }
                 if quant == Quantifier::Some && !self.skolems.is_empty() =>

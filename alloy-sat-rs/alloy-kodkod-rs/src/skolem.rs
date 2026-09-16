@@ -135,8 +135,12 @@ struct StaticSkolemizer<'a> {
     bounds: &'a mut Bounds,
     /// enclosing universals: (variable, arity, original domain expression)
     universals: Vec<(VarId, u32, ExprId)>,
-    /// upper bounds of the universal domains, aligned with `universals`
-    universal_uppers: Vec<TupleSet>,
+    /// upper bounds of the universal domains, aligned with `universals`.
+    /// `None` marks a dynamically-shaped domain (e.g. a join over a bound
+    /// variable like `stu.courses`) whose static upper cannot be computed;
+    /// while any enclosing entry is `None`, witness construction is
+    /// declined (existentials stay intact), which is always sound.
+    universal_uppers: Vec<Option<TupleSet>>,
     fresh: usize,
     created: Vec<RelationId>,
 }
@@ -244,6 +248,20 @@ impl<'a> StaticSkolemizer<'a> {
             crate::ast::FormulaNode::Multiplicity { mult, expr } => {
                 let e = self.subst_expr(expr, map, shadow);
                 self.arena.multiplicity_formula(mult, e).unwrap_or(f)
+            }
+            // Soft nodes: substitute through (witness replacement must
+            // reach soft bodies for models to project correctly).
+            crate::ast::FormulaNode::MaxSome(e) => {
+                let e2 = self.subst_expr(e, map, shadow);
+                self.arena.maxsome(e2)
+            }
+            crate::ast::FormulaNode::MinSome(e) => {
+                let e2 = self.subst_expr(e, map, shadow);
+                self.arena.minsome(e2)
+            }
+            crate::ast::FormulaNode::SoftFact(inner) => {
+                let b = self.subst_formula(inner, map, shadow);
+                self.arena.soft_fact(b)
             }
             crate::ast::FormulaNode::Quantified { quant, decls, body } => {
                 let list = self.arena.decls(decls).to_vec();
@@ -406,7 +424,16 @@ impl<'a> StaticSkolemizer<'a> {
             let rel = self.arena.relation(&name, k + extra);
             self.arena.set_skolem(rel, true);
             let mut full = ub.clone();
+            // Enclosing universals without static uppers (dynamic domains)
+            // veto witness construction: leave the existential intact.
+            let mut enclosed: Vec<&TupleSet> = Vec::with_capacity(self.universal_uppers.len());
             for uu in &self.universal_uppers {
+                match uu {
+                    Some(ts) => enclosed.push(ts),
+                    None => return Ok(None),
+                }
+            }
+            for uu in enclosed {
                 // universal columns PRECEDE the witness columns
                 full = cross(uu, &full)?;
             }
@@ -486,6 +513,11 @@ fn sk_walk(
         | crate::ast::FormulaNode::Comparison { .. }
         | crate::ast::FormulaNode::IntComparison { .. }
         | crate::ast::FormulaNode::Multiplicity { .. } => f,
+        // Soft nodes: leave intact (skolemization inside softs is an
+        // optimization only; skipping is always sound).
+        crate::ast::FormulaNode::MaxSome(_)
+        | crate::ast::FormulaNode::MinSome(_)
+        | crate::ast::FormulaNode::SoftFact(_) => f,
             crate::ast::FormulaNode::Not(child) => {
                 // ¬∀x.F ≡ ∃x.¬F: flip to a positive existential and skolemize
                 // it directly. The replacement is returned AS-IS — the outer
@@ -533,9 +565,8 @@ fn sk_walk(
                 (Quantifier::All, true) => {
                     let list = sk.arena.decls(decls).to_vec();
                     for d in &list {
-                        let ub = upper_bound_expr(sk.arena, d.expr, sk.bounds)
-                            .expect("universal domains must have upper bounds to reach here");
-                        sk.universal_uppers.push(ub);
+                        sk.universal_uppers
+                            .push(upper_bound_expr(sk.arena, d.expr, sk.bounds));
                     }
                     sk.universals.extend(
                         list.iter()
@@ -552,9 +583,8 @@ fn sk_walk(
                 (Quantifier::Some, false) => {
                     let list = sk.arena.decls(decls).to_vec();
                     for d in &list {
-                        let ub = upper_bound_expr(sk.arena, d.expr, sk.bounds)
-                            .expect("universal domains must have upper bounds to reach here");
-                        sk.universal_uppers.push(ub);
+                        sk.universal_uppers
+                            .push(upper_bound_expr(sk.arena, d.expr, sk.bounds));
                     }
                     sk.universals.extend(
                         list.iter()
@@ -589,9 +619,8 @@ fn sk_walk(
                 (Quantifier::All, false) => {
                     let list = sk.arena.decls(decls).to_vec();
                     for d in &list {
-                        let ub = upper_bound_expr(sk.arena, d.expr, sk.bounds)
-                            .expect("universal domains must have upper bounds to reach here");
-                        sk.universal_uppers.push(ub);
+                        sk.universal_uppers
+                            .push(upper_bound_expr(sk.arena, d.expr, sk.bounds));
                     }
                     sk.universals.extend(
                         list.iter()

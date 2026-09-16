@@ -145,3 +145,80 @@ run { pin part1 and #A = 2 } for 3
   表示からの変更で、表示と保存のみ (文法は不変: `+` も `none` も従来通り
   受理し、`{}` は空集合リテラルとして受理)。表示出力はそのまま `:add` や
   `:query {...}` に再投入できる。
+
+## 6. 最適化コマンド: `maximize` / `minimize` (Rust専用文法)
+
+Java Alloy・Pardinus いずれにも最大最小コマンド文法は存在しない
+(Java側の最適化は `PMaxSAT4J`＋target/weightのAPI指定のみ)。以下は
+Rustフロント専用の純粋な拡張。ソルバは `alloy-kodkod-rs/src/opt.rs`
+の OLL/Fu-Malik core-guided ループ (単一セッション・selector仮定＋
+`failed_core` 継承)。
+
+### 6.1 `.als` コマンド文法
+
+```alloy
+maximize { <formula> } : <intexpr> for <scope>
+minimize { <formula> } : <intexpr> for <scope>
+maximize : <intexpr> for <scope>              // facts のみ
+maximize predName : <intexpr> for <scope>     // 名前付きpred参照
+maximize weights { <rel> : <int>, ... } for <scope>
+maximize weights { <rel> : <int>, ... } { <formula> } for <scope>
+```
+
+- `maximize` / `minimize` / `weights` は予約語化 (既存83例題に
+  識別子衝突なしを確認)。`run` / `check` と並列に `CommandKind` に
+  追加 (`Maximize { name, objective }` / `Minimize { name, objective }`)。
+- 目的は `OptSpec::Int(IntExpr)`（`: <intexpr>`、既存Int式文法を再利用）
+  または `OptSpec::Weights(Vec<(String, i64)>)`（`weights {...}`、重みは
+  符号付き整数リテラルのみ）。`{ F }` ボディは `run { F }` と同じ
+  auto-para 生成 (`maximize$N`)。
+- `weights` 形式と `#` の線形結合 (`2*#r1 + 5*#r2`) は意味が等しいが
+  lowering経路が別 (前者は `var_origins`→soft unit節の専用経路で加算
+  回路不要、後者は `IntCircuit` 経由)。記述した形式＝使用経路が原則で
+  自動判定はしない。
+- `for <scope>` / `expect` は `run` と同一解釈。temporal・多目的・
+  辞書式は対象外。
+
+### 6.3 AlloyMax 表面文法: `maxsome` / `minsome` / `soft fact`
+
+Java Alloy にも存在しない AlloyMax 方言（`cmu-soda/AlloyMax`
+`maxsat_all` ブランチ互換のサブセット）。Kodkod レベルでは
+`maxsome e` が式ソフト公式として降りてくる実装（同ブランチの
+`Expression.maxSome()` に対応）。
+
+```alloy
+run MaxInterests1 {
+  validSchedule[courses]
+  all stu: Student | maxsome stu.interests & stu.courses
+}
+soft fact { no lec: Alice.courses.lectures | ... }  // 最適化対象の制約
+```
+
+- `maxsome e` / `minsome e`: 式 `e` の各セルに unit soft（重み1）。
+  `minsome` は否定記録し、報告コストは自然値に補正する。hard 意味は
+  `true`（検証・充足判定には寄与しない）。
+- `soft fact F`: lowered root を unit soft 化（重み1）。hard からは外れる。
+- いずれも単一セッション OLL（`Objective::Collected`）で解く。`run` /
+  `check` コマンド内に現れた場合は自動で最適化経路に振り分け
+  （`command_needs_opt`）、素の SAT 経路（`run_command` / `Cnf::solve` /
+  temporal）は大声で拒否する（黙って soft を落とさない）。
+- 対象外（明示エラー）：`maxsome x: T | F` 宣言形（free な集合値
+  witness が必要）、`maxsome[n]` 優先度（全 soft 重み1均一）、
+  temporal との併用。
+
+### 6.2 REPL コマンド
+
+| コマンド | 意味 |
+|---|---|
+| `:max <intexpr> [in <cnf>] [as <sol>]` | Int式の最大化 |
+| `:min <intexpr> [in <cnf>] [as <sol>]` | Int式の最小化 |
+| `:maxw <rel>:<w>[, ...] [in <cnf>] [as <sol>]` | Σ w·#r の最大化 |
+| `:minw <rel>:<w>[, ...] [in <cnf>] [as <sol>]` | Σ w·#r の最小化 |
+
+- 末尾 `in <cnf>` は保存済みCnf名の場合のみCnf指定と解釈 (Alloyの
+  `in` との衝突回避は `:query` と同方針)。結果表示に `cost=<n>` を
+  付け、`:sols` 一覧にも `cost=` を表示する。
+- `Cnf` は `run`/`check` コマンドから作る (`maximize` コマンド自体は
+  `Cnf` 化せず `run_opt_command` で直接解く)。`Cnf` は high-level
+  (arena/bounds/formula) を保持しているため、REPL目的式はその場で
+  lowerして `solve_opt_with` に渡す。

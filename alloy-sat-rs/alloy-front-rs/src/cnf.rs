@@ -92,6 +92,7 @@ impl Cnf {
 fn command_name_of(module: &Module, index: usize) -> Option<String> {
     module.commands.get(index).and_then(|c| match &c.kind {
         CommandKind::Run(n) | CommandKind::Check(n) => n.clone(),
+        CommandKind::Maximize { name: n, .. } | CommandKind::Minimize { name: n, .. } => n.clone(),
     })
 }
 
@@ -104,6 +105,8 @@ fn build_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cnf, FrontE
         .ok_or_else(|| FrontError::Resolve(format!("no command #{index}")))?;
 
     // Enforce kind match so `run` never silently builds a `check` and vice versa.
+    // Maximize/minimize commands are not buildable as plain Cnfs (they
+    // carry an objective; use run_opt_command / optimize instead).
     match (&cmd.kind, kind) {
         (CommandKind::Run(_), CnfKind::Run) | (CommandKind::Check(_), CnfKind::Check) => {}
         (CommandKind::Run(_), CnfKind::Check) => {
@@ -116,6 +119,11 @@ fn build_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cnf, FrontE
                 "command #{index} is `check`, use `check` not `run`"
             )));
         }
+        (CommandKind::Maximize { .. } | CommandKind::Minimize { .. }, _) => {
+            return Err(FrontError::Resolve(format!(
+                "command #{index} is maximize/minimize, use `:max`/`:min` or run_opt_command"
+            )));
+        }
     }
 
     if module.is_temporal_command(index) {
@@ -126,6 +134,13 @@ fn build_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cnf, FrontE
 
     let mut lower = Lowerer::new(module);
     let problem = lower.prepare_command(index)?;
+    // AlloyMax softs need the optimizer loop, not a static Cnf: refuse
+    // loudly rather than solving the hard part only.
+    if problem.has_softs {
+        return Err(FrontError::Resolve(format!(
+            "command #{index} carries soft constraints (maxsome/minsome/soft fact); use run_opt_command or :max"
+        )));
+    }
     let mut arena = problem.arena;
     let mut bounds = problem.bounds;
     let mut formula = problem.formula;

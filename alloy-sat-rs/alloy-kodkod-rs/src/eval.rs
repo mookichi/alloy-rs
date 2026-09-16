@@ -199,6 +199,11 @@ impl<'a> Evaluator<'a> {
     ) -> Result<bool, EvalError> {
         match arena.formula(f).clone() {
             crate::ast::FormulaNode::Constant(v) => Ok(v),
+            // Soft nodes contribute nothing hard (always true); their
+            // optima live in the MaxSAT layer, not in validation.
+            crate::ast::FormulaNode::MaxSome(_)
+            | crate::ast::FormulaNode::MinSome(_)
+            | crate::ast::FormulaNode::SoftFact(_) => Ok(true),
             crate::ast::FormulaNode::Not(child) => Ok(!self.formula_bool(arena, child, env)?),
             crate::ast::FormulaNode::Nary { op, children } => {
                 let mut vals = Vec::with_capacity(children.len());

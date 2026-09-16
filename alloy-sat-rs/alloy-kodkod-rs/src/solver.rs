@@ -85,13 +85,33 @@ impl Solver {
         formula: FormulaId,
         bounds: &Bounds,
     ) -> Result<Solution, TranslateError> {
+        let t0 = std::time::Instant::now();
         let mut translator = FolTranslator::new(crate::BoolCtx::new(), bounds);
         translator.set_bitwidth(self.options.bitwidth);
         let root = translator.formula_ref(arena, formula, &[])?;
+        let dt_fol = t0.elapsed();
         let max_primary = translator.ctx.num_slots();
         let ctx = translator.ctx.clone();
         ctx.with_factory(|factory| translate_into_solver(solver, factory, root, max_primary))?;
+        let dt_cnf = t0.elapsed() - dt_fol;
         let satisfiable = SatSolver::solve(solver);
+        let dt_sat = t0.elapsed() - dt_fol - dt_cnf;
+        if std::env::var_os("ALLOY_TIMING").is_some() {
+            eprintln!(
+                "[timing] fol={}ms cnf={}ms sat={}ms",
+                dt_fol.as_millis(),
+                dt_cnf.as_millis(),
+                dt_sat.as_millis()
+            );
+            eprintln!(
+                "[folstats] refs={} qbodies={} joins={} memohit={} memomiss={}",
+                translator.stats.formula_refs,
+                translator.stats.quant_bodies,
+                translator.stats.matrix_join,
+                translator.memo_hits,
+                translator.memo_miss
+            );
+        }
         let instance = if satisfiable {
             Some(translator.materialize(|slot| SatSolver::value_of(solver, slot as i64)))
         } else {
@@ -126,6 +146,30 @@ impl Solver {
     ) -> Result<crate::ucore::CoreSolution, TranslateError> {
         crate::ucore::solve_core_with(solver, self.options.bitwidth, arena, formula, bounds)
     }
+
+    /// Optimization solve (Iter 13) with a caller-provided SAT solver.
+    ///
+    /// Runs the OLL/Fu-Malik core-guided loop over the
+    /// [`Objective`](crate::opt::Objective); on SAT the returned
+    /// [`OptSolution`](crate::opt::OptSolution) carries the optimal model
+    /// and its exact cost. See [`crate::opt`].
+    pub fn solve_opt_with<S: SatSolver>(
+        &self,
+        solver: &mut S,
+        arena: &AstArena,
+        formula: FormulaId,
+        bounds: &Bounds,
+        objective: crate::opt::Objective,
+    ) -> Result<crate::opt::OptSolution, TranslateError> {
+        crate::opt::solve_opt_with(
+            solver,
+            self.options.bitwidth,
+            arena,
+            formula,
+            bounds,
+            objective,
+        )
+    }
 }
 
 #[cfg(feature = "ipasir")]
@@ -152,18 +196,38 @@ mod ipasir_impl {
             formula: FormulaId,
             bounds: &Bounds,
         ) -> Result<Solution, TranslateError> {
+            // Phase breakdown reported under `ALLOY_TIMING=1` (diagnostics).
+            let t_all = std::time::Instant::now();
             let mut solver = IpasirSolver::new().map_err(TranslateError::Solver)?;
             if self.options.skolemize {
                 let mut b2 = bounds.clone();
+                let t_sk = std::time::Instant::now();
                 let f2 = match skolemize_static(arena, &mut b2, formula)? {
                     Some(sk) => sk.formula,
                     None => formula,
                 };
+                let dt_sk = t_sk.elapsed();
                 let mut solution = self.solve_with(&mut solver, arena, f2, &b2)?;
                 solution.backend = solver.backend_name();
+                if std::env::var_os("ALLOY_TIMING").is_some() {
+                    eprintln!(
+                        "[timing] skolem={}ms total={}ms primary={}",
+                        dt_sk.as_millis(),
+                        t_all.elapsed().as_millis(),
+                        solution.num_primary_variables
+                    );
+                }
                 return Ok(solution);
             }
             let mut solution = self.solve_with(&mut solver, arena, formula, bounds)?;
+            solution.backend = solver.backend_name();
+            if std::env::var_os("ALLOY_TIMING").is_some() {
+                eprintln!(
+                    "[timing] total={}ms primary={}",
+                    t_all.elapsed().as_millis(),
+                    solution.num_primary_variables
+                );
+            }
             solution.backend = solver.backend_name();
             if self.options.report_stats {
                 eprintln!(
@@ -315,6 +379,19 @@ mod ipasir_impl {
         ) -> Result<crate::ucore::CoreSolution, TranslateError> {
             let mut solver = IpasirSolver::new().map_err(TranslateError::Solver)?;
             self.solve_core_with(&mut solver, arena, formula, bounds)
+        }
+
+        /// Optimization solve (Iter 13) using the default IPASIR
+        /// (CaDiCaL) backend. See [`crate::opt`].
+        pub fn solve_opt(
+            &self,
+            arena: &AstArena,
+            formula: FormulaId,
+            bounds: &Bounds,
+            objective: crate::opt::Objective,
+        ) -> Result<crate::opt::OptSolution, TranslateError> {
+            let mut solver = IpasirSolver::new().map_err(TranslateError::Solver)?;
+            self.solve_opt_with(&mut solver, arena, formula, bounds, objective)
         }
     }
 }

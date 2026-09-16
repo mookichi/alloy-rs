@@ -365,6 +365,16 @@ pub enum FormulaNode {
         decls: DeclsId,
         body: FormulaId,
     },
+    /// Soft set-maximization cell source (AlloyMax `maxsome e`).
+    /// Hard meaning: true. The FOL layer records a unit soft per
+    /// non-constant cell of `expr` and yields true.
+    MaxSome(ExprId),
+    /// Soft set-minimization cell source (AlloyMax `minsome e`).
+    /// Hard meaning: true. Records negated unit softs.
+    MinSome(ExprId),
+    /// Soft formula (AlloyMax `soft fact F`). Hard meaning: true.
+    /// Records the root literal as a unit soft.
+    SoftFact(FormulaId),
     Multiplicity {
         mult: Multiplicity,
         expr: ExprId,
@@ -853,6 +863,23 @@ impl AstArena {
             return Err(AstError::SetIsNotFormulaMult);
         }
         Ok(self.push_formula(FormulaNode::Multiplicity { mult, expr }))
+    }
+
+    /// Soft set-maximization source (AlloyMax `maxsome e`): records a
+    /// unit soft per non-constant cell of `expr`; hard meaning is true.
+    pub fn maxsome(&mut self, expr: ExprId) -> FormulaId {
+        self.push_formula(FormulaNode::MaxSome(expr))
+    }
+
+    /// Soft set-minimization source (AlloyMax `minsome e`).
+    pub fn minsome(&mut self, expr: ExprId) -> FormulaId {
+        self.push_formula(FormulaNode::MinSome(expr))
+    }
+
+    /// Soft formula (AlloyMax `soft fact F`): records the root literal
+    /// as a unit soft; hard meaning is true.
+    pub fn soft_fact(&mut self, inner: FormulaId) -> FormulaId {
+        self.push_formula(FormulaNode::SoftFact(inner))
     }
 
     pub fn temporal_unary(&mut self, op: TemporalFormulaOp, child: FormulaId) -> FormulaId {

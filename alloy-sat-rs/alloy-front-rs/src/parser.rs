@@ -225,6 +225,7 @@ impl Parser {
 
         let mut sigs = Vec::new();
         let mut facts = Vec::new();
+        let mut soft_facts = Vec::new();
         let mut paras = Vec::new();
         let mut commands = Vec::new();
         let mut partials = Vec::new();
@@ -265,6 +266,25 @@ impl Parser {
                     let body = self.braced_formula()?;
                     facts.push((name, body));
                 }
+                // AlloyMax `soft fact [name] { ... }`: collected as soft
+                // constraints (optimized, not asserted).
+                Tok::Soft => {
+                    self.bump();
+                    self.expect(&Tok::Fact)?;
+                    let name = if let Tok::Ident(_) = self.peek() {
+                        Some(match self.bump().tok {
+                            Tok::Ident(n) => {
+                                self.nod(&n)?;
+                                n
+                            }
+                            _ => unreachable!(),
+                        })
+                    } else {
+                        None
+                    };
+                    let body = self.braced_formula()?;
+                    soft_facts.push((name, body));
+                }
                 Tok::Pred => paras.push(self.para(false)?),
                 Tok::Fun => paras.push(self.para(true)?),
                 Tok::Assert => {
@@ -291,7 +311,9 @@ impl Parser {
                         ret: None,
                     });
                 }
-                Tok::Run | Tok::Check => commands.push(self.command()?),
+                Tok::Run | Tok::Check | Tok::Maximize | Tok::Minimize => {
+                    commands.push(self.command()?)
+                }
                 Tok::Eof => break,
                 other => {
                     return Err(
@@ -305,6 +327,7 @@ impl Parser {
             header,
             sigs,
             facts,
+            soft_facts,
             paras,
             commands,
             opens,
@@ -714,52 +737,90 @@ impl Parser {
 
     fn command(&mut self) -> PResult<Command> {
         let pos = self.pos();
-        let kind = if self.eat(&Tok::Run) {
-            CommandKind::Run(None)
+        #[derive(Clone, Copy, PartialEq)]
+        enum Head {
+            Run,
+            Check,
+            Maximize,
+            Minimize,
+        }
+        let head = if self.eat(&Tok::Run) {
+            Head::Run
+        } else if self.eat(&Tok::Check) {
+            Head::Check
+        } else if self.eat(&Tok::Maximize) {
+            Head::Maximize
+        } else if self.eat(&Tok::Minimize) {
+            Head::Minimize
         } else {
-            self.expect(&Tok::Check)?;
-            CommandKind::Check(None)
+            return Err(self.err(&format!(
+                "expected 'run', 'check', 'maximize' or 'minimize', found {}",
+                self.peek().describe()
+            )));
         };
-        let mut kind = if let Tok::Ident(_) = self.peek() {
-            let n = self.ident()?;
-            match kind {
-                CommandKind::Run(_) => CommandKind::Run(Some(n)),
-                CommandKind::Check(_) => CommandKind::Check(Some(n)),
-            }
+        let head_word = match head {
+            Head::Run => "run",
+            Head::Check => "check",
+            Head::Maximize => "maximize",
+            Head::Minimize => "minimize",
+        };
+        let mut name: Option<String> = if let Tok::Ident(_) = self.peek() {
+            Some(self.ident()?)
         } else {
-            kind
+            None
         };
-        // inline braced body: `run { F } for ..`, `check name { F } for ..`
+        // inline braced body: `run { F } for ..`, `maximize { F } : e for ..`
         if matches!(self.peek(), Tok::LBrace) {
-            let auto =
-                matches!(kind, CommandKind::Run(None)) || matches!(kind, CommandKind::Check(None));
             self.inline_body_index += 1;
-            let name = match &kind {
-                CommandKind::Run(Some(n)) | CommandKind::Check(Some(n)) => n.clone(),
-                _ => format!(
-                    "{}${}",
-                    if matches!(kind, CommandKind::Run(_)) {
-                        "run"
-                    } else {
-                        "check"
-                    },
-                    self.inline_body_index
-                ),
-            };
-            let _ = auto;
+            let auto = name.clone().unwrap_or_else(|| {
+                format!("{}${}", head_word, self.inline_body_index)
+            });
             let body = self.braced_formula()?;
             self.pending_paras.push(Para {
-                name: name.clone(),
+                name: auto.clone(),
                 params: Vec::new(),
                 body,
                 body_expr: None,
                 is_fun: false,
                 ret: None,
             });
-            kind = match kind {
-                CommandKind::Run(_) => CommandKind::Run(Some(name)),
-                CommandKind::Check(_) => CommandKind::Check(Some(name)),
-            };
+            name = Some(auto);
+        }
+        // Optimization target: `weights { r: w, ... }` (either side of the
+        // body) or `: <intexpr>`. Run/check commands have neither.
+        let mut objective: Option<OptSpec> = None;
+        if matches!(head, Head::Maximize | Head::Minimize) && matches!(self.peek(), Tok::Weights)
+        {
+            objective = Some(OptSpec::Weights(self.weights_block()?));
+        }
+        if matches!(head, Head::Maximize | Head::Minimize) && objective.is_none() {
+            if self.eat(&Tok::Colon) {
+                objective = Some(OptSpec::Int(self.int_expr()?));
+            } else if matches!(self.peek(), Tok::Weights) {
+                objective = Some(OptSpec::Weights(self.weights_block()?));
+            } else {
+                return Err(self.err(&format!(
+                    "expected ':' <intexpr> or 'weights {{...}}' after '{head_word}' command"
+                )));
+            }
+        }
+        // `maximize weights {...} { F }` order: body after the weights block.
+        if matches!(head, Head::Maximize | Head::Minimize)
+            && name.is_none()
+            && matches!(self.peek(), Tok::LBrace)
+        {
+            self.inline_body_index += 1;
+            let auto = format!("{}${}", head_word, self.inline_body_index);
+            let body = self.braced_formula()?;
+            self.pending_paras.push(Para {
+                name: auto.clone(),
+                params: Vec::new(),
+                body,
+                body_expr: None,
+                is_fun: false,
+                ret: None,
+            });
+            name = Some(auto);
         }
         let mut scope = Scope::default();
         if self.eat(&Tok::For) {
@@ -771,7 +832,56 @@ impl Parser {
                 self.bump();
             }
         }
+        let kind = match head {
+            Head::Run => CommandKind::Run(name),
+            Head::Check => CommandKind::Check(name),
+            Head::Maximize => CommandKind::Maximize {
+                name,
+                objective: objective.expect("opt objective parsed"),
+            },
+            Head::Minimize => CommandKind::Minimize {
+                name,
+                objective: objective.expect("opt objective parsed"),
+            },
+        };
         Ok(Command { kind, scope, pos })
+    }
+
+    /// `weights { rel: w, ... }` — relation-weight map of a
+    /// maximize/minimize command. Weights are (possibly negative) integer
+    /// literals.
+    fn weights_block(&mut self) -> PResult<Vec<(String, i64)>> {
+        self.expect(&Tok::Weights)?;
+        self.expect(&Tok::LBrace)?;
+        let mut out: Vec<(String, i64)> = Vec::new();
+        if matches!(self.peek(), Tok::RBrace) {
+            return Err(self.err("empty 'weights {...}' block"));
+        }
+        loop {
+            let rel = self.ident()?;
+            self.expect(&Tok::Colon)?;
+            let neg = self.eat(&Tok::Minus);
+            let w = match self.peek() {
+                Tok::Int(v) => {
+                    let v = *v;
+                    self.bump();
+                    v
+                }
+                _ => {
+                    return Err(self.err(&format!(
+                        "expected integer weight for '{rel}', found {}",
+                        self.peek().describe()
+                    )))
+                }
+            };
+            out.push((rel, if neg { -w } else { w }));
+            if self.eat(&Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(out)
     }
 
     fn scope_clause(&mut self, scope: &mut Scope) -> PResult<()> {
@@ -1471,6 +1581,7 @@ impl Parser {
                 Ok(Formula::Consistently(Box::new(self.parse_not_level()?)))
             }
             Tok::All | Tok::Some | Tok::No | Tok::Lone | Tok::One => self.parse_quant_or_cmp(),
+            Tok::MaxSome | Tok::MinSome => self.parse_maxsome(),
             Tok::Sum => {
                 // sum formula? not a formula starter; error out naturally
                 self.parse_quant_or_cmp()
@@ -1495,6 +1606,65 @@ impl Parser {
 
     fn starts_negation(&self) -> bool {
         matches!(self.peek(), Tok::Not)
+    }
+
+    /// AlloyMax `maxsome e` / `minsome e`: soft set optimization.
+    /// Declaration form (`maxsome x: T | F`) and priorities
+    /// (`maxsome[n]`) are rejected with explicit errors.
+    fn parse_maxsome(&mut self) -> PResult<Formula> {
+        let is_max = matches!(self.peek(), Tok::MaxSome);
+        let kw = if is_max { "maxsome" } else { "minsome" };
+        self.bump();
+        if matches!(self.peek(), Tok::LBracket) {
+            return Err(self.err(&format!(
+                "'{kw}[n]' priorities are not supported (all softs share weight 1)"
+            )));
+        }
+        if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Colon) {
+            // Declaration form: parse (sibling commands keep working),
+            // reject at lowering with a clear error. Domains tolerate a
+            // leading multiplicity keyword (AlloyMax `set Course`).
+            let mut decls = Vec::new();
+            loop {
+                let name = self.ident()?;
+                self.expect(&Tok::Colon)?;
+                // Skip a leading multiplicity keyword on the domain.
+                if matches!(
+                    self.peek(),
+                    Tok::SetKw | Tok::Some | Tok::Lone | Tok::One
+                ) {
+                    self.bump();
+                }
+                let expr = self.rel_expr_top(false)?;
+                let pos = self.pos();
+                decls.push(Decl {
+                    disj: false,
+                    names: vec![name],
+                    expr,
+                    pos,
+                    is_var: false,
+                });
+                if self.eat(&Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+            let body = if matches!(self.peek(), Tok::Bar) {
+                self.bump();
+                self.formula()?
+            } else if matches!(self.peek(), Tok::LBrace) {
+                self.braced_formula()?
+            } else {
+                return Err(self.err("expected '|' or '{' after maxsome declarations"));
+            };
+            return Ok(Formula::MaxSomeDecl(decls, Box::new(body)));
+        }
+        let e = self.rel_expr_top(false)?;
+        Ok(if is_max {
+            Formula::MaxSome(Box::new(e))
+        } else {
+            Formula::MinSome(Box::new(e))
+        })
     }
 
     fn parse_quant_or_cmp(&mut self) -> PResult<Formula> {

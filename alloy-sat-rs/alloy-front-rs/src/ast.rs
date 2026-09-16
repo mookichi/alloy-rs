@@ -176,6 +176,16 @@ pub enum Formula {
     Not(Box<Formula>),
     LetBind(Vec<(String, Expr)>, Box<Formula>),
     Call(String, Vec<Expr>, usize),
+    /// AlloyMax `maxsome e`: maximize the set `e` (unit soft per cell).
+    /// Hard meaning is true; declaration form (`maxsome x: T | F`) and
+    /// priorities (`maxsome[n]`) are rejected at parse time.
+    MaxSome(Box<Expr>),
+    /// AlloyMax `minsome e`: minimize the set `e`.
+    MinSome(Box<Expr>),
+    /// AlloyMax `maxsome x: T | F` declaration form. Parsed (so sibling
+    /// commands in the same file still run) but rejected at lowering:
+    /// free set-valued witnesses are not supported yet.
+    MaxSomeDecl(Vec<Decl>, Box<Formula>),
     /// `pin P`: the partial instance `P` embeds (existentially) here.
     /// `avoid P` parses as `Not(Pin)`. Lowered by desugaring to an
     /// existential over gensym label variables; never temporal.
@@ -200,8 +210,7 @@ pub enum Formula {
 
 impl Formula {
     /// Returns true if this formula or any subformula contains temporal operators.
-    pub fn has_temporal(&self) -> bool {
-        match self {
+    pub fn has_temporal(&self) -> bool {        match self {
             Formula::Always(_) | Formula::Eventually(_) => true,
             Formula::Until(_, _) | Formula::Releases(_, _) => true,
             Formula::Before(_) | Formula::Historically(_) | Formula::Once(_) => true,
@@ -223,8 +232,55 @@ impl Formula {
             Formula::IntCmp(_, a, b, _) => a.has_temporal() || b.has_temporal(),
             Formula::Multi(_, e, _) => e.has_temporal(),
             Formula::Call(_, args, _) => args.iter().any(|a| a.has_temporal()),
+            Formula::MaxSomeDecl(ds, body) => {
+                body.has_temporal() || ds.iter().any(|d| d.expr.has_temporal())
+            }
+            Formula::MaxSome(e) | Formula::MinSome(e) => e.has_temporal(),
             Formula::Pin(..) => false,
             Formula::Const(_) => false,
+        }
+    }
+
+    /// Returns true if this formula or any subformula contains AlloyMax
+    /// soft nodes (`maxsome` / `minsome`). Such commands must run through
+    /// the optimizer, never the plain SAT path.
+    pub fn has_soft(&self) -> bool {
+        match self {
+            Formula::MaxSome(_) | Formula::MinSome(_) => true,
+            Formula::Not(f) => f.has_soft(),
+            Formula::And(a, b)
+            | Formula::Or(a, b)
+            | Formula::Implies(a, b)
+            | Formula::Iff(a, b) => a.has_soft() || b.has_soft(),
+            Formula::Quant(_, decls, body) => {
+                body.has_soft() || decls.iter().any(|d| d.expr.has_soft())
+            }
+            Formula::LetBind(binds, body) => {
+                body.has_soft() || binds.iter().any(|(_, e)| e.has_soft())
+            }
+            Formula::Cmp(_, a, b, _) => a.has_soft() || b.has_soft(),
+            Formula::IntCmp(_, a, b, _) => a.has_soft() || b.has_soft(),
+            Formula::Multi(_, e, _) => e.has_soft(),
+            Formula::Call(_, args, _) => args.iter().any(|a| a.has_soft()),
+            // Declaration form is soft-bearing (it errors at lowering,
+            // but must still route to the optimizer for the message).
+            Formula::MaxSomeDecl(..) => true,
+            Formula::Always(f)
+            | Formula::Eventually(f)
+            | Formula::Before(f)
+            | Formula::Historically(f)
+            | Formula::Once(f)
+            | Formula::Keeping(f)
+            | Formula::Goal(f)
+            | Formula::Restore(f)
+            | Formula::Initially(f)
+            | Formula::Regularly(f)
+            | Formula::Consistently(f) => f.has_soft(),
+            Formula::Until(a, b)
+            | Formula::Releases(a, b)
+            | Formula::Since(a, b)
+            | Formula::Triggered(a, b) => a.has_soft() || b.has_soft(),
+            Formula::Pin(..) | Formula::Const(_) => false,
         }
     }
 }
@@ -249,6 +305,35 @@ impl Expr {
             }
         }
     }
+
+    /// Expression-level soft scan (soft nodes live in formulas, but
+    /// comprehensions and `if` conditions can nest them).
+    pub fn has_soft(&self) -> bool {
+        match self {
+            Expr::Comprehension(decls, body) => {
+                body.has_soft() || decls.iter().any(|d| d.expr.has_soft())
+            }
+            Expr::If(c, t, e) => c.has_soft() || t.has_soft() || e.has_soft(),
+            Expr::Bin(_, a, b) => a.has_soft() || b.has_soft(),
+            Expr::Transpose(x)
+            | Expr::TClosure(x)
+            | Expr::RClosure(x)
+            | Expr::ArrowMult(_, x)
+            | Expr::LeadMult(_, x)
+            | Expr::AtExpr(x)
+            | Expr::Prime(x) => x.has_soft(),
+            Expr::Bracket(b, args) => b.has_soft() || args.iter().any(|a| a.has_soft()),
+            Expr::Call(_, args, _) => args.iter().any(|a| a.has_soft()),
+            Expr::LetBind(binds, body) => {
+                body.has_soft() || binds.iter().any(|(_, e)| e.has_soft())
+            }
+            Expr::Name(..)
+            | Expr::Univ
+            | Expr::None_
+            | Expr::Iden
+            | Expr::IntAtom(_) => false,
+        }
+    }
 }
 
 impl IntExpr {
@@ -260,6 +345,20 @@ impl IntExpr {
             }
             IntExpr::Bin(_, a, b) => a.has_temporal() || b.has_temporal(),
             IntExpr::Val(e, _) | IntExpr::SumOf(e, _) => e.has_temporal(),
+            IntExpr::Lit(..) => false,
+        }
+    }
+
+    /// Soft scan (soft nodes are formula-level; `IntExpr` can only nest
+    /// them through comprehension bodies in decl domains).
+    pub fn has_soft(&self) -> bool {
+        match self {
+            IntExpr::Card(e, _) => e.has_soft(),
+            IntExpr::Sum(decls, body, _) => {
+                body.has_soft() || decls.iter().any(|d| d.expr.has_soft())
+            }
+            IntExpr::Bin(_, a, b) => a.has_soft() || b.has_soft(),
+            IntExpr::Val(e, _) | IntExpr::SumOf(e, _) => e.has_soft(),
             IntExpr::Lit(..) => false,
         }
     }
@@ -280,6 +379,24 @@ pub struct Para {
 pub enum CommandKind {
     Run(Option<String>),
     Check(Option<String>),
+    Maximize {
+        name: Option<String>,
+        objective: OptSpec,
+    },
+    Minimize {
+        name: Option<String>,
+        objective: OptSpec,
+    },
+}
+
+/// Optimization target of a `maximize`/`minimize` command (Rust-frontend
+/// extension; Java Alloy has no such command).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OptSpec {
+    /// `: <intexpr>` — maximize/minimize an integer expression value.
+    Int(IntExpr),
+    /// `weights { rel: w, ... }` — maximize/minimize Σ w·#rel.
+    Weights(Vec<(String, i64)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -352,6 +469,9 @@ pub struct Module {
     pub header: String,
     pub sigs: Vec<SigDecl>,
     pub facts: Vec<(Option<String>, Formula)>,
+    /// AlloyMax `soft fact` entries: solved as soft constraints
+    /// (unit soft on the lowered root), not hard facts.
+    pub soft_facts: Vec<(Option<String>, Formula)>,
     pub paras: Vec<Para>,
     pub commands: Vec<Command>,
     pub opens: Vec<Open>,
@@ -362,6 +482,9 @@ impl Module {
     pub fn find_command(&self, name: &str) -> Option<usize> {
         self.commands.iter().position(|c| match &c.kind {
             CommandKind::Run(Some(n)) | CommandKind::Check(Some(n)) => n == name,
+            CommandKind::Maximize { name: n, .. } | CommandKind::Minimize { name: n, .. } => {
+                n.as_deref() == Some(name)
+            }
             _ => false,
         })
     }
@@ -377,12 +500,24 @@ impl Module {
         if self.facts.iter().any(|(_, f)| f.has_temporal()) {
             return true;
         }
+        if self.soft_facts.iter().any(|(_, f)| f.has_temporal()) {
+            return true;
+        }
         // Check the command's referenced predicate body
         match &cmd.kind {
             CommandKind::Run(Some(name)) | CommandKind::Check(Some(name)) => {
                 if let Some(para) = self.paras.iter().find(|p| p.name == *name) {
                     if para.body.has_temporal() {
                         return true;
+                    }
+                }
+            }
+            CommandKind::Maximize { name, .. } | CommandKind::Minimize { name, .. } => {
+                if let Some(n) = name {
+                    if let Some(para) = self.paras.iter().find(|p| p.name == *n) {
+                        if para.body.has_temporal() {
+                            return true;
+                        }
                     }
                 }
             }
@@ -616,6 +751,13 @@ fn collect_int_widths_formula(f: &Formula, acc: &mut u32) {
                 collect_int_widths_expr(a, acc);
             }
         }
+        Formula::MaxSome(e) | Formula::MinSome(e) => collect_int_widths_expr(e, acc),
+        Formula::MaxSomeDecl(ds, body) => {
+            for d in ds {
+                collect_int_widths_expr(&d.expr, acc);
+            }
+            collect_int_widths_formula(body, acc);
+        }
     }
 }
 
@@ -747,6 +889,13 @@ fn scan_formula_int_set(f: &Formula, needs: &mut bool) {
             for a in args {
                 scan_expr_int_set(a, needs);
             }
+        }
+        Formula::MaxSome(e) | Formula::MinSome(e) => scan_expr_int_set(e, needs),
+        Formula::MaxSomeDecl(ds, body) => {
+            for d in ds {
+                scan_expr_int_set(&d.expr, needs);
+            }
+            scan_formula_int_set(body, needs);
         }
     }
 }
