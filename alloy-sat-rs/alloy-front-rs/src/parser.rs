@@ -2,6 +2,7 @@
 
 use crate::ast::*;
 use crate::lex::{Tok, Token};
+use crate::types::{int_left_of_in_is_error, set_eq_rhs_is_int, should_rewind_eq};
 use crate::FrontError;
 
 pub struct Parser {
@@ -243,10 +244,7 @@ impl Parser {
                 Tok::Ident(n) if n == "partial" => {
                     let pd = self.partial_def()?;
                     if partials.iter().any(|p: &PartialDef| p.name == pd.name) {
-                        return Err(self.err(&format!(
-                            "duplicate partial '{}'",
-                            pd.name
-                        )));
+                        return Err(self.err(&format!("duplicate partial '{}'", pd.name)));
                     }
                     partials.push(pd);
                 }
@@ -368,32 +366,31 @@ impl Parser {
     fn partial_entry(&mut self) -> PResult<PartialEntry> {
         let pos = self.pos();
         let left = self.rel_expr_top(false)?;
-        let op = match self.peek() {
-            Tok::Eq => {
-                self.bump();
-                PartialOp::Eq
-            }
-            Tok::In => {
-                self.bump();
-                PartialOp::In
-            }
-            Tok::NotEq => {
-                return Err(self.err(
-                    "partial entries use `=` or `in` only (`!=` is not supported; use `avoid`)",
-                ))
-            }
-            Tok::Not => {
-                return Err(self.err(
+        let op =
+            match self.peek() {
+                Tok::Eq => {
+                    self.bump();
+                    PartialOp::Eq
+                }
+                Tok::In => {
+                    self.bump();
+                    PartialOp::In
+                }
+                Tok::NotEq => {
+                    return Err(self.err(
+                        "partial entries use `=` or `in` only (`!=` is not supported; use `avoid`)",
+                    ))
+                }
+                Tok::Not => return Err(self.err(
                     "partial entries use `=` or `in` only (`not in` is not supported; use `avoid`)",
-                ))
-            }
-            other => {
-                return Err(self.err(&format!(
-                    "expected `=` or `in` in partial entry, got {}",
-                    other.describe()
-                )))
-            }
-        };
+                )),
+                other => {
+                    return Err(self.err(&format!(
+                        "expected `=` or `in` in partial entry, got {}",
+                        other.describe()
+                    )))
+                }
+            };
         let right = self.rel_expr_top(false)?;
         for side in [&left, &right] {
             if !partial_set_shape(side) {
@@ -772,9 +769,9 @@ impl Parser {
         // inline braced body: `run { F } for ..`, `maximize { F } : e for ..`
         if matches!(self.peek(), Tok::LBrace) {
             self.inline_body_index += 1;
-            let auto = name.clone().unwrap_or_else(|| {
-                format!("{}${}", head_word, self.inline_body_index)
-            });
+            let auto = name
+                .clone()
+                .unwrap_or_else(|| format!("{}${}", head_word, self.inline_body_index));
             let body = self.braced_formula()?;
             self.pending_paras.push(Para {
                 name: auto.clone(),
@@ -789,8 +786,7 @@ impl Parser {
         // Optimization target: `weights { r: w, ... }` (either side of the
         // body) or `: <intexpr>`. Run/check commands have neither.
         let mut objective: Option<OptSpec> = None;
-        if matches!(head, Head::Maximize | Head::Minimize) && matches!(self.peek(), Tok::Weights)
-        {
+        if matches!(head, Head::Maximize | Head::Minimize) && matches!(self.peek(), Tok::Weights) {
             objective = Some(OptSpec::Weights(self.weights_block()?));
         }
         if matches!(head, Head::Maximize | Head::Minimize) && objective.is_none() {
@@ -1123,21 +1119,33 @@ impl Parser {
                 self.bump();
                 let at = self.eat(&Tok::At);
                 let inner = self.parse_unary(in_sig)?;
-                let inner = if at { Expr::AtExpr(Box::new(inner)) } else { inner };
+                let inner = if at {
+                    Expr::AtExpr(Box::new(inner))
+                } else {
+                    inner
+                };
                 Ok(Expr::Transpose(Box::new(inner)))
             }
             Tok::Hat => {
                 self.bump();
                 let at = self.eat(&Tok::At);
                 let inner = self.parse_unary(in_sig)?;
-                let inner = if at { Expr::AtExpr(Box::new(inner)) } else { inner };
+                let inner = if at {
+                    Expr::AtExpr(Box::new(inner))
+                } else {
+                    inner
+                };
                 Ok(Expr::TClosure(Box::new(inner)))
             }
             Tok::Star => {
                 self.bump();
                 let at = self.eat(&Tok::At);
                 let inner = self.parse_unary(in_sig)?;
-                let inner = if at { Expr::AtExpr(Box::new(inner)) } else { inner };
+                let inner = if at {
+                    Expr::AtExpr(Box::new(inner))
+                } else {
+                    inner
+                };
                 Ok(Expr::RClosure(Box::new(inner)))
             }
             Tok::After => {
@@ -1607,10 +1615,7 @@ impl Parser {
                 let name = self.ident()?;
                 self.expect(&Tok::Colon)?;
                 // Skip a leading multiplicity keyword on the domain.
-                if matches!(
-                    self.peek(),
-                    Tok::SetKw | Tok::Some | Tok::Lone | Tok::One
-                ) {
+                if matches!(self.peek(), Tok::SetKw | Tok::Some | Tok::Lone | Tok::One) {
                     self.bump();
                 }
                 let expr = self.rel_expr_top(false)?;
@@ -1729,10 +1734,10 @@ impl Parser {
             && (matches!(self.peek_at(2), Tok::Colon) || matches!(self.peek_at(2), Tok::Comma))
         {
             self.bump(); // comma
-            // If the token after the name we're about to read is Colon,
-            // it means the group ends with this name: `x, y: S`
-            // But if peek_at(1) (after the comma) is a name followed by Colon
-            // and we've already consumed a Colon for a prior name, stop.
+                         // If the token after the name we're about to read is Colon,
+                         // it means the group ends with this name: `x, y: S`
+                         // But if peek_at(1) (after the comma) is a name followed by Colon
+                         // and we've already consumed a Colon for a prior name, stop.
             names.push(self.bind_name()?);
             // If next is Colon, the group is complete — don't add more
             if matches!(self.peek(), Tok::Colon) {
@@ -1781,11 +1786,15 @@ impl Parser {
         if self.starts_int_expr() || matches!(self.peek(), Tok::LParen) {
             let save = self.pos;
             match self.int_cmp_tail() {
+                // Rewind when the right side is NOT a genuine int (it has a
+                // set reading) and the left is not a bare integer either
+                // (`{x: X} = X`, `(A + B) = S`), or when both sides are
+                // brace-pure set shapes (`{0}+{1} = {0,1}`, `{A} = {B}`):
+                // the relational reading wins. A bare-int left
+                // (`5 = X`, `sum X = Y`, `MSB = 3`) commits bitmask
+                // semantics.
                 Ok(Formula::IntCmp(IntCmpOp::Eq | IntCmpOp::Neq, ref l, ref r, _))
-                    if !l.int_typed()
-                        || !r.int_typed()
-                        || l.rewind_bitsval_eq()
-                        || r.rewind_bitsval_eq() =>
+                    if should_rewind_eq(l, r) =>
                 {
                     self.pos = save;
                 }
@@ -1804,9 +1813,8 @@ impl Parser {
         if matches!(self.peek(), Tok::Hash | Tok::Sum | Tok::LParen) {
             let save = self.pos;
             if let Ok(ie) = self.int_expr() {
-                if ie.int_typed()
+                if crate::types::is_int_query(&ie)
                     && !matches!(ie, IntExpr::Lit(..))
-                    && !ie.rewind_bitsval_eq()
                     && matches!(self.peek(), Tok::Eq | Tok::NotEq)
                 {
                     let neg = matches!(self.peek(), Tok::NotEq);
@@ -1861,10 +1869,7 @@ impl Parser {
         let l = self.rel_expr_top(false)?;
         // `<`/`>`/`<=`/`>=` can never continue a set comparison: rewind and
         // take the integer route (operands lower via the SUM cast).
-        if matches!(
-            self.peek(),
-            Tok::Lt | Tok::Gt | Tok::LtEq | Tok::GtEq
-        ) {
+        if matches!(self.peek(), Tok::Lt | Tok::Gt | Tok::LtEq | Tok::GtEq) {
             self.pos = start;
             return self.int_cmp_tail();
         }
@@ -1906,46 +1911,47 @@ impl Parser {
                 return Err(self.err(&format!("expected comparison, got {}", other.describe())))
             }
         };
-        // `set = int-expr` (Java `toSet`: the int side becomes the
-        // singleton set). `X = sum {1,2}` desugars to `#X = 1 and
-        // sum(X) = sum({1,2})`. `#`/`sum` never start a set expression,
-        // so attempting int-first here cannot regress: on failure the
-        // original error surfaces unchanged. (The operator itself is
-        // still next; the int operand starts one token later.)
+        // Bit-vector model: an integer expression left of `in` is a type
+        // error (`in` requires set operands on both sides). Probe the
+        // LHS from the comparison start: a genuine int tree (not a
+        // brace-pure set shape, e.g. `{1}+{2}`) commits the error;
+        // `{1}+{2} in X` and `x in X` stay relational.
+        if matches!(kind, CmpKind::In | CmpKind::NotIn) {
+            let at_op = self.pos;
+            self.pos = start;
+            if let Ok(ie) = self.int_expr() {
+                if int_left_of_in_is_error(&ie) {
+                    self.pos = start;
+                    return Err(self.err(
+                        "type mismatch: integer expression cannot appear left of `in` (both sides must be sets, e.g. `{0, 2} in X`)",
+                    ));
+                }
+            }
+            self.pos = at_op;
+        }
+        // `set = int-expr` (bit-vector model: the set side reads as its
+        // bitmask value, so `X = 5` holds iff X = {0, 2}).
+        // `#`/`sum`/`(`/literals never start a set expression, so
+        // attempting int-first here cannot regress: on failure or brace
+        // rewind the original relational path surfaces unchanged.
         if matches!(kind, CmpKind::Eq | CmpKind::Neq)
-            && matches!(self.peek_at(1), Tok::Hash | Tok::Sum | Tok::LParen)
+            && matches!(
+                self.peek_at(1),
+                Tok::Hash | Tok::Sum | Tok::LParen | Tok::Int(_) | Tok::Minus
+            )
         {
             let save = self.pos;
             self.bump(); // consume `=` / `!=`
             if let Ok(ie) = self.int_expr() {
-                if ie.int_typed() && !matches!(ie, IntExpr::Lit(..)) && !ie.rewind_bitsval_eq() {
-                    return Ok(set_eq_int(l, ie, pos, matches!(kind, CmpKind::Neq)));
+                if set_eq_rhs_is_int(&ie) {
+                    let neg = matches!(kind, CmpKind::Neq);
+                    return Ok(set_eq_int(l, ie, pos, neg));
                 }
             }
             self.pos = save;
         }
         self.bump();
         let r = self.rel_expr_top(false)?;
-        // Bit-vector model: `=`/`!=` with an integer-literal side against
-        // a UNION compares the literal's bitset (`7 = {0, 1, 2}` holds
-        // since bits(7) is `{0, 1, 2}`, as does `7 = {0}+{1}+{2}`).
-        // Any other shape keeps the legacy singleton reading, so `x = 5`,
-        // `a.x = 3` and `MSB = 3` are unaffected. `in` is untouched as well.
-        if matches!(kind, CmpKind::Eq | CmpKind::Neq) {
-            let lnum = numeric_name(&l);
-            let rnum = numeric_name(&r);
-            let lun = matches!(l, crate::ast::Expr::Bin(crate::ast::BinOp::Union, _, _));
-            let run = matches!(r, crate::ast::Expr::Bin(crate::ast::BinOp::Union, _, _));
-            let l = match lnum {
-                Some((v, p)) if run => Expr::Bits(v, p),
-                _ => l,
-            };
-            let r = match rnum {
-                Some((v, p)) if lun => Expr::Bits(v, p),
-                _ => r,
-            };
-            return Ok(Formula::Cmp(kind, l, r, pos));
-        }
         Ok(Formula::Cmp(kind, l, r, pos))
     }
 
@@ -1971,10 +1977,12 @@ impl Parser {
     }
 
     fn starts_int_expr(&self) -> bool {
-        matches!(
-            self.peek(),
-            Tok::Hash | Tok::Sum | Tok::Int(_) | Tok::Minus | Tok::LBrace
-        )
+        match self.peek() {
+            Tok::Hash | Tok::Sum | Tok::Int(_) | Tok::Minus | Tok::LBrace => true,
+            // MSB reads as a scalar (its bitmask value) in int positions.
+            Tok::Ident(n) => n == "MSB",
+            _ => false,
+        }
     }
 
     fn int_expr(&mut self) -> PResult<IntExpr> {
@@ -2116,11 +2124,9 @@ impl Parser {
 fn partial_set_shape(e: &crate::ast::Expr) -> bool {
     match e {
         crate::ast::Expr::Name(..) | crate::ast::Expr::None_ => true,
-        crate::ast::Expr::Bin(
-            crate::ast::BinOp::Union | crate::ast::BinOp::Product,
-            a,
-            b,
-        ) => partial_set_shape(a) && partial_set_shape(b),
+        crate::ast::Expr::Bin(crate::ast::BinOp::Union | crate::ast::BinOp::Product, a, b) => {
+            partial_set_shape(a) && partial_set_shape(b)
+        }
         // Dotted pool reference (`B.f`): joins of label-free plain names.
         crate::ast::Expr::Bin(crate::ast::BinOp::Join, a, b) => {
             dotted_rel_shape(a) && dotted_rel_shape(b)
@@ -2144,36 +2150,16 @@ fn dotted_rel_shape(e: &crate::ast::Expr) -> bool {
     }
 }
 
-/// Integer literal in set position (a lone `Name("7")`): returns its value
-/// and position. Sig/variable names never parse as integers, so this
-/// unambiguously detects literal sides of `=`/`!=` for bitset comparison.
-fn numeric_name(e: &crate::ast::Expr) -> Option<(i64, usize)> {
-    match e {
-        crate::ast::Expr::Name(n, p) => n.parse::<i64>().ok().map(|v| (v, *p)),
-        _ => None,
-    }
-}
-
-/// `set = int` (Java `toSet`: the int side denotes its singleton set).
-/// Desugared as `#set = 1 and sum(set) = int`, equivalent for int atoms.
+/// `set = int` (bit-vector model: the set side reads as its bitmask
+/// value, Σ signed-MSB weights — `X = 5` holds iff X = {0, 2}).
+/// Desugared as `bits(set) = int`; the set side keeps its Expr so the
+/// lowerer can check it denotes int atoms.
 fn set_eq_int(set: Expr, ie: IntExpr, pos: usize, neg: bool) -> Formula {
-    let one = Formula::IntCmp(
-        IntCmpOp::Eq,
-        IntExpr::Card(Box::new(set.clone()), pos),
-        IntExpr::Lit(1, pos),
-        pos,
-    );
-    let sum = Formula::IntCmp(
-        IntCmpOp::Eq,
-        IntExpr::SumOf(Box::new(set), pos),
-        ie,
-        pos,
-    );
-    let and = Formula::And(Box::new(one), Box::new(sum));
+    let cmp = Formula::IntCmp(IntCmpOp::Eq, IntExpr::BitsVal(Box::new(set), pos), ie, pos);
     if neg {
-        Formula::Not(Box::new(and))
+        Formula::Not(Box::new(cmp))
     } else {
-        and
+        cmp
     }
 }
 
@@ -2196,7 +2182,8 @@ fn fold_int_literal(ie: &crate::ast::IntExpr) -> Option<i64> {
     }
 }
 
-fn mult3(t: &Tok) -> crate::ast::Mult3 {    match t {
+fn mult3(t: &Tok) -> crate::ast::Mult3 {
+    match t {
         Tok::Lone => crate::ast::Mult3::Lone,
         Tok::One => crate::ast::Mult3::One,
         _ => crate::ast::Mult3::Some,

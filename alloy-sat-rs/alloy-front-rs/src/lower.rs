@@ -2,6 +2,7 @@
 
 use crate::ast::*;
 use crate::bounds::{self, Resolved};
+use crate::types::{SetKind, INT_MISMATCH_MSG};
 use crate::FrontError;
 use alloy_kodkod_rs::ast::{
     self as kk, CastToIntOp, ExprCompOp, ExprId, FormulaId, IntId, Multiplicity, Quantifier,
@@ -46,8 +47,11 @@ pub struct Lowerer<'m> {
 
 type LResult<T> = Result<T, FrontError>;
 
-/// Variable environment: name -> (kodkod var, arity).
-type Env = Vec<(String, kk::VarId, u32)>;
+/// A resolved name binding: (kodkod expr, arity, abstract flavor).
+type BindEntry = (ExprId, u32, SetKind);
+
+/// Variable environment: name -> (kodkod var, arity, abstract flavor).
+type Env = Vec<(String, kk::VarId, u32, SetKind)>;
 
 impl<'m> Lowerer<'m> {
     pub fn new(module: &'m Module) -> Lowerer<'m> {
@@ -88,8 +92,12 @@ impl<'m> Lowerer<'m> {
             | CommandKind::Minimize { name: None, .. } => false,
             CommandKind::Run(Some(name))
             | CommandKind::Check(Some(name))
-            | CommandKind::Maximize { name: Some(name), .. }
-            | CommandKind::Minimize { name: Some(name), .. } => self
+            | CommandKind::Maximize {
+                name: Some(name), ..
+            }
+            | CommandKind::Minimize {
+                name: Some(name), ..
+            } => self
                 .module
                 .paras
                 .iter()
@@ -106,128 +114,131 @@ impl<'m> Lowerer<'m> {
                 .filter_map(|sd| sd.fact.as_ref())
                 .any(|f| f.has_soft())
             || body_soft;
-        let (arena, bounds, bitwidth, (formula, objective)) = self.with_setup(&scope, |ctx, arena, _bounds, mut parts| {            // global facts
-            for (_, f) in &ctx.module.facts {
-                parts.push(ctx.lower_formula(arena, f, &mut Vec::new())?);
-            }
-            // sig facts: all this: S | fact
-            for sd in &ctx.module.sigs {
-                if let Some(f) = &sd.fact {
-                    for owner in &sd.names {
-                        let fid = ctx.lower_sig_fact(arena, f, owner)?;
-                        parts.push(fid);
-                    }
+        let (arena, bounds, bitwidth, (formula, objective)) =
+            self.with_setup(&scope, |ctx, arena, _bounds, mut parts| {
+                // global facts
+                for (_, f) in &ctx.module.facts {
+                    parts.push(ctx.lower_formula(arena, f, &mut Vec::new())?);
                 }
-            }
-            // sig `in` constraints: sig A in B  =>  A in B (subset).
-            // A builtin `Int`/`Signed` parent needs no formula: the child's
-            // upper bound is already exactly the int atoms (the solver's
-            // integer layer cannot take an Ints constant in a formula).
-            for sd in &ctx.module.sigs {
-                if sd.rel == crate::ast::SigRel::In {
-                    if let Some(parent_name) = &sd.extends {
-                        if parent_name == "Int" || parent_name == "Signed" {
-                            continue;
-                        }
-                        for child_name in &sd.names {
-                            let child_rel = ctx.lookup_rel(child_name).ok_or_else(|| {
-                                FrontError::Resolve(format!("unknown sig '{child_name}'"))
-                            })?;
-                            let parent_rel = ctx.lookup_rel(parent_name).ok_or_else(|| {
-                                FrontError::Resolve(format!("unknown sig '{parent_name}'"))
-                            })?;
-                            let ce = arena.expr_relation(child_rel);
-                            let pe = arena.expr_relation(parent_rel);
-                            // A in B  <=>  no (A - B)
-                            let diff = arena
-                                .binary_expr(kk::BinaryOp::Difference, ce, pe)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            let some_diff = arena
-                                .multiplicity_formula(Multiplicity::Some, diff)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            parts.push(arena.not(some_diff));
+                // sig facts: all this: S | fact
+                for sd in &ctx.module.sigs {
+                    if let Some(f) = &sd.fact {
+                        for owner in &sd.names {
+                            let fid = ctx.lower_sig_fact(arena, f, owner)?;
+                            parts.push(fid);
                         }
                     }
                 }
-            }
-            // AlloyMax `soft fact`s: lowered and wrapped as soft
-            // formulas (optimized, not asserted).
-            for (_, f) in &ctx.module.soft_facts {
-                let bf = ctx.lower_formula(arena, f, &mut Vec::new())?;
-                parts.push(arena.soft_fact(bf));
-            }
-            // command body
-            let (body_name, negate) = match &kind {                CommandKind::Run(n) => (n.clone(), false),
-                CommandKind::Check(n) => (n.clone(), true),
-                CommandKind::Maximize { name, .. } | CommandKind::Minimize { name, .. } => {
-                    (name.clone(), false)
-                }
-            };
-            match body_name {
-                None => parts.push(arena.bool_formula(true)),
-                Some(name) => {
-                    let para = ctx
-                        .module
-                        .paras
-                        .iter()
-                        .find(|p| p.name == name)
-                        .ok_or_else(|| {
-                            FrontError::Resolve(format!("command references unknown '{name}'"))
-                        })?;
-                    if !para.params.is_empty() {
-                        return Err(FrontError::Unsupported(format!(
-                            "parametrized '{name}' in command"
-                        )));
-                    }
-                    let bf = ctx.lower_formula(arena, &para.body, &mut Vec::new())?;
-                    // `check F` searches for a counterexample to F
-                    if negate {
-                        parts.push(arena.not(bf));
-                    } else {
-                        parts.push(bf);
-                    }
-                }
-            }
-            let formula = arena.and(&parts);
-            // Java Simplifier port: shrink uppers (grow lowers) from
-            // top-level `in`/`=` facts before translation. Applies to
-            // run/check/opt alike (and hence REPL Cnfs built from them).
-            let mut formula = formula;
-            match alloy_kodkod_rs::simplify::simplify_bounds(&arena, _bounds, formula)
-                .map_err(|e| FrontError::Resolve(e.to_string()))?
-            {
-                alloy_kodkod_rs::simplify::SimplifyOutcome::Unsat => {
-                    formula = arena.false_formula();
-                }
-                _ => {}
-            }
-            // Optimization target (maximize/minimize only).
-            let objective = match (opt_sense, opt_spec) {
-                (Some(sense), Some(spec)) => {
-                    let target = match spec {
-                        OptSpec::Int(ie) => {
-                            LoweredTarget::Int(ctx.lower_int(arena, &ie, &mut Vec::new())?)
-                        }
-                        OptSpec::Weights(pairs) => {
-                            let mut weights = HashMap::new();
-                            for (name, w) in pairs {
-                                let r = ctx.lookup_rel(&name).ok_or_else(|| {
-                                    FrontError::Resolve(format!(
-                                        "unknown relation '{name}' in weights"
-                                    ))
-                                })?;
-                                weights.insert(r, w);
+                // sig `in` constraints: sig A in B  =>  A in B (subset).
+                // A builtin `Int`/`Signed` parent needs no formula: the child's
+                // upper bound is already exactly the int atoms (the solver's
+                // integer layer cannot take an Ints constant in a formula).
+                for sd in &ctx.module.sigs {
+                    if sd.rel == crate::ast::SigRel::In {
+                        if let Some(parent_name) = &sd.extends {
+                            if parent_name == "Int" || parent_name == "Signed" {
+                                continue;
                             }
-                            LoweredTarget::Weighted(weights)
+                            for child_name in &sd.names {
+                                let child_rel = ctx.lookup_rel(child_name).ok_or_else(|| {
+                                    FrontError::Resolve(format!("unknown sig '{child_name}'"))
+                                })?;
+                                let parent_rel = ctx.lookup_rel(parent_name).ok_or_else(|| {
+                                    FrontError::Resolve(format!("unknown sig '{parent_name}'"))
+                                })?;
+                                let ce = arena.expr_relation(child_rel);
+                                let pe = arena.expr_relation(parent_rel);
+                                // A in B  <=>  no (A - B)
+                                let diff = arena
+                                    .binary_expr(kk::BinaryOp::Difference, ce, pe)
+                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                                let some_diff = arena
+                                    .multiplicity_formula(Multiplicity::Some, diff)
+                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                                parts.push(arena.not(some_diff));
+                            }
                         }
-                    };
-                    Some(LoweredOpt { sense, target })
+                    }
                 }
-                (None, None) => None,
-                _ => unreachable!("sense and spec move together"),
-            };
-            Ok((formula, objective))
-        })?;
+                // AlloyMax `soft fact`s: lowered and wrapped as soft
+                // formulas (optimized, not asserted).
+                for (_, f) in &ctx.module.soft_facts {
+                    let bf = ctx.lower_formula(arena, f, &mut Vec::new())?;
+                    parts.push(arena.soft_fact(bf));
+                }
+                // command body
+                let (body_name, negate) = match &kind {
+                    CommandKind::Run(n) => (n.clone(), false),
+                    CommandKind::Check(n) => (n.clone(), true),
+                    CommandKind::Maximize { name, .. } | CommandKind::Minimize { name, .. } => {
+                        (name.clone(), false)
+                    }
+                };
+                match body_name {
+                    None => parts.push(arena.bool_formula(true)),
+                    Some(name) => {
+                        let para = ctx
+                            .module
+                            .paras
+                            .iter()
+                            .find(|p| p.name == name)
+                            .ok_or_else(|| {
+                                FrontError::Resolve(format!("command references unknown '{name}'"))
+                            })?;
+                        if !para.params.is_empty() {
+                            return Err(FrontError::Unsupported(format!(
+                                "parametrized '{name}' in command"
+                            )));
+                        }
+                        let bf = ctx.lower_formula(arena, &para.body, &mut Vec::new())?;
+                        // `check F` searches for a counterexample to F
+                        if negate {
+                            parts.push(arena.not(bf));
+                        } else {
+                            parts.push(bf);
+                        }
+                    }
+                }
+                let formula = arena.and(&parts);
+                // Java Simplifier port: shrink uppers (grow lowers) from
+                // top-level `in`/`=` facts before translation. Applies to
+                // run/check/opt alike (and hence REPL Cnfs built from them).
+                let mut formula = formula;
+                match alloy_kodkod_rs::simplify::simplify_bounds(&arena, _bounds, formula)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?
+                {
+                    alloy_kodkod_rs::simplify::SimplifyOutcome::Unsat => {
+                        formula = arena.false_formula();
+                    }
+                    _ => {}
+                }
+                // Optimization target (maximize/minimize only).
+                let objective = match (opt_sense, opt_spec) {
+                    (Some(sense), Some(spec)) => {
+                        let target = match spec {
+                            OptSpec::Int(ie) => {
+                                LoweredTarget::Int(ctx.lower_int(arena, &ie, &mut Vec::new())?)
+                            }
+                            OptSpec::Weights(pairs) => {
+                                let mut weights = HashMap::new();
+                                for (name, w) in pairs {
+                                    let r = ctx.lookup_rel(&name).ok_or_else(|| {
+                                        FrontError::Resolve(format!(
+                                            "unknown relation '{name}' in weights"
+                                        ))
+                                    })?;
+                                    weights.insert(r, w);
+                                }
+                                LoweredTarget::Weighted(weights)
+                            }
+                        };
+                        Some(LoweredOpt { sense, target })
+                    }
+                    (None, None) => None,
+                    _ => unreachable!("sense and spec move together"),
+                };
+                Ok((formula, objective))
+            })?;
         Ok(LoweredProblem {
             arena,
             bounds,
@@ -335,11 +346,25 @@ impl<'m> Lowerer<'m> {
                 open_params.insert(open.alias.clone(), params);
             }
         }
+        let mut field_int: HashMap<String, SetKind> = HashMap::new();
+        for sd in &self.module.sigs {
+            for owner in &sd.names {
+                for d in &sd.fields {
+                    for fname in &d.names {
+                        field_int.insert(
+                            format!("{owner}.{fname}"),
+                            SetKind::from_bool(mentions_int_expr(&d.expr)),
+                        );
+                    }
+                }
+            }
+        }
         let ctx = Ctx {
             module: self.module,
             res: &res,
             rels: &rels,
             field_arity: &field_arity,
+            field_int,
             ordering_info: &ordering_info,
             depth: std::cell::Cell::new(0),
             open_params,
@@ -511,11 +536,25 @@ impl<'m> Lowerer<'m> {
             }
         }
 
+        let mut field_int: HashMap<String, SetKind> = HashMap::new();
+        for sd in &self.module.sigs {
+            for owner in &sd.names {
+                for d in &sd.fields {
+                    for fname in &d.names {
+                        field_int.insert(
+                            format!("{owner}.{fname}"),
+                            SetKind::from_bool(mentions_int_expr(&d.expr)),
+                        );
+                    }
+                }
+            }
+        }
         let ctx = Ctx {
             module: self.module,
             res: &res,
             rels: &rels,
             field_arity: &field_arity,
+            field_int,
             ordering_info: &ordering_info,
             depth: std::cell::Cell::new(0),
             open_params,
@@ -555,9 +594,9 @@ impl<'m> Lowerer<'m> {
                             out.push(t);
                         }
                         let tuples = self.type_tuples(&d.expr, ctx.res)?;
-                        let frel = ctx.lookup_rel(&key).ok_or_else(|| {
-                            FrontError::Resolve(format!("unknown field '{key}'"))
-                        })?;
+                        let frel = ctx
+                            .lookup_rel(&key)
+                            .ok_or_else(|| FrontError::Resolve(format!("unknown field '{key}'")))?;
                         if let Some(c) =
                             field_mult_constraint(ctx, arena, b, frel, d, owner, &tuples)?
                         {
@@ -623,7 +662,12 @@ impl<'m> Lowerer<'m> {
             }
             Expr::Bin(_, a, _) => self.type_arity(a, res)?,
             Expr::Name(n, pos) => {
-                if res.sigs.contains_key(n) || n == "univ" || n == "int" || n == "Int" || n == "Signed" {
+                if res.sigs.contains_key(n)
+                    || n == "univ"
+                    || n == "int"
+                    || n == "Int"
+                    || n == "Signed"
+                {
                     1
                 } else {
                     return Err(FrontError::Parse {
@@ -677,9 +721,8 @@ impl<'m> Lowerer<'m> {
             Expr::IntAtom => {
                 // Int atoms: named by their numeric value over the
                 // resolved atom count (`{0, .., W-1}`).
-                let int_atoms: Vec<Vec<String>> = (0..res.int_count)
-                    .map(|v| vec![v.to_string()])
-                    .collect();
+                let int_atoms: Vec<Vec<String>> =
+                    (0..res.int_count).map(|v| vec![v.to_string()]).collect();
                 Ok(int_atoms)
             }
             Expr::Bin(BinOp::Product, a, b) => {
@@ -716,6 +759,16 @@ impl<'m> Lowerer<'m> {
     }
 }
 
+/// Rightmost field label of a dotted chain (`Bar.f` -> `f`).
+fn trailing_field_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Name(n, _) => Some(n.clone()),
+        Expr::Bin(_, _, r) => trailing_field_name(r),
+        Expr::Bracket(base, _) => trailing_field_name(base),
+        _ => None,
+    }
+}
+
 /// Shared lowering context over resolved names.
 struct Ctx<'a> {
     module: &'a Module,
@@ -727,10 +780,14 @@ struct Ctx<'a> {
     depth: std::cell::Cell<u32>,
     /// alias -> parameter type names (from `open util/graph[Type] as graph`)
     open_params: HashMap<String, Vec<String>>,
-    /// expression-level name bindings (used for sig fact field qualification)
-    expr_binds: std::cell::RefCell<HashMap<String, (ExprId, u32)>>,
-    /// let-binding scope: name -> (lowered ExprId, arity)
-    let_binds: std::cell::RefCell<Vec<HashMap<String, (ExprId, u32)>>>,
+    /// expression-level name bindings (used for sig fact field qualification):
+    /// name -> (kodkod expr, arity, abstract flavor).
+    expr_binds: std::cell::RefCell<HashMap<String, BindEntry>>,
+    /// Per-field abstract flavor (key `Owner.field`): `Int` when the
+    /// field type mentions `int`/`Int`/`Signed` (bitmask-comparable).
+    field_int: HashMap<String, SetKind>,
+    /// let-binding scope: name -> `BindEntry`.
+    let_binds: std::cell::RefCell<Vec<HashMap<String, BindEntry>>>,
     /// Whether universe atom names (`A$0`) resolve as singleton sets.
     /// True only for the `:query` path (solve-after evaluation, mirroring
     /// Java's `frame.a2k`); model text (run/check/eval builds) rejects
@@ -1190,7 +1247,9 @@ impl<'a> Ctx<'a> {
             }
             "stronglyConnected" => {
                 if args.len() != 1 {
-                    return Err(FrontError::Resolve("stronglyConnected expects 1 arg".into()));
+                    return Err(FrontError::Resolve(
+                        "stronglyConnected expects 1 arg".into(),
+                    ));
                 }
                 let (re, _ra) = self.lower_expr(arena, &args[0], env)?;
                 let domain_e = arena.expr_relation(domain_sig);
@@ -1402,11 +1461,11 @@ impl<'a> Ctx<'a> {
         let this_e = arena.expr_variable(var);
 
         // Collect all field names for this sig and ancestors, and build this.field bindings
-        let mut binds = HashMap::new();
+        let mut binds: HashMap<String, BindEntry> = HashMap::new();
         self.collect_sig_field_binds(arena, owner, this_e, &mut binds);
 
         *self.expr_binds.borrow_mut() = binds;
-        let mut env: Env = vec![("this".into(), var, 1)];
+        let mut env: Env = vec![("this".into(), var, 1, SetKind::Plain)];
         let body = self.lower_formula(arena, f, &mut env)?;
         self.expr_binds.borrow_mut().clear();
         Ok(arena.quantified(Quantifier::All, ds, body))
@@ -1417,10 +1476,15 @@ impl<'a> Ctx<'a> {
         arena: &mut kk::AstArena,
         sig_name: &str,
         this_e: ExprId,
-        binds: &mut HashMap<String, (ExprId, u32)>,
+        binds: &mut HashMap<String, BindEntry>,
     ) {
         // Find the sig decl
-        let sd = match self.module.sigs.iter().find(|s| s.names.iter().any(|n| n == sig_name)) {
+        let sd = match self
+            .module
+            .sigs
+            .iter()
+            .find(|s| s.names.iter().any(|n| n == sig_name))
+        {
             Some(s) => s.clone(),
             None => return,
         };
@@ -1445,7 +1509,12 @@ impl<'a> Ctx<'a> {
                             found = Some(r);
                             break;
                         }
-                        if let Some(psd) = self.module.sigs.iter().find(|s| s.names.iter().any(|n| n == parent)) {
+                        if let Some(psd) = self
+                            .module
+                            .sigs
+                            .iter()
+                            .find(|s| s.names.iter().any(|n| n == parent))
+                        {
                             cur = psd.extends.as_deref();
                         } else {
                             break;
@@ -1456,8 +1525,13 @@ impl<'a> Ctx<'a> {
                 if let Some(fr) = fr {
                     let fexpr = arena.expr_relation(fr);
                     let fa = arena.relation_arity(fr);
+                    let flavor = self
+                        .field_int
+                        .get(&format!("{sig_name}.{fname}"))
+                        .copied()
+                        .unwrap_or(SetKind::Plain);
                     if let Ok(this_field) = arena.binary_expr(kk::BinaryOp::Join, this_e, fexpr) {
-                        binds.insert(fname.clone(), (this_field, fa - 1));
+                        binds.insert(fname.clone(), (this_field, fa - 1, flavor));
                     }
                 }
             }
@@ -1471,11 +1545,7 @@ impl<'a> Ctx<'a> {
     /// Exact singleton set of the int atom `v` (bit-vector model: int
     /// atoms are named by value, `{0, .., W-1}`). Errors when the atom was
     /// not materialized (lazy Int allocation).
-    fn int_atom_singleton(
-        &self,
-        arena: &mut kk::AstArena,
-        v: i64,
-    ) -> LResult<ExprId> {
+    fn int_atom_singleton(&self, arena: &mut kk::AstArena, v: i64) -> LResult<ExprId> {
         let name = v.to_string();
         match self.res.universe.index(&name) {
             Ok(idx) => Ok(arena.expr_atoms(vec![idx])),
@@ -1484,6 +1554,147 @@ impl<'a> Ctx<'a> {
                 self.res.int_count
             ))),
         }
+    }
+
+    /// Abstract flavor of a sig: `Int` when its ancestor chain roots at
+    /// the builtin `Int` or `Signed` (atoms are `{0..W-1}` int atoms).
+    fn sig_int_flavored(&self, name: &str) -> SetKind {
+        let mut cur = name.to_string();
+        loop {
+            match self.res.sigs.get(&cur) {
+                Some(si) => match &si.parent {
+                    Some(p) if p == "Int" || p == "Signed" => return SetKind::Int,
+                    Some(p) => cur = p.clone(),
+                    None => return SetKind::Plain,
+                },
+                None => return SetKind::Plain,
+            }
+        }
+    }
+
+    /// Abstract flavor of the LAST field of a dotted chain (`a.x` -> `x`):
+    /// Some(kind) when the label resolves to declared fields.
+    fn field_int_flavored(&self, e: &Expr) -> Option<SetKind> {
+        let field = trailing_field_name(e)?;
+        if field == "int" || field == "Int" || field == "Signed" || field == "MSB" {
+            return Some(SetKind::Int);
+        }
+        if field.contains('$') || field.contains('/') || field.parse::<i64>().is_ok() {
+            return None;
+        }
+        let mut found: Option<SetKind> = None;
+        for (key, &flavor) in self.field_int.iter() {
+            if key.rsplit('.').next() == Some(field.as_str()) {
+                found = Some(match found {
+                    None => flavor,
+                    Some(acc) => acc.and(flavor),
+                });
+            }
+        }
+        found
+    }
+
+    /// Abstract flavor of an expression (bit-vector model): `Int` when the
+    /// set denotes int atoms, so integer comparisons are bitmask
+    /// meaningful. `Unknown` (comprehension, unresolved calls) behaves as
+    /// non-int today; reserved for gradual strictness.
+    fn set_int_flavored(&self, e: &Expr, env: &Env) -> SetKind {
+        // Fast path for leaves that need no environment.
+        if let Some(kind) = crate::types::leaf_kind(e) {
+            match kind {
+                SetKind::Int | SetKind::Plain => return kind,
+                SetKind::Unknown => return kind,
+            }
+        }
+        match e {
+            Expr::Name(n, _) => {
+                // name resolution order mirroring lower_expr
+                {
+                    let binds = self.let_binds.borrow();
+                    for scope in binds.iter().rev() {
+                        if let Some(&(_, _, kind)) = scope.get(n) {
+                            return kind;
+                        }
+                    }
+                }
+                if let Some((_, _, _, kind)) = env.iter().rev().find(|(nm, ..)| nm == n) {
+                    return *kind;
+                }
+                if let Some(&(_, _, kind)) = self.expr_binds.borrow().get(n) {
+                    return kind;
+                }
+                if self.rels.contains_key(n) {
+                    return self.sig_int_flavored(n);
+                }
+                // unresolved name: universe atom fallback treats numeric
+                // atoms as int; otherwise not int-flavored.
+                SetKind::from_bool(
+                    self.res
+                        .universe
+                        .index(n)
+                        .ok()
+                        .and_then(|idx| self.res.universe.atom(idx as usize).ok())
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .is_some_and(|v| v >= 0),
+                )
+            }
+            Expr::Bin(op, l, r) => match op {
+                BinOp::Join => match self.field_int_flavored(r) {
+                    Some(kind) => kind,
+                    None => self.set_int_flavored(r, env).and(self.set_int_flavored(l, env)),
+                },
+                _ => self.set_int_flavored(l, env).and(self.set_int_flavored(r, env)),
+            },
+            Expr::Transpose(x)
+            | Expr::TClosure(x)
+            | Expr::RClosure(x)
+            | Expr::Prime(x)
+            | Expr::AtExpr(x)
+            | Expr::ArrowMult(_, x)
+            | Expr::LeadMult(_, x) => self.set_int_flavored(x, env),
+            Expr::Bracket(base, args) => {
+                let mut kind = self.set_int_flavored(base, env);
+                for a in args {
+                    kind = kind.and(self.set_int_flavored(a, env));
+                }
+                kind
+            }
+            Expr::Call(name, _, _) => self
+                .module
+                .paras
+                .iter()
+                .find(|p| p.is_fun && p.name == *name && p.ret.is_some())
+                .map(|p| self.set_int_flavored(p.ret.as_ref().unwrap(), env))
+                .unwrap_or(SetKind::Unknown),
+            Expr::If(_c, t, el) => self.set_int_flavored(t, env).and(self.set_int_flavored(el, env)),
+            Expr::LetBind(binds, body) => {
+                let mut kind = self.set_int_flavored(body, env);
+                for (_, ex) in binds {
+                    kind = kind.and(self.set_int_flavored(ex, env));
+                }
+                kind
+            }
+            // Conservative: other shapes error on int use.
+            _ => SetKind::Plain,
+        }
+    }
+
+    /// Single gate for set-typed operands in integer position: checks the
+    /// abstract flavor, then lowers and applies the BITS bitmask cast.
+    /// `SumOf` (explicit `sum e`) intentionally bypasses this and uses SUM.
+    fn lower_int_cast(
+        &self,
+        arena: &mut kk::AstArena,
+        e: &Expr,
+        env: &mut Env,
+    ) -> LResult<IntId> {
+        if !self.set_int_flavored(e, env).is_int() {
+            return Err(FrontError::Resolve(INT_MISMATCH_MSG.to_string()));
+        }
+        let (ee, _) = self.lower_expr(arena, e, env)?;
+        arena
+            .cast_to_int(CastToIntOp::Bits, ee)
+            .map_err(|e| FrontError::Resolve(e.to_string()))
     }
 
     fn lower_expr(
@@ -1549,17 +1760,17 @@ impl<'a> Ctx<'a> {
                 {
                     let binds = self.let_binds.borrow();
                     for scope in binds.iter().rev() {
-                        if let Some(&(eid, a)) = scope.get(n) {
+                        if let Some(&(eid, a, _)) = scope.get(n) {
                             return Ok((eid, a));
                         }
                     }
                 }
-                if let Some((_, v, a)) = env.iter().rev().find(|(nm, _, _)| nm == n) {
+                if let Some((_, v, a, _fl)) = env.iter().rev().find(|(nm, ..)| nm == n) {
                     let (v, a) = (*v, *a);
                     return Ok((arena.expr_variable(v), a));
                 }
                 // Check expression-level bindings (sig fact field qualification)
-                if let Some(&(eid, a)) = self.expr_binds.borrow().get(n) {
+                if let Some(&(eid, a, _)) = self.expr_binds.borrow().get(n) {
                     return Ok((eid, a));
                 }
                 if let Some(r) = self.lookup_rel(n) {
@@ -1666,7 +1877,11 @@ impl<'a> Ctx<'a> {
                 }
                 return Err(FrontError::Parse {
                     pos: *pos,
-                    msg: format!("unresolved name '{}' (env has: {:?})", n, env.iter().map(|(n,_,_)| n.as_str()).collect::<Vec<_>>()),
+                    msg: format!(
+                        "unresolved name '{}' (env has: {:?})",
+                        n,
+                        env.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>()
+                    ),
                 });
             }
             Expr::Bin(op, a, b) => {
@@ -1840,7 +2055,7 @@ impl<'a> Ctx<'a> {
                 // name(args) where name is a relation: treat as bracket indexing
                 // Check expr_binds first (sig fact context), then lookup_rel
                 if !args.is_empty() {
-                    let base = if let Some(&(eid, ea)) = self.expr_binds.borrow().get(name) {
+                    let base = if let Some(&(eid, ea, _fl)) = self.expr_binds.borrow().get(name) {
                         Some((eid, ea))
                     } else {
                         self.lookup_rel(name).map(|r| {
@@ -1934,6 +2149,7 @@ impl<'a> Ctx<'a> {
         let mut list = Vec::new();
         let mut pushed = 0usize;
         for d in decls {
+            let domain_int = self.set_int_flavored(&d.expr, env);
             let (dom, _da) = self.lower_expr(arena, &d.expr, env)?;
             for n in &d.names {
                 let v = arena.variable(n);
@@ -1944,7 +2160,7 @@ impl<'a> Ctx<'a> {
                     ))
                 })?;
                 list.push(da);
-                env.push((n.clone(), v, arena.variable_arity(v)));
+                env.push((n.clone(), v, arena.variable_arity(v), domain_int));
                 pushed += 1;
             }
         }
@@ -1958,27 +2174,16 @@ impl<'a> Ctx<'a> {
                 let (ee, _) = self.lower_expr(arena, e, env)?;
                 arena.cast_to_int(CastToIntOp::Cardinality, ee).unwrap()
             }
-            IntExpr::Val(e, _) => {
-                // Set-typed operand in integer position: SUM cast (Java
-                // `typecheck_as_int`). A singleton evaluates to its value.
-                let (ee, _) = self.lower_expr(arena, e, env)?;
-                arena
-                    .cast_to_int(CastToIntOp::Sum, ee)
-                    .map_err(|e| FrontError::Resolve(e.to_string()))?
-            }
             IntExpr::SumOf(e, _) => {
-                // Explicit `sum e`: same SUM cast as `Val`.
+                // Explicit `sum e`: Σ of the int-atom VALUES via the SUM
+                // cast (`sum {0, 1}` is 1 — distinct from the bitmask 3).
                 let (ee, _) = self.lower_expr(arena, e, env)?;
                 arena
                     .cast_to_int(CastToIntOp::Sum, ee)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?
             }
-            IntExpr::BitsVal(e, _) => {
-                // Bit-vector value of a set: Σ 2^v over int atoms.
-                let (ee, _) = self.lower_expr(arena, e, env)?;
-                arena
-                    .cast_to_int(CastToIntOp::Bits, ee)
-                    .map_err(|e| FrontError::Resolve(e.to_string()))?
+            IntExpr::Val(e, _) | IntExpr::BitsVal(e, _) => {
+                self.lower_int_cast(arena, e, env)?
             }
             IntExpr::Sum(decls, body, _) => {
                 if decls.iter().any(|d| d.disj && d.names.len() > 1) {
@@ -2066,7 +2271,8 @@ impl<'a> Ctx<'a> {
                 .decl(v, Multiplicity::One, dom)
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
             decl_list.push(da);
-            env.push((full.clone(), v, 1));
+            let int_flavor = self.set_int_flavored(&Expr::Name(prefix.clone(), pd.pos), env);
+            env.push((full.clone(), v, 1, int_flavor));
             pushed += 1;
             var_of.insert(full.clone(), v);
         }
@@ -2185,6 +2391,14 @@ impl<'a> Ctx<'a> {
     ) -> LResult<FormulaId> {
         Ok(match f {
             Formula::Const(v) => arena.bool_formula(*v),
+            // `n in set` with an integer left side: type mismatch (`in`
+            // requires set operands on both sides). Reported at lowering.
+            Formula::BadIn(..) => {
+                return Err(FrontError::Parse {
+                    pos: 0,
+                    msg: "type mismatch: integer expression cannot appear left of `in` (both sides must be sets, e.g. `{0, 2} in X`)".to_string(),
+                });
+            }
             Formula::Not(x) => {
                 let inner = self.lower_formula(arena, x, env)?;
                 arena.not(inner)
@@ -2279,7 +2493,10 @@ impl<'a> Ctx<'a> {
                 let mut scope = HashMap::new();
                 for (name, e) in binds {
                     let (ee, ea) = self.lower_expr(arena, e, env)?;
-                    scope.insert(name.clone(), (ee, ea));
+                    // Formula-level `let` keeps the legacy lenient flavor
+                    // (historically `true`); revisit when gradual
+                    // strictness assigns real flavors here.
+                    scope.insert(name.clone(), (ee, ea, SetKind::Int));
                 }
                 self.let_binds.borrow_mut().push(scope);
                 let bf = self.lower_formula(arena, body, env)?;
@@ -2387,8 +2604,8 @@ impl<'a> Ctx<'a> {
                         // `disj` groups contribute x != y conjuncts/guards
                         let disj_pairs = collect_disj_pairs(decls, arena);
                         let (ds, pushed) = self.lower_decls(arena, decls, env)?;
-                let mut bf = self.lower_formula(arena, body, env)?;
-                for _ in 0..pushed {
+                        let mut bf = self.lower_formula(arena, body, env)?;
+                        for _ in 0..pushed {
                             env.pop();
                         }
                         for &(a, b) in &disj_pairs {
@@ -2564,10 +2781,7 @@ fn valid_pin_tag(tag: &str) -> bool {
 /// Collect distinct `(prefix, tag, full)` labels in first-seen order.
 /// Anything that is not a well-formed `Sig$tag` label is an error here
 /// (the `$` declaration ban keeps user bindings out of this path).
-fn collect_pin_labels(
-    e: &Expr,
-    out: &mut Vec<(String, String, String)>,
-) -> LResult<()> {
+fn collect_pin_labels(e: &Expr, out: &mut Vec<(String, String, String)>) -> LResult<()> {
     match e {
         Expr::Name(n, pos) => {
             if let Some((prefix, tag)) = n.split_once('$') {
@@ -2635,6 +2849,7 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
         Formula::Cmp(k, a, b, p) => {
             Formula::Cmp(*k, subst_expr(a, from, to), subst_expr(b, from, to), *p)
         }
+        Formula::BadIn(a, p) => Formula::BadIn(Box::new(subst_expr(a, from, to)), *p),
         Formula::IntCmp(op, a, b, p) => {
             Formula::IntCmp(*op, subst_int(a, from, to), subst_int(b, from, to), *p)
         }
@@ -2712,7 +2927,9 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
 fn subst_expr(e: &Expr, from: &str, to: &str) -> Expr {
     match e {
         Expr::Name(n, p) if n == from => Expr::Name(to.to_string(), *p),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => e.clone(),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => {
+            e.clone()
+        }
         Expr::Bin(op, a, b) => Expr::Bin(
             *op,
             Box::new(subst_expr(a, from, to)),
@@ -2809,29 +3026,27 @@ fn subst_int(i: &IntExpr, from: &str, to: &str) -> IntExpr {
 fn strip_mult(e: &Expr) -> Expr {
     match e {
         Expr::ArrowMult(_, inner) | Expr::LeadMult(_, inner) => strip_mult(inner),
-        Expr::Bin(op, a, b) => Expr::Bin(
-            *op,
-            Box::new(strip_mult(a)),
-            Box::new(strip_mult(b)),
-        ),
+        Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(strip_mult(a)), Box::new(strip_mult(b))),
         Expr::Transpose(x) => Expr::Transpose(Box::new(strip_mult(x))),
         Expr::TClosure(x) => Expr::TClosure(Box::new(strip_mult(x))),
         Expr::RClosure(x) => Expr::RClosure(Box::new(strip_mult(x))),
         Expr::Comprehension(ds, body) => Expr::Comprehension(ds.clone(), body.clone()),
-        Expr::If(c, t, el) => Expr::If(c.clone(), Box::new(strip_mult(t)), Box::new(strip_mult(el))),
+        Expr::If(c, t, el) => {
+            Expr::If(c.clone(), Box::new(strip_mult(t)), Box::new(strip_mult(el)))
+        }
         Expr::Bracket(base, args) => Expr::Bracket(
             Box::new(strip_mult(base)),
             args.iter().map(|a| Box::new(strip_mult(a))).collect(),
         ),
-        Expr::Call(n, args, p) => Expr::Call(
-            n.clone(),
-            args.iter().map(|a| strip_mult(a)).collect(),
-            *p,
-        ),
+        Expr::Call(n, args, p) => {
+            Expr::Call(n.clone(), args.iter().map(|a| strip_mult(a)).collect(), *p)
+        }
         Expr::Prime(x) => Expr::Prime(Box::new(strip_mult(x))),
         Expr::AtExpr(x) => Expr::AtExpr(Box::new(strip_mult(x))),
         Expr::LetBind(binds, body) => Expr::LetBind(binds.clone(), Box::new(strip_mult(body))),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => e.clone(),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => {
+            e.clone()
+        }
     }
 }
 
@@ -2866,6 +3081,7 @@ fn mentions_int_expr(e: &Expr) -> bool {
 fn mentions_int_formula(f: &Formula) -> bool {
     match f {
         Formula::IntCmp(..) => true,
+        Formula::BadIn(..) => true,
         Formula::Const(_) => false,
         // `pin` bodies live in `Module::partials`, walked at module level.
         Formula::Pin(..) => false,
@@ -2930,10 +3146,7 @@ fn seg_arity(e: &Expr) -> u32 {
 
 /// A product leaf usable directly as a unary quantifier domain.
 fn is_plain_domain(e: &Expr) -> bool {
-    matches!(
-        e,
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden
-    )
+    matches!(e, Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden)
 }
 
 /// Resolve one field-type column to a unary quantifier-domain expression:
@@ -3009,12 +3222,19 @@ fn field_mult_constraint(
                 walk(b, offset + aa as usize, markers, total_cols)?;
                 Ok(())
             }
-            Expr::Name(..) | Expr::Univ | Expr::IntAtom | Expr::Bits(..) | Expr::None_ | Expr::Iden => {
+            Expr::Name(..)
+            | Expr::Univ
+            | Expr::IntAtom
+            | Expr::Bits(..)
+            | Expr::None_
+            | Expr::Iden => {
                 *total_cols += 1;
                 Ok(())
             }
             Expr::AtExpr(inner) => walk(inner, offset, markers, total_cols),
-            Expr::Bin(BinOp::Union, _, _) | Expr::Bin(BinOp::Intersect, _, _) | Expr::Bin(BinOp::Difference, _, _) => {
+            Expr::Bin(BinOp::Union, _, _)
+            | Expr::Bin(BinOp::Intersect, _, _)
+            | Expr::Bin(BinOp::Difference, _, _) => {
                 *total_cols += 1;
                 Ok(())
             }
@@ -3047,9 +3267,9 @@ fn field_mult_constraint(
     // - columns 1.. are the lowered product-segment types (plain unary
     //   sigs); anything else falls back to an exact static helper.
     let mut dom_exprs: Vec<ExprId> = Vec::with_capacity(n);
-    let owner_rel = ctx.lookup_rel(owner).ok_or_else(|| {
-        FrontError::Resolve(format!("unknown sig '{owner}'"))
-    })?;
+    let owner_rel = ctx
+        .lookup_rel(owner)
+        .ok_or_else(|| FrontError::Resolve(format!("unknown sig '{owner}'")))?;
     dom_exprs.push(arena.expr_relation(owner_rel));
     // Uniform rule (documented `r: A m -> n B` table, Java-verified): a
     // multiplicity marking constrains, per (owner x prefix) row, the
@@ -3139,9 +3359,7 @@ fn field_mult_constraint(
             // pair sees multiplicity M of the preimage:
             // `all o: O, bl: D_last | M(join(join(o, f), bl))`.
             // (Argument-LAST single join = preimage direction.)
-            let dv_last = col_domain(
-                ctx, arena, b, res, &segs, &seg_cols, &col_atoms, d, n - 1,
-            )?;
+            let dv_last = col_domain(ctx, arena, b, res, &segs, &seg_cols, &col_atoms, d, n - 1)?;
             let v0 = arena.variable(&format!("%ml0%{}", std::ptr::from_ref(d) as usize));
             let d0 = arena.decl(v0, Multiplicity::One, dom_exprs[0]).unwrap();
             let vl = arena.variable(&format!("%ml1%{}", std::ptr::from_ref(d) as usize));
@@ -3173,7 +3391,9 @@ fn field_mult_constraint(
 fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
     match e {
         Expr::Name(n, _) if n == from => to.clone(),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => e.clone(),
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => {
+            e.clone()
+        }
         Expr::Bin(op, a, b) => Expr::Bin(
             *op,
             Box::new(replace_var_expr(a, from, to)),
@@ -3275,6 +3495,7 @@ fn replace_var_formula(f: &Formula, from: &str, to: &Expr) -> Formula {
             replace_var_expr(b, from, to),
             *p,
         ),
+        Formula::BadIn(a, p) => Formula::BadIn(Box::new(replace_var_expr(a, from, to)), *p),
         Formula::IntCmp(op, a, b, p) => Formula::IntCmp(
             *op,
             replace_var_int(a, from, to),
@@ -3383,9 +3604,7 @@ fn replace_var_int(i: &IntExpr, from: &str, to: &Expr) -> IntExpr {
         ),
         IntExpr::Val(e, p) => IntExpr::Val(Box::new(replace_var_expr(e, from, to)), *p),
         IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(replace_var_expr(e, from, to)), *p),
-        IntExpr::BitsVal(e, p) => {
-            IntExpr::BitsVal(Box::new(replace_var_expr(e, from, to)), *p)
-        }
+        IntExpr::BitsVal(e, p) => IntExpr::BitsVal(Box::new(replace_var_expr(e, from, to)), *p),
     }
 }
 

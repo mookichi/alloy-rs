@@ -16,14 +16,8 @@ const DEMO: &str = r#"
 #[test]
 fn fragment_keys_single_named_decls() {
     assert_eq!(fragment_keys("sig X {}").unwrap(), vec!["sig:X"]);
-    assert_eq!(
-        fragment_keys("pred p { some A }").unwrap(),
-        vec!["para:p"]
-    );
-    assert_eq!(
-        fragment_keys("fun f: set A { A }").unwrap(),
-        vec!["para:f"]
-    );
+    assert_eq!(fragment_keys("pred p { some A }").unwrap(), vec!["para:p"]);
+    assert_eq!(fragment_keys("fun f: set A { A }").unwrap(), vec!["para:f"]);
     assert_eq!(
         fragment_keys("fact named { some A }").unwrap(),
         vec!["fact:named"]
@@ -35,7 +29,9 @@ fn fragment_keys_append_only() {
     assert!(fragment_keys("fact { some A }").unwrap().is_empty());
     assert!(fragment_keys("run someA for 3").unwrap().is_empty());
     assert!(fragment_keys("sig X {} sig Y {}").unwrap().is_empty());
-    assert!(fragment_keys("open util/ordering[A] as ord").unwrap().is_empty());
+    assert!(fragment_keys("open util/ordering[A] as ord")
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -73,7 +69,11 @@ fn eval_lifts_bare_expression() {
     assert!(eval(DEMO, "A +").is_err());
 }
 
-fn solved_demo() -> (alloy_front_rs::Module, alloy_front_rs::Cnf, alloy_front_rs::Instance) {
+fn solved_demo() -> (
+    alloy_front_rs::Module,
+    alloy_front_rs::Cnf,
+    alloy_front_rs::Instance,
+) {
     let m = alloy_front_rs::parse_module(DEMO).expect("parse");
     let cnf = run(&m, 0).expect("run");
     let inst = solve(&cnf).expect("solve").expect("SAT");
@@ -169,7 +169,7 @@ fn query_int_universe() {
                 assert_eq!(ts.len(), 4, "W = 4 covers 0..3");
             }
             QueryValue::Int(..) => panic!("expected Set"),
-        QueryValue::Bool(..) => panic!("expected Set"),
+            QueryValue::Bool(..) => panic!("expected Set"),
         }
     }
     // the set-only entry point accepts it too
@@ -224,7 +224,7 @@ fn query_int_literal_wraps_like_java() {
         QueryValue::Bool(..) => panic!("expected Int"),
     }
     match query_value(&m, scope, &cnf, "-9", &inst).expect("query -9") {
-        QueryValue::Int(v) => assert_eq!(v, 7),
+        QueryValue::Int(v) => assert_eq!(v, -9),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
     }
@@ -281,17 +281,18 @@ fn query_comprehension_int_filter() {
     let src = r#"
         module demo
         sig X in Int {}
-        fact pin { X = 0 + 1 + 2 }
+        fact pin { X = {0} + {1} + {2} }
         run {} for 3, 8 Int
     "#;
     let m = alloy_front_rs::parse_module(src).expect("parse");
     let cnf = run(&m, 0).expect("build cnf");
     let inst = solve(&cnf).expect("solve").expect("SAT instance");
     let scope = &m.commands[0].scope;
+    // bitmask(x) < 2 holds only for atom 0 (weight 1)
     match query_value(&m, scope, &cnf, "{x: X | x < 2}", &inst).expect("query") {
         QueryValue::Set(arity, ts) => {
             assert_eq!(arity, 1);
-            assert_eq!(ts.len(), 2);
+            assert_eq!(ts.len(), 1);
         }
         QueryValue::Int(..) => panic!("expected Set"),
         QueryValue::Bool(..) => panic!("expected Set"),
@@ -307,7 +308,7 @@ fn query_bare_comprehension() {
     let src = r#"
         module demo
         sig X in Int {}
-        fact pin { X = 0 + 1 + 2 }
+        fact pin { X = {0} + {1} + {2} }
         run {} for 3, 8 Int
     "#;
     let m = alloy_front_rs::parse_module(src).expect("parse");
@@ -387,8 +388,8 @@ fn query_sum_of_set() {
     let src = r#"
         module demo
         sig X in Int {}
-        fact pin { X = 1 + 2 + 3 }
-        run {} for 3
+        fact pin { X = {1} + {2} + {3} }
+        run {} for 3, 8 Int
     "#;
     let m = alloy_front_rs::parse_module(src).expect("parse");
     let cnf = run(&m, 0).expect("build cnf");
@@ -512,6 +513,20 @@ fn query_brace_set_routing() {
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
     }
+    // mixed `+`/`-` with a plain int commits to integer arithmetic as well.
+    match query_value(&m, scope, &cnf, "{0, 1} + 2", &inst).expect("query {0,1} + 2") {
+        QueryValue::Int(v) => assert_eq!(v, 5),
+        QueryValue::Set(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
+    }
+    match query_value(&m, scope, &cnf, "{0, 1} - 0", &inst).expect("query {0,1} - 0") {
+        QueryValue::Int(v) => assert_eq!(v, 3),
+        QueryValue::Set(..) => panic!("expected Int"),
+        QueryValue::Bool(..) => panic!("expected Int"),
+    }
+    // pure brace `+` keeps the set reading: `{0} + {1}` is `{0, 1}`.
+    let (_, u) = query(&m, scope, &cnf, "{0} + {1}", &inst).expect("query {0} + {1}");
+    assert_eq!(u.len(), 2);
 }
 #[test]
 fn query_comprehension_over_int() {

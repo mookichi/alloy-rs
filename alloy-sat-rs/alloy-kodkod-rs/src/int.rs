@@ -379,3 +379,35 @@ impl IntCircuit {
         })
     }
 }
+
+/// Signed-MSB weight of an int atom for the BITS cast: the top atom
+/// (`top = W - 1`) weighs `-2^top`, every other non-negative atom below
+/// 63 weighs `+2^v`. Out-of-range values contribute nothing.
+/// Single source shared by `fol.rs` (circuit) and `eval.rs` (model).
+pub fn bit_weight(v: i64, top: i64) -> Option<i64> {
+    if v == top && top >= 0 && top < 63 {
+        Some(-1i64 << top)
+    } else if (0..63).contains(&v) {
+        Some(1i64 << v)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bit_weight;
+
+    #[test]
+    fn msb_weight_table() {
+        // W = 4: top atom 3 weighs -8, rest are powers of two.
+        assert_eq!(bit_weight(3, 3), Some(-8));
+        assert_eq!(bit_weight(2, 3), Some(4));
+        assert_eq!(bit_weight(0, 3), Some(1));
+        // Non-top values are unaffected by `top`.
+        assert_eq!(bit_weight(2, 5), Some(4));
+        // Out of range contributes nothing.
+        assert_eq!(bit_weight(63, 63), None);
+        assert_eq!(bit_weight(-1, 3), None);
+    }
+}

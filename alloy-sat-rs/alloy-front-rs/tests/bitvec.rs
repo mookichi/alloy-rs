@@ -74,8 +74,11 @@ fn brace_set_keeps_set_reading() {
 #[test]
 fn msb_is_top_atom() {
     sat("pred p { {MSB} = {3} }\nrun p for 4 Int");
-    sat("pred p { MSB = 3 }\nrun p for 4 Int");
-    // MSB in int position sums the singleton: sum {MSB} = 3.
+    // MSB in int position reads as the signed MSB weight (-2^(w-1) = -8),
+    // so `MSB = 3` is false and `MSB + 1` is -7.
+    unsat("pred p { MSB = 3 }\nrun p for 4 Int");
+    sat("pred p { MSB + 1 = -7 }\nrun p for 4 Int");
+    // explicit sum keeps the Σ-values reading: sum {MSB} = 3.
     sat("pred p { sum {MSB} = 3 }\nrun p for 4 Int");
 }
 
@@ -89,9 +92,10 @@ fn int_atoms_count() {
 
 #[test]
 fn int_atom_values() {
-    // atoms are exactly 0..W-1: 3 is in Int, 4 is out of scope.
-    sat("pred p { 3 in Int }\nrun p for 4 Int");
-    let m = parse_module("pred p { 4 in Int }\nrun p for 4 Int").expect("parse");
+    // atoms are exactly 0..W-1 (set spelling: bare ints left of `in`
+    // are a type error): 3 is in Int, 4 is out of scope.
+    sat("pred p { {3} in Int }\nrun p for 4 Int");
+    let m = parse_module("pred p { {4} in Int }\nrun p for 4 Int").expect("parse");
     assert!(run(&m, 0).is_err(), "atom 4 out of scope at W = 4");
 }
 
@@ -110,13 +114,13 @@ fn field_typed_signed() {
 
 #[test]
 fn set_idiom_preserved() {
-    // `x = 5` with a non-literal side stays a singleton set equality,
-    // including field = constant.
+    // Uniform rule: set × integer `=` is a bitmask comparison, so a
+    // multi-valued field satisfies `a.x = 5` via a.x = {0, 2} (bits of 5).
     sat("sig A { x: Int }\npred p { some a: A | a.x = 5 }\nrun p for 8 Int");
     sat("sig A { x: Int }\npred p { some a: A | a.x = {5} }\nrun p for 8 Int");
-    // membership keeps singleton semantics.
+    // membership (both set sides) keeps the singleton reading.
     sat("sig A { x: Int }\npred p { some a: A | a.x in {5} }\nrun p for 8 Int");
-    sat("sig A { x: Int }\npred p { some a: A | 5 in a.x }\nrun p for 8 Int");
+    sat("sig A { x: Int }\npred p { some a: A | {5} in a.x }\nrun p for 8 Int");
 }
 
 #[test]
@@ -137,13 +141,60 @@ fn int_queries_see_unsigned_atoms() {
     let src = "sig A {}\nrun { some A } for 1, 8 Int";
     let m = parse_module(src).expect("parse");
     let cnf = run(&m, 0).expect("run");
-    assert_eq!(cnf.bitwidth, 8);
+    assert_eq!(cnf.bitwidth, 9, "E = W + 1 (signed MSB weight)");
     let inst = solve(&cnf).expect("solve").expect("SAT");
     let scope = &m.commands[0].scope;
     match query_value(&m, scope, &cnf, "#Int", &inst).expect("query #Int") {
         QueryValue::Int(v) => assert_eq!(v, 8),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
-        QueryValue::Bool(..) => panic!("expected Int"),
     }
+}
+
+#[test]
+fn mask_equality_named_sets() {
+    // Mixed set x integer `=` is a bitmask value comparison, uniformly
+    // for named sets and literals: `X = 5` iff X = {0, 2}.
+    sat("sig X in Int {}\nfact pin { X = {0, 2} }\nrun { X = 5 } for 4 Int");
+    unsat("sig X in Int {}\nfact pin { X = {0, 1} }\nrun { X = 5 } for 4 Int");
+    // mirrored orientation reads identically (Q5 symmetry).
+    sat("sig X in Int {}\nfact pin { X = {0, 2} }\nrun { 5 = X } for 4 Int");
+    unsat("sig X in Int {}\nfact pin { X = {0, 1} }\nrun { 5 = X } for 4 Int");
+    // Signed mirrors Int over the same atoms.
+    sat("sig X in Signed {}\nfact pin { X = {0, 2} }\nrun { X = 5 } for 4 Int");
+    // W-dependent atom weight: at W = 3 atom 2 is the MSB (-4).
+    unsat("pred p { {2} = 4 }\nrun p for 3 Int");
+    sat("pred p { {2} = 4 }\nrun p for 4 Int");
+}
+
+#[test]
+fn mask_type_errors() {
+    // An integer left of `in` is a type error; brace sets stay subsets.
+    assert!(parse_module("sig X in Int {}\nrun { 5 in X } for 1").is_err()
+        || run(
+            &parse_module("sig X in Int {}\nrun { 5 in X } for 1").expect("parse"),
+            0
+        )
+        .is_err());
+    assert!(parse_module("sig X in Int {}\nrun { 1 + 2 in X } for 1").is_err()
+        || run(
+            &parse_module("sig X in Int {}\nrun { 1 + 2 in X } for 1").expect("parse"),
+            0
+        )
+        .is_err());
+    // non-Int sigs against integers are a type mismatch (safety).
+    let m = parse_module("sig A {}\nrun { A = 1 + 2 } for 1").expect("parse");
+    assert!(run(&m, 0).is_err());
+    let m2 = parse_module("sig A {}\nrun { {A} = 5 } for 1").expect("parse");
+    assert!(run(&m2, 0).is_err());
+}
+
+#[test]
+fn scalar_mask_reading() {
+    // A scalar in int position reads as its bitmask value, uniformly:
+    // `x = 5` is impossible (2^v = 5 has no solution); `x = 4` pins atom 2.
+    unsat("sig X in Signed {}\nrun { some x: X | x = 5 } for 4 Int");
+    sat("sig X in Signed {}\nrun { some x: X | x = 4 } for 4 Int");
+    // ... hence `some x: X | x = 4 and x = {2}` agree on the witness.
+    sat("sig X in Signed {}\nrun { some x: X | x = 4 and x = {2} } for 4 Int");
 }

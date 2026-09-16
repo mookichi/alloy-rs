@@ -17,6 +17,7 @@ use alloy_kodkod_rs::tupleset::TupleSet;
 use crate::ast::{Expr, Formula, IntExpr, Module, Scope};
 use crate::cnf::Cnf;
 use crate::lower::Lowerer;
+use crate::types::is_int_query;
 use crate::FrontError;
 
 /// Parse a bare relational expression (`let x = e in ...` allowed).
@@ -151,7 +152,7 @@ pub fn query_value(
         // A bare `{...}` (or `+`/`-` over one) keeps the set reading,
         // mirroring the parser's `=`/`!=` rewind rule; pure `*`/`/`/`%`
         // trees read as integers.
-        if ie.int_typed() && !ie.rewind_bitsval_eq() {
+        if is_int_query(&ie) {
             return query_int_parsed(module, scope, cnf, &ie, instance);
         }
     }

@@ -24,6 +24,7 @@ mod bounds;
 mod lex;
 mod lower;
 mod parser;
+pub mod types;
 
 pub use ast::Scope;
 pub use ast::{

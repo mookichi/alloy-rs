@@ -212,9 +212,7 @@ impl<'a> FolTranslator<'a> {
         }
         let out: Option<Vec<u32>> = match arena.expr(e) {
             ExprNode::Variable(v) => Some(vec![v.0]),
-            ExprNode::Relation(_) | ExprNode::Constant(_) | ExprNode::Atoms(_) => {
-                Some(Vec::new())
-            }
+            ExprNode::Relation(_) | ExprNode::Constant(_) | ExprNode::Atoms(_) => Some(Vec::new()),
             ExprNode::Unary { child, .. } => self.free_vars_of(arena, *child),
             ExprNode::Binary { left, right, .. } => {
                 let mut l = self.free_vars_of(arena, *left)?;
@@ -653,27 +651,29 @@ impl<'a> FolTranslator<'a> {
                         acc
                     }
                     CastToIntOp::Bits => {
-                        // Bit-vector value: Σ 2^v for int atoms v in the
-                        // set. Only bits below the circuit width exist;
-                        // higher atoms are truncated (same rule as the
-                        // frontend bitset lowering).
+                        // Bit-vector value with signed MSB weight:
+                        // Σ weight(v) where weight(v) = -2^(W-1) for the
+                        // top atom (v = W-1, the MSB) and +2^v otherwise.
+                        // W = the top atom + 1 is derived from the bound
+                        // set itself; atoms are named by value.
                         let mut positions: Vec<(i64, usize)> = Vec::new();
+                        let mut max_val: i64 = -1;
                         for (val, ts) in self.bounds.int_bounds() {
+                            max_val = max_val.max(val);
                             for idx in ts.index_view().iter() {
                                 positions.push((val, idx as usize));
                             }
                         }
                         positions.sort_by_key(|p| p.1);
+                        let top = max_val; // W - 1
                         let mut acc = IntCircuit::constant(0, bw, &self.ctx);
                         for &(val, pos) in &positions {
-                            if val >= 0 && (val as u64) < bw as u64 {
-                                if let Some(cell) = m.get(pos) {
-                                    let c = IntCircuit::constant(1i64 << val, bw, &self.ctx);
-                                    acc = acc.add(
-                                        &c.choice(cell, &IntCircuit::zero(&self.ctx)),
-                                        bw,
-                                    );
-                                }
+                            let Some(weight) = crate::int::bit_weight(val, top) else {
+                                continue;
+                            };
+                            if let Some(cell) = m.get(pos) {
+                                let c = IntCircuit::constant(weight, bw, &self.ctx);
+                                acc = acc.add(&c.choice(cell, &IntCircuit::zero(&self.ctx)), bw);
                             }
                         }
                         acc
@@ -754,11 +754,7 @@ impl<'a> FolTranslator<'a> {
     /// Sorted free-variable ids of a formula. `None` = conservative
     /// fallback (quantifier domains included: omitting them collapses
     /// distinct instantiations — see `fol_memo` regression test).
-    fn ffree_vars_of(
-        &mut self,
-        arena: &AstArena,
-        f: crate::ast::FormulaId,
-    ) -> Option<Vec<u32>> {
+    fn ffree_vars_of(&mut self, arena: &AstArena, f: crate::ast::FormulaId) -> Option<Vec<u32>> {
         if let Some(v) = self.ffree_memo.get(&f.0) {
             return v.clone();
         }
@@ -784,9 +780,7 @@ impl<'a> FolTranslator<'a> {
             }
             FormulaNode::Multiplicity { expr, .. } => self.free_vars_of(arena, *expr),
             // Soft nodes are transparent for free variables.
-            FormulaNode::MaxSome(e) | FormulaNode::MinSome(e) => {
-                self.free_vars_of(arena, *e)
-            }
+            FormulaNode::MaxSome(e) | FormulaNode::MinSome(e) => self.free_vars_of(arena, *e),
             FormulaNode::SoftFact(inner) => self.ffree_vars_of(arena, *inner),
             FormulaNode::Quantified { decls, body, .. } => {
                 // Free vars = body frees + DOMAIN frees, minus bound vars.

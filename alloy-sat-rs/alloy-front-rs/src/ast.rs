@@ -170,40 +170,41 @@ impl IntExpr {
         }
     }
 
-    /// True when the tree contains a `{...}` bit-value node.
-    fn has_bitsval(&self) -> bool {
+    /// Brace-pure tree: only `{...}` bit-values combined by `+`/`-`
+    /// (e.g. `{0}`, `{0}+{1}`, `{0,1}-{0}`). Such a tree could equally be
+    /// read as a SET expression, so `=`/`!=` between two brace-pure sides
+    /// rewinds to the relational set reading. Mixed shapes (`{0,1}+2`)
+    /// and plain int trees (`1+2`, `2*3`) commit to integer semantics.
+    pub(crate) fn brace_pure(&self) -> bool {
         match self {
             IntExpr::BitsVal(..) => true,
-            IntExpr::Bin(_, a, b) => a.has_bitsval() || b.has_bitsval(),
-            IntExpr::Sum(_, body, _) => body.has_bitsval(),
-            _ => false,
-        }
-    }
-
-    /// True when the tree has `+`/`-` with a bit-value descendant. A bare
-    /// `{...}` nested under `*`/`/`/`%` does not count (integer-only shape).
-    fn plusminus_bitsval(&self) -> bool {
-        match self {
             IntExpr::Bin(op, a, b) => {
-                if matches!(op, IntBinOp::Add | IntBinOp::Sub) {
-                    a.has_bitsval()
-                        || b.has_bitsval()
-                        || a.plusminus_bitsval()
-                        || b.plusminus_bitsval()
-                } else {
-                    a.plusminus_bitsval() || b.plusminus_bitsval()
-                }
+                matches!(op, IntBinOp::Add | IntBinOp::Sub)
+                    && a.brace_pure()
+                    && b.brace_pure()
             }
-            IntExpr::Sum(_, body, _) => body.plusminus_bitsval(),
+            IntExpr::Sum(_, body, _) => body.brace_pure(),
             _ => false,
         }
     }
 
-    /// Rewind-to-relational test for `=`/`!=` (and `:query` routing): a
-    /// bare `{...}` side, or `+`/`-` combining a bit-value, keeps the
-    /// legacy relational set reading. Pure `*`/`/`/`%` trees commit.
+    /// Bare integer shape: a tree with no set-originated nodes (no
+    /// `BitsVal`, no `Val` other than the MSB scalar). Such a tree can
+    /// only be read as an integer, so in `5 = X` / `sum X = Y` the other
+    /// side reads as a bitmask value rather than rewinding.
+    pub(crate) fn bare_int(&self) -> bool {
+        match self {
+            IntExpr::Lit(..) | IntExpr::Card(..) | IntExpr::SumOf(..) => true,
+            IntExpr::Val(e, _) => matches!(&**e, Expr::Name(n, _) if n == "MSB"),
+            IntExpr::Bin(_, a, b) => a.bare_int() && b.bare_int(),
+            IntExpr::Sum(_, body, _) => body.bare_int(),
+            IntExpr::BitsVal(..) => false,
+        }
+    }
+    /// Rewind-to-relational test for an integer LEFT of `in`: a brace-pure
+    /// tree is a set and stays relational; anything else is a type error.
     pub(crate) fn rewind_bitsval_eq(&self) -> bool {
-        matches!(self, IntExpr::BitsVal(..)) || self.plusminus_bitsval()
+        self.brace_pure()
     }
 }
 
@@ -211,6 +212,9 @@ impl IntExpr {
 pub enum Formula {
     Const(bool),
     Cmp(CmpKind, Expr, Expr, usize),
+    /// `intexpr in set` with an integer left side: always a type error
+    /// (reported at lowering; kept parseable so sibling errors surface).
+    BadIn(Box<Expr>, usize),
     IntCmp(IntCmpOp, IntExpr, IntExpr, usize),
     Quant(QuantKind, Vec<Decl>, Box<Formula>),
     Multi(QuantKind, Expr, usize), // some/lone/one/no expr
@@ -255,7 +259,8 @@ pub enum Formula {
 
 impl Formula {
     /// Returns true if this formula or any subformula contains temporal operators.
-    pub fn has_temporal(&self) -> bool {        match self {
+    pub fn has_temporal(&self) -> bool {
+        match self {
             Formula::Always(_) | Formula::Eventually(_) => true,
             Formula::Until(_, _) | Formula::Releases(_, _) => true,
             Formula::Before(_) | Formula::Historically(_) | Formula::Once(_) => true,
@@ -274,6 +279,7 @@ impl Formula {
                 body.has_temporal() || binds.iter().any(|(_, e)| e.has_temporal())
             }
             Formula::Cmp(_, a, b, _) => a.has_temporal() || b.has_temporal(),
+            Formula::BadIn(a, _) => a.has_temporal(),
             Formula::IntCmp(_, a, b, _) => a.has_temporal() || b.has_temporal(),
             Formula::Multi(_, e, _) => e.has_temporal(),
             Formula::Call(_, args, _) => args.iter().any(|a| a.has_temporal()),
@@ -304,6 +310,7 @@ impl Formula {
                 body.has_soft() || binds.iter().any(|(_, e)| e.has_soft())
             }
             Formula::Cmp(_, a, b, _) => a.has_soft() || b.has_soft(),
+            Formula::BadIn(a, _) => a.has_soft(),
             Formula::IntCmp(_, a, b, _) => a.has_soft() || b.has_soft(),
             Formula::Multi(_, e, _) => e.has_soft(),
             Formula::Call(_, args, _) => args.iter().any(|a| a.has_soft()),
@@ -344,7 +351,12 @@ impl Expr {
             Expr::Bracket(b, args) => b.has_temporal() || args.iter().any(|a| a.has_temporal()),
             Expr::Call(_, args, _) => args.iter().any(|a| a.has_temporal()),
             Expr::ArrowMult(_, x) | Expr::LeadMult(_, x) => x.has_temporal(),
-            Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => false,
+            Expr::Name(..)
+            | Expr::Univ
+            | Expr::None_
+            | Expr::Iden
+            | Expr::IntAtom
+            | Expr::Bits(..) => false,
             Expr::LetBind(binds, body) => {
                 body.has_temporal() || binds.iter().any(|(_, e)| e.has_temporal())
             }
@@ -390,9 +402,7 @@ impl IntExpr {
                 body.has_temporal() || decls.iter().any(|d| d.expr.has_temporal())
             }
             IntExpr::Bin(_, a, b) => a.has_temporal() || b.has_temporal(),
-            IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => {
-                e.has_temporal()
-            }
+            IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => e.has_temporal(),
             IntExpr::Lit(..) => false,
         }
     }
@@ -591,11 +601,12 @@ impl Module {
 /// Default Int atom count for a bare `Int` (no `for N Int`).
 pub const DEFAULT_INT_BITWIDTH: u32 = 4;
 
-/// Effective problem bitwidth (bit-vector model): the circuit width `E =
-/// min(W, 30)` where `W` is the Int atom count below. `Int[w]`
-/// per-occurrence widths are no longer supported.
+/// Effective problem bitwidth (bit-vector model): the circuit width
+/// `E = min(W + 1, 30)` for an Int atom count `W` — one extra bit so the
+/// signed MSB weight `-2^(w-1)` stays distinct from plain positives
+/// (e.g. `{2} = 4` is false at W = 3 where atom 2 is the MSB).
 pub fn effective_bitwidth(_module: &Module, scope: &Scope) -> u32 {
-    effective_int_count(scope).clamp(1, 30)
+    (effective_int_count(scope) + 1).clamp(1, 30)
 }
 
 /// Effective Int atom count (bit-vector model): `W` from `for W Int`
@@ -683,7 +694,13 @@ pub(crate) fn scan_expr_int_set(e: &Expr, needs: &mut bool) {
         Expr::IntAtom => *needs = true,
         // A bitset denotes Int atoms by construction.
         Expr::Bits(..) => *needs = true,
-        Expr::Name(n, _) if n == "int" || n == "Int" || n == "Signed" || n == "MSB" || n.parse::<i64>().is_ok() => {
+        Expr::Name(n, _)
+            if n == "int"
+                || n == "Int"
+                || n == "Signed"
+                || n == "MSB"
+                || n.parse::<i64>().is_ok() =>
+        {
             *needs = true;
         }
         Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden => {}
@@ -735,6 +752,8 @@ pub(crate) fn scan_formula_int_set(f: &Formula, needs: &mut bool) {
         Formula::Const(_) => {}
         // `pin` bodies live in `Module::partials`, walked at module level.
         Formula::Pin(..) => {}
+        // The set side is kept for context only; the formula always errors.
+        Formula::BadIn(..) => {}
         Formula::Cmp(_, a, b, _) => {
             scan_expr_int_set(a, needs);
             scan_expr_int_set(b, needs);
@@ -805,7 +824,10 @@ pub(crate) fn scan_intexpr_int_set(ie: &IntExpr, needs: &mut bool) {
     }
     match ie {
         IntExpr::Lit(..) => {}
-        IntExpr::Card(e, _) | IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => {
+        IntExpr::Card(e, _)
+        | IntExpr::Val(e, _)
+        | IntExpr::SumOf(e, _)
+        | IntExpr::BitsVal(e, _) => {
             scan_expr_int_set(e, needs);
         }
         IntExpr::Sum(ds, body, _) => {

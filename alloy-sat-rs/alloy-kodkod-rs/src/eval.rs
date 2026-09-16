@@ -91,7 +91,7 @@ impl<'a> Evaluator<'a> {
                     }
                     TupleSet::from_indices(self.instance.universe(), 1, out)
                         .map_err(|_| EvalError::UnboundVariable)
-                },
+                }
                 ConstantExpr::Iden => {
                     let mut ts = self.dims(2)?;
                     let n = self.univ() as usize;
@@ -297,15 +297,32 @@ impl<'a> Evaluator<'a> {
                         Ok(total)
                     }
                     CastToIntOp::Bits => {
-                        // Bit-vector value: Σ 2^v over int atoms in the
-                        // set (same truncation rule as the solver path).
+                        // Bit-vector value with signed MSB weight:
+                        // Σ weight(v), weight(v) = -2^(W-1) for the top
+                        // atom (W-1), +2^v otherwise. Resolve int atoms by
+                        // the integer layer, or by universe name.
+                        let mut max_val: i64 = -1;
+                        for (val, _) in self.instance.int_tuples() {
+                            max_val = max_val.max(val);
+                        }
+                        for idx in 0..self.instance.universe().size() {
+                            if let Ok(atom) = self.instance.universe().atom(idx) {
+                                if let Ok(v) = atom.parse::<i64>() {
+                                    max_val = max_val.max(v);
+                                }
+                            }
+                        }
+                        let top = max_val; // W - 1
+                        let weight_of = |v: i64| -> Option<i64> { crate::int::bit_weight(v, top) };
                         let mut total = 0i64;
                         let mut layered = false;
                         for (val, ts) in self.instance.int_tuples() {
                             layered = true;
                             for idx in ts.index_view().iter() {
-                                if m.contains_index(idx) && val >= 0 && val < 63 {
-                                    total += 1i64 << val;
+                                if m.contains_index(idx) {
+                                    if let Some(wt) = weight_of(val) {
+                                        total += wt;
+                                    }
                                 }
                             }
                         }
@@ -313,8 +330,8 @@ impl<'a> Evaluator<'a> {
                             for idx in m.index_view().iter() {
                                 if let Ok(atom) = self.instance.universe().atom(idx as usize) {
                                     if let Ok(v) = atom.parse::<i64>() {
-                                        if v >= 0 && v < 63 {
-                                            total += 1i64 << v;
+                                        if let Some(wt) = weight_of(v) {
+                                            total += wt;
                                         }
                                     }
                                 }

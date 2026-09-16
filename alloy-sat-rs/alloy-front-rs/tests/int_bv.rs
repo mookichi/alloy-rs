@@ -39,7 +39,7 @@ fn int_brackets_rejected() {
     // bare Int still defaults to the command scope (else 4 atoms)
     let m = parse_module("sig A { x: Int }\nrun {} for 3").expect("parse bare Int");
     let scope = &m.commands[0].scope;
-    assert_eq!(effective_bitwidth(&m, scope), 4);
+    assert_eq!(effective_bitwidth(&m, scope), 5);
     assert_eq!(effective_int_count(scope), 4);
     assert!(module_needs_int_atoms(&m, scope));
 }
@@ -47,18 +47,18 @@ fn int_brackets_rejected() {
 #[test]
 fn scope_sets_width_and_atoms() {
     let m = parse_module("sig A { x: Int }\nrun {} for 3, 4 Int").expect("parse");
-    assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 4);
+    assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 5);
     assert_eq!(effective_int_count(&m.commands[0].scope), 4);
     let cnf = run(&m, 0).expect("build");
-    assert_eq!(cnf.bitwidth, 4);
+    assert_eq!(cnf.bitwidth, 5);
 
     let m = parse_module("sig A { x: Int }\nrun {} for 3, 8 Int").expect("parse");
-    assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 8);
+    assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 9);
     assert_eq!(effective_int_count(&m.commands[0].scope), 8);
 
     // quantified domains observe the same scope
     let m = parse_module("pred p { all x: Int | x = x }\nrun p for 3, 6 Int").expect("parse");
-    assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 6);
+    assert_eq!(effective_bitwidth(&m, &m.commands[0].scope), 7);
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn lazy_no_atoms_when_int_free() {
     let scope = m.commands[0].scope.clone();
     assert!(!module_needs_int_atoms(&m, &scope));
     let cnf = run(&m, 0).expect("build");
-    assert_eq!(cnf.bitwidth, 4, "circuits still default to 4");
+    assert_eq!(cnf.bitwidth, 5, "circuits default to W+1 = 5");
     assert_eq!(cnf.bounds.universe().size(), 3);
     assert_eq!(cnf.bounds.int_bounds().count(), 0);
 }
@@ -85,7 +85,6 @@ fn pure_int_arithmetic_needs_no_atoms() {
     match query_value(&m, &scope, &cnf, "#A", &inst).expect("query #A") {
         QueryValue::Int(v) => assert_eq!(v, 2),
         QueryValue::Set(..) => panic!("expected Int"),
-        QueryValue::Bool(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
     }
 }
@@ -104,7 +103,7 @@ fn atoms_materialize_on_use() {
     assert_eq!(cnf.bounds.int_bounds().count(), 4);
 
     // set-position literals materialize
-    let m = parse_module("sig A {}\nrun { 5 in A } for 3").expect("parse");
+    let m = parse_module("sig A {}\nrun { {5} in A } for 3").expect("parse");
     let scope = m.commands[0].scope.clone();
     assert!(module_needs_int_atoms(&m, &scope));
 }
@@ -114,7 +113,7 @@ fn int_field_solves_unsigned() {
     let src = "sig C { v: Int }\nrun { some C and some C.v } for 3, 8 Int";
     let m = parse_module(src).expect("parse");
     let cnf = run(&m, 0).expect("build");
-    assert_eq!(cnf.bitwidth, 8);
+    assert_eq!(cnf.bitwidth, 9);
     assert_eq!(cnf.bounds.int_bounds().count(), 8);
     let inst = solve(&cnf).expect("solve").expect("SAT");
     let scope = &m.commands[0].scope;
@@ -122,13 +121,11 @@ fn int_field_solves_unsigned() {
         QueryValue::Int(v) => assert_eq!(v, 8),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
-        QueryValue::Bool(..) => panic!("expected Int"),
     }
-    // out-of-range literals wrap at the circuit width 8: 300 -> 44
+    // literals wrap as E-bit two's complement (E = W + 1 = 9): 300 -> -212
     match query_value(&m, scope, &cnf, "300", &inst).expect("query 300") {
-        QueryValue::Int(v) => assert_eq!(v, 44),
+        QueryValue::Int(v) => assert_eq!(v, -212),
         QueryValue::Set(..) => panic!("expected Int"),
-        QueryValue::Bool(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
     }
 }
@@ -139,10 +136,10 @@ fn int_in_arrow_type() {
     let src = "sig B {}\nsig A { f: B -> Int }\nrun { some f } for 3, 8 Int";
     let m = parse_module(src).expect("parse");
     let scope = m.commands[0].scope.clone();
-    assert_eq!(effective_bitwidth(&m, &scope), 8);
+    assert_eq!(effective_bitwidth(&m, &scope), 9);
     assert!(module_needs_int_atoms(&m, &scope));
     let cnf = run(&m, 0).expect("build");
-    assert_eq!(cnf.bitwidth, 8);
+    assert_eq!(cnf.bitwidth, 9);
     assert!(solve(&cnf).expect("solve").is_some());
 }
 
@@ -156,7 +153,7 @@ fn scope_clause_forms_unchanged() {
     ] {
         let m = parse_module(src).expect("parse scope form");
         let scope = scope_of(src);
-        assert_eq!(effective_bitwidth(&m, &scope), 8);
+        assert_eq!(effective_bitwidth(&m, &scope), 9);
         assert_eq!(effective_int_count(&scope), 8);
         assert!(module_needs_int_atoms(&m, &scope));
     }

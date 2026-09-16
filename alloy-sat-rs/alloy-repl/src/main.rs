@@ -16,11 +16,11 @@
 //!   (`.apin`); `:ppin`/`:pavoid` apply it to a Cnf. Partial instances
 //!   transfer tuple indices directly, so no atom-name text is involved.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy_front_rs::{
     check, command_needs_opt, eval, fragment_keys, optimize, parse_int_expr, parse_module,
-    query_value, run, run_opt_command, solve, validate, Cnf, CnfKind, CommandKind,
+    query_value, run, run_opt_command, solve, validate, Cnf, CnfKind, CommandKind, Expr,
     IncrementalSession, Instance, KkOptSense, Module, OptSolution, OptTarget, PartialInstance,
     QueryValue,
 };
@@ -562,15 +562,57 @@ impl Session {
         }
     }
 
-    fn print_solution(&self, inst: &Option<Instance>, is_check: bool) {
-        match inst {
+    /// Display hints for integer rendering: Signed-rooted sigs plus
+    /// `Owner.field` keys whose declared type mentions `Signed`.
+    fn display_hints(&self) -> fmt::DisplayHints {
+        let mut hints = fmt::DisplayHints::default();
+        let Some(module) = self.module.as_ref() else {
+            return hints;
+        };
+        for sd in &module.sigs {
+            for n in &sd.names {
+                let mut cur = n.as_str();
+                let mut seen = HashSet::new();
+                loop {
+                    if !seen.insert(cur) {
+                        break;
+                    }
+                    let parent = module
+                        .sigs
+                        .iter()
+                        .find(|s| s.names.iter().any(|x| x == cur))
+                        .and_then(|s| s.extends.as_deref());
+                    match parent {
+                        Some("Signed") => {
+                            hints.signed_sigs.insert(n.clone());
+                            break;
+                        }
+                        Some(p) => cur = p,
+                        None => break,
+                    }
+                }
+            }
+            for owner in &sd.names {
+                for d in &sd.fields {
+                    if expr_is_signed(&d.expr) {
+                        for fname in &d.names {
+                            hints.signed_fields.insert(format!("{owner}.{fname}"));
+                        }
+                    }
+                }
+            }
+        }
+        hints
+    }
+
+    fn print_solution(&self, inst: &Option<Instance>, is_check: bool) {        match inst {
             Some(i) => {
                 if is_check {
                     println!("SAT -- counterexample found:");
                 } else {
                     println!("SAT -- example found:");
                 }
-                println!("{}", fmt::instance_alloy(i));
+                println!("{}", fmt::instance_alloy_hinted(i, &self.display_hints()));
             }
             None => {
                 if is_check {
@@ -737,7 +779,7 @@ impl Session {
                 None => println!("SAT -- optimum found"),
             }
             if let Some(ref inst) = sol.instance {
-                println!("{}", fmt::instance_alloy(inst));
+                println!("{}", fmt::instance_alloy_hinted(inst, &self.display_hints()));
             }
         } else {
             println!("UNSAT -- no model (empty)");
@@ -824,7 +866,37 @@ impl Session {
         };
         match query_value(m, scope, &cnf_owned, expr, &inst_owned) {
             Ok(QueryValue::Set(arity, ts)) => {
-                println!("{}", fmt::set_alloy(ts.universe(), arity, &ts))
+                let hints = self.display_hints();
+                let expr_t = expr.trim();
+                // Integer display: a bare Signed sig name reads as its
+                // bitmask value, as does a dotted `Owner.field` path with
+                // Signed range (arity 1 = the collapsed single row,
+                // arity 2 = per-owner rows).
+                let (as_int, dotted) = match expr_t.split_once('.') {
+                    None => (
+                        arity == 1 && hints.signed_sigs.contains(expr_t),
+                        None,
+                    ),
+                    Some((owner, field)) => {
+                        let key = format!("{}.{}", owner.trim(), field.trim());
+                        (
+                            hints.signed_fields.contains(&key),
+                            Some((owner.trim().to_string(), field.trim().to_string())),
+                        )
+                    }
+                };
+                if as_int && arity == 2 {
+                    let (owner, field) = dotted.unwrap();
+                    println!(
+                        "{}",
+                        fmt::field_rows_alloy(&inst_owned, &owner, &field, &ts)
+                    )
+                } else {
+                    println!(
+                        "{}",
+                        fmt::set_alloy_maybe_int(ts.universe(), arity, &ts, as_int)
+                    )
+                }
             }
             Ok(QueryValue::Int(v)) => println!("{v}"),
             Ok(QueryValue::Bool(v)) => println!("{v}"),
@@ -920,7 +992,7 @@ impl Session {
         match validate(cnf, inst) {
             Some(back) => {
                 println!("valid -- `{sol_name}` is a model of `{cnf_name}`, as-is:");
-                println!("{}", fmt::instance_alloy(&back));
+                println!("{}", fmt::instance_alloy_hinted(&back, &self.display_hints()));
             }
             None => println!("invalid -- `{sol_name}` is not a model of `{cnf_name}` (none/empty)"),
         }
@@ -1291,7 +1363,10 @@ impl Session {
                 } else {
                     format!("SAT <- `{}`", s.from_cnf)
                 };
-                println!("solution `{name}`: {kind}\n{}", fmt::instance_alloy(inst));
+                println!(
+                    "solution `{name}`: {kind}\n{}",
+                    fmt::instance_alloy_hinted(inst, &self.display_hints())
+                );
             }
             None => println!("solution `{name}`: UNSAT (none / empty)"),
         }
@@ -1400,9 +1475,10 @@ fn print_help() {
     println!("notes: `let` works inside pred/fun bodies and :eval/:query expressions.");
     println!("notes: integers are bitvectors: `for W Int` gives W atoms");
     println!("  {{0, .., W-1}} (bare `Int` = command default, else 4) with");
-    println!("  W-bit circuits capped at 30. `Int[w]` widths are gone.");
-    println!("  `7 = {{0, 1, 2}}` holds (bitset comparison); `sig X in Signed`");
-    println!("  and `MSB` (= W-1) mirror `Int`. Int atoms");
+    println!("  (W+1)-bit circuits capped at 30. Sets read as bitmask values");
+    println!("  (MSB atom weight -2^(W-1)): `X = 5` iff X = {{0, 2}};");
+    println!("  bare `1+2` is an integer; use `{{1, 2}}` or `{{1}}+{{2}}` for sets.");
+    println!("  `sig X in Signed` mirrors `Int`. Int atoms");
     println!("  are allocated lazily: models that never use Int as a set carry");
     println!("  none (queries like `Int` then read empty; add `for N Int` to");
     println!("  materialize the range).");
@@ -1434,6 +1510,27 @@ fn looks_like_decl(s: &str) -> bool {
     match first_token(s) {
         "sig" | "abstract" | "fact" | "pred" | "fun" | "assert" | "open" | "partial" => true,
         "one" | "lone" | "some" | "var" => second_token(s) == "sig",
+        _ => false,
+    }
+}
+
+/// True when a field TYPE expression mentions `Signed` (so a Signed
+/// range makes rows bitmask-readable). Mirrors the lowerer's
+/// `mentions_int_expr`, restricted to `Signed`.
+fn expr_is_signed(e: &Expr) -> bool {
+    match e {
+        Expr::Name(n, _) => n == "Signed",
+        Expr::Bin(_, a, b) => expr_is_signed(a) || expr_is_signed(b),
+        Expr::Transpose(x)
+        | Expr::TClosure(x)
+        | Expr::RClosure(x)
+        | Expr::ArrowMult(_, x)
+        | Expr::LeadMult(_, x)
+        | Expr::Prime(x)
+        | Expr::AtExpr(x) => expr_is_signed(x),
+        Expr::Bracket(base, args) => {
+            expr_is_signed(base) || args.iter().any(|a| expr_is_signed(a))
+        }
         _ => false,
     }
 }

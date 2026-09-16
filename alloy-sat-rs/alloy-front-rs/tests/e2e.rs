@@ -436,12 +436,13 @@ fn int_var_lt_parses_as_int_cmp() {
     assert!(dbg.contains("Val"), "got: {dbg}");
 }
 
-/// `=`/`!=` stay relational (Java: no int casts): `x = 5` is set equality
-/// against the `{5}` singleton, and `A = B` is untouched.
+/// `=` with an int right side takes the bitmask route (`x = 5` is
+/// `bitmask(x) = 5`); `A = B` stays relational; `#A = 4` stays IntCmp.
 #[test]
 fn int_eq_stays_relational() {
     let f = alloy_front_rs::parse_formula("x = 5").expect("parse");
-    assert!(format!("{f:?}").starts_with("Cmp("), "got: {f:?}");
+    assert!(format!("{f:?}").contains("IntCmp"), "got: {f:?}");
+    assert!(format!("{f:?}").contains("BitsVal"), "got: {f:?}");
     let f = alloy_front_rs::parse_formula("A = B").expect("parse");
     assert!(format!("{f:?}").starts_with("Cmp("), "got: {f:?}");
     // genuinely int-typed `=` keeps the int route (`#A` is cardinality)
@@ -461,8 +462,9 @@ fn int_literal_singleton_some() {
     assert_eq!(outcome(src, 0), "SAT");
 }
 
-/// Unsigned Int atoms: `some x: X | x < 2` is SAT, while `x < 0` is
-/// UNSAT (nothing in `{0, .., W-1}` is negative).
+/// Bitmask values of scalar Int atoms are positive powers of two
+/// (`2^v`), except the MSB atom (`-2^(w-1)`), so `x < 0` is SAT as well
+/// (satisfied by x = the MSB atom).
 #[test]
 fn int_var_lt_some_sat() {
     let src = r#"
@@ -471,12 +473,12 @@ fn int_var_lt_some_sat() {
         run { some x: X | x < 2 } for 3
     "#;
     assert_eq!(outcome(src, 0), "SAT");
-    let src = r#"
+    let src2 = r#"
         module t
         sig X in Int {}
         run { some x: X | x < 0 } for 3
     "#;
-    assert_eq!(outcome(src, 0), "UNSAT");
+    assert_eq!(outcome(src2, 0), "SAT");
 }
 
 /// Above the bitwidth-4 maximum (7), no X atom qualifies: UNSAT.
@@ -490,15 +492,22 @@ fn int_var_gt_unsat() {
     assert_eq!(outcome(src, 0), "UNSAT");
 }
 
-/// Relational `x = 0` against the `{0}` singleton is SAT.
+/// Exact atom matching goes through braces: `x = {0}` is SAT, while
+/// `x = 0` (bitmask read: 2^v = 0 is impossible) is UNSAT.
 #[test]
 fn int_var_eq_zero_sat() {
-    let src = r#"
+    let sat_src = r#"
+        module t
+        sig X in Int {}
+        run { some x: X | x = {0} } for 3
+    "#;
+    assert_eq!(outcome(sat_src, 0), "SAT");
+    let unsat_src = r#"
         module t
         sig X in Int {}
         run { some x: X | x = 0 } for 3
     "#;
-    assert_eq!(outcome(src, 0), "SAT");
+    assert_eq!(outcome(unsat_src, 0), "UNSAT");
 }
 
 /// Java parity: `{x: X}` without `| body` enumerates the whole domain.
@@ -507,7 +516,7 @@ fn comprehension_without_filter() {
     let src = r#"
         module t
         sig X in Int {}
-        fact pin { X = 1 + 2 + 3 }
+        fact pin { X = {1} + {2} + {3} }
         pred p { {x: X} = X }
         run p for 3
     "#;
@@ -595,7 +604,7 @@ fn sum_of_set() {
     let sat = r#"
         module t
         sig X in Int {}
-        fact pin { X = 1 + 2 + 3 }
+        fact pin { X = {1} + {2} + {3} }
         pred p { (sum X) = 6 }
         run p for 3
     "#;
@@ -603,7 +612,7 @@ fn sum_of_set() {
     let unsat = r#"
         module t
         sig X in Int {}
-        fact pin { X = 1 + 2 + 3 }
+        fact pin { X = {1} + {2} + {3} }
         pred p { (sum X) = 7 }
         run p for 3
     "#;
@@ -611,42 +620,44 @@ fn sum_of_set() {
     let braced = r#"
         module t
         sig X in Int {}
-        fact pin { X = 1 + 2 + 3 }
+        fact pin { X = {1} + {2} + {3} }
         pred p { (sum {x: X | some x}) = 6 }
         run p for 3
     "#;
     assert_eq!(outcome(braced, 0), "SAT");
 }
 
-/// `set = int-expr`: the int side denotes its singleton (Java `toSet`).
-/// `X = sum {1,2}` holds iff X is `{3}`.
+/// `set = sum {...}` is a bitmask read of the set side (uniform rule):
+/// `X = sum {1,2}` holds iff bitmask(X) = 3, i.e. X = {0, 1}.
 #[test]
-fn set_eq_sum_singleton() {
+fn set_eq_sum_mask() {
     let sat = r#"
         module t
         sig X in Int {}
-        fact pin { X = 1 + 2 + 3 }
+        fact pin { X = {1} + {2} + {3} }
         pred p { X = sum {1, 2} }
-        run p for 3
+        run p for 3, 8 Int
     "#;
-    // X = {1,2,3}, sum{1,2} = 3: {1,2,3} != {3}
+    // X = {1,2,3}, bitmask(X) = 2+4-8 = -2 != 3
     assert_eq!(outcome(sat, 0), "UNSAT");
     let sat2 = r#"
         module t
         sig X in Int {}
-        fact pin { X = 3 }
+        fact pin { X = {0} + {1} }
         pred p { X = sum {1, 2} }
-        run p for 3
+        run p for 3, 8 Int
     "#;
+    // X = {0,1}, bitmask(X) = 1+2 = 3 = sum {1,2}
     assert_eq!(outcome(sat2, 0), "SAT");
-    // mirrored form and `!=`
+    // mirrored form (`sum Y = X` rewinds to the gate-2 desugar) and `!=`
     let mirror = r#"
         module t
         sig X in Int {}
         sig Y in Int {}
-        fact pin { X = 3  Y = 1 + 2 }
-        pred p { (sum Y) = X and X != sum {1} }
-        run p for 3
+        fact pin { X = {0}  Y = {1} }
+        pred p { (sum Y) = X and X != sum {2} }
+        run p for 3, 8 Int
     "#;
+    // sum(Y) = 1, bitmask(X) = 1: equal and not 2
     assert_eq!(outcome(mirror, 0), "SAT");
 }
