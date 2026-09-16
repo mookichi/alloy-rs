@@ -1,1 +1,4 @@
 target/
+
+# REPL runtime history (auto-generated, never commit)
+.alloy_repl_history
