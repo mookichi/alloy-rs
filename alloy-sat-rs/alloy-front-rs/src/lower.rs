@@ -444,6 +444,45 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
+        // ------------------------------------------------------------------
+        // `totalOrder[S, S.next]`: pin the binary field relation
+        // (i.e. `S<:next`) to the canonical chain
+        // over the sig's atoms (Java `pred/totalOrder` symmetry breaking,
+        // aggressive mode). Runs before sig binding so the exact bound
+        // below replaces the generic upper bound.
+        // ------------------------------------------------------------------
+        for (sig_name, field_name) in collect_total_order_pins(self.module) {
+            let key = format!("{sig_name}.{field_name}");
+            let Some(&fr) = rels.get(&key) else {
+                return Err(FrontError::Resolve(format!(
+                    "totalOrder: unknown field '{key}'"
+                )));
+            };
+            let atoms = res.atoms_of(&sig_name);
+            if !res.sigs.contains_key(&sig_name) {
+                return Err(FrontError::Resolve(format!(
+                    "totalOrder: unknown sig '{sig_name}'"
+                )));
+            }
+            let fa = field_arity.get(&key).copied().unwrap_or(2);
+            if fa != 2 {
+                return Err(FrontError::Resolve(format!(
+                    "totalOrder: field '{key}' must be binary (got arity {fa})"
+                )));
+            }
+            let mut chain =
+                alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            for w in atoms.windows(2) {
+                let t = bounds::tuple_of(&res, &[w[0].clone(), w[1].clone()])
+                    .map_err(FrontError::Resolve)?;
+                chain
+                    .insert(&t)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            }
+            b.bound_exactly(fr, &chain)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+        }
         // bind sig bounds AFTER field bounds so pool interning is consistent
         bounds::bind_sigs(self.module, &res, &pool, &mut arena, &mut b, scope)
             .map_err(FrontError::Resolve)?;
@@ -2433,6 +2472,18 @@ impl<'a> Ctx<'a> {
                 arena.or(&[both, neither])
             }
             Formula::Call(name, args, pos) => {
+                // `totalOrder[S, S.next]`: order fixing is applied via
+                // exact bounds on the binary links (i.e. `S<:next`);
+                // the formula itself is true.
+                if name == "totalOrder" {
+                    if args.len() != 2 {
+                        return Err(FrontError::Resolve(format!(
+                            "'totalOrder' expects 2 args, got {}",
+                            args.len()
+                        )));
+                    }
+                    return Ok(arena.bool_formula(true));
+                }
                 // Check ordering builtins first
                 if let Some(f) = self.try_ordering_pred(arena, name, args, env)? {
                     return Ok(f);
@@ -3118,6 +3169,192 @@ fn mentions_int_formula(f: &Formula) -> bool {
             binds.iter().any(|(_, ex)| mentions_int_expr(ex)) || mentions_int_formula(body)
         }
         Formula::Call(_, args, _) => args.iter().any(mentions_int_expr),
+    }
+}
+
+/// Collect `(sig, field)` pairs from `totalOrder[S, S.next]` calls found
+/// in facts, sig facts, and predicate bodies. The second argument
+/// designates the binary links (i.e. `S<:next`). The actual bound pinning
+/// happens in `with_setup`; this only gathers the targets so bounds can
+/// be fixed before lowering.
+fn collect_total_order_pins(module: &Module) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (_, f) in &module.facts {
+        scan_total_order_formula(f, &mut out);
+    }
+    for (_, f) in &module.soft_facts {
+        scan_total_order_formula(f, &mut out);
+    }
+    for sd in &module.sigs {
+        if let Some(f) = &sd.fact {
+            scan_total_order_formula(f, &mut out);
+        }
+    }
+    for p in &module.paras {
+        scan_total_order_formula(&p.body, &mut out);
+    }
+    out
+}
+
+fn scan_total_order_formula(f: &Formula, out: &mut Vec<(String, String)>) {
+    match f {
+        Formula::Call(name, args, _) if name == "totalOrder" && args.len() == 2 => {
+            if let Some(pair) = total_order_target(&args[0], &args[1]) {
+                if !out.contains(&pair) {
+                    out.push(pair);
+                }
+            }
+        }
+        Formula::Call(_, args, _) => {
+            for a in args {
+                scan_total_order_expr(a, out);
+            }
+        }
+        Formula::Cmp(_, a, b, _) => {
+            scan_total_order_expr(a, out);
+            scan_total_order_expr(b, out);
+        }
+        Formula::BadIn(a, _) => scan_total_order_expr(a, out),
+        Formula::IntCmp(_, a, b, _) => {
+            scan_total_order_intexpr(a, out);
+            scan_total_order_intexpr(b, out);
+        }
+        Formula::Quant(_, ds, body) => {
+            for d in ds {
+                scan_total_order_expr(&d.expr, out);
+            }
+            scan_total_order_formula(body, out);
+        }
+        Formula::Multi(_, e, _) => scan_total_order_expr(e, out),
+        Formula::And(a, b)
+        | Formula::Or(a, b)
+        | Formula::Implies(a, b)
+        | Formula::Iff(a, b)
+        | Formula::Until(a, b)
+        | Formula::Releases(a, b)
+        | Formula::Since(a, b)
+        | Formula::Triggered(a, b) => {
+            scan_total_order_formula(a, out);
+            scan_total_order_formula(b, out);
+        }
+        Formula::Not(x)
+        | Formula::Always(x)
+        | Formula::Eventually(x)
+        | Formula::Before(x)
+        | Formula::Historically(x)
+        | Formula::Once(x)
+        | Formula::Keeping(x)
+        | Formula::Goal(x)
+        | Formula::Restore(x)
+        | Formula::Initially(x)
+        | Formula::Regularly(x)
+        | Formula::Consistently(x) => scan_total_order_formula(x, out),
+        Formula::LetBind(binds, body) => {
+            for (_, e) in binds {
+                scan_total_order_expr(e, out);
+            }
+            scan_total_order_formula(body, out);
+        }
+        Formula::MaxSome(e) | Formula::MinSome(e) => scan_total_order_expr(e, out),
+        Formula::MaxSomeDecl(ds, body) => {
+            for d in ds {
+                scan_total_order_expr(&d.expr, out);
+            }
+            scan_total_order_formula(body, out);
+        }
+        Formula::Const(_) | Formula::Pin(..) => {}
+    }
+}
+
+fn scan_total_order_expr(e: &Expr, out: &mut Vec<(String, String)>) {
+    match e {
+        Expr::Call(name, args, _) => {
+            if name == "totalOrder" && args.len() == 2 {
+                if let Some(pair) = total_order_target(&args[0], &args[1]) {
+                    if !out.contains(&pair) {
+                        out.push(pair);
+                    }
+                }
+            }
+            for a in args {
+                scan_total_order_expr(a, out);
+            }
+        }
+        Expr::Bin(_, a, b) => {
+            scan_total_order_expr(a, out);
+            scan_total_order_expr(b, out);
+        }
+        Expr::Transpose(x) | Expr::TClosure(x) | Expr::RClosure(x) => {
+            scan_total_order_expr(x, out);
+        }
+        Expr::Comprehension(ds, body) => {
+            for d in ds {
+                scan_total_order_expr(&d.expr, out);
+            }
+            scan_total_order_formula(body, out);
+        }
+        Expr::If(c, t, el) => {
+            scan_total_order_formula(c, out);
+            scan_total_order_expr(t, out);
+            scan_total_order_expr(el, out);
+        }
+        Expr::Bracket(base, args) => {
+            scan_total_order_expr(base, out);
+            for a in args {
+                scan_total_order_expr(a, out);
+            }
+        }
+        Expr::ArrowMult(_, inner) | Expr::LeadMult(_, inner) => {
+            scan_total_order_expr(inner, out);
+        }
+        Expr::Prime(x) | Expr::AtExpr(x) => scan_total_order_expr(x, out),
+        Expr::LetBind(binds, body) => {
+            for (_, ex) in binds {
+                scan_total_order_expr(ex, out);
+            }
+            scan_total_order_expr(body, out);
+        }
+        _ => {}
+    }
+}
+
+fn scan_total_order_intexpr(e: &IntExpr, out: &mut Vec<(String, String)>) {
+    match e {
+        IntExpr::Card(inner, _) | IntExpr::Val(inner, _) | IntExpr::BitsVal(inner, _) => {
+            scan_total_order_expr(inner, out);
+        }
+        IntExpr::Bin(_, a, b) => {
+            scan_total_order_intexpr(a, out);
+            scan_total_order_intexpr(b, out);
+        }
+        IntExpr::Sum(ds, body, _) => {
+            for d in ds {
+                scan_total_order_expr(&d.expr, out);
+            }
+            scan_total_order_intexpr(body, out);
+        }
+        IntExpr::SumOf(inner, _) => scan_total_order_expr(inner, out),
+        IntExpr::Lit(..) => {}
+    }
+}
+
+/// Extract `(sig, field)` from `totalOrder[S, S.next]` arguments.
+/// The second argument designates the binary links (i.e. `S<:next`):
+/// either `S.next` (a join of the sig and field names) or a bare field
+fn total_order_target(sig_arg: &Expr, rel_arg: &Expr) -> Option<(String, String)> {
+    let Expr::Name(sig, _) = sig_arg else {
+        return None;
+    };
+    match rel_arg {
+        Expr::Bin(BinOp::Join, _, right) => {
+            if let Expr::Name(field, _) = right.as_ref() {
+                Some((sig.clone(), field.clone()))
+            } else {
+                None
+            }
+        }
+        Expr::Name(field, _) if field != sig => Some((sig.clone(), field.clone())),
+        _ => None,
     }
 }
 
