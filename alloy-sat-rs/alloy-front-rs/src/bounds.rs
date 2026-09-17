@@ -35,6 +35,8 @@ pub struct Resolved {
     pub bitwidth: u32,
     /// Int atom count `W` (atoms `{0, .., W-1}`).
     pub int_count: u32,
+    /// Step atoms `{Step$0, ..}` (empty in static commands).
+    pub step_atoms: Vec<String>,
     pub sigs: HashMap<String, SigInfo>,
     /// Every declared sig relation (sig name -> relation).
     #[allow(dead_code)]
@@ -328,8 +330,29 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     } else {
         Vec::new()
     };
+    // Step atoms: temporal step count (`for N steps`, default 4 when the
+    // module carries temporal operators), else empty (static = empty set).
+    let temporal = module.facts.iter().any(|(_, f)| f.has_temporal())
+        || module.soft_facts.iter().any(|(_, f)| f.has_temporal())
+        || module.paras.iter().any(|p| p.body.has_temporal())
+        || module.sigs.iter().any(|sd| {
+            sd.fact.as_ref().is_some_and(|f| f.has_temporal())
+                || sd.fields.iter().any(|d| d.expr.has_temporal())
+        });
+    let step_n: u32 = match scope.steps {
+        Some(n) => n,
+        None => {
+            if temporal {
+                4
+            } else {
+                0
+            }
+        }
+    };
+    let step_atoms: Vec<String> = (0..step_n).map(|i| format!("Step${i}")).collect();
     let mut uni_atoms: Vec<String> = flat.clone();
     uni_atoms.extend(int_names.iter().cloned());
+    uni_atoms.extend(step_atoms.iter().cloned());
     let refs: Vec<&str> = uni_atoms.iter().map(|s| s.as_str()).collect();
     let universe = Universe::new(refs).map_err(|e| format!("universe: {e}"))?;
 
@@ -346,14 +369,31 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             },
         );
     }
+    // Builtin `Step`: reserved name (lexer maps any case/plural to the
+    // scope keyword, so a user `sig Step` cannot parse; rename to avoid).
+    sigs.insert(
+        "Step".to_string(),
+        SigInfo {
+            name: "Step".to_string(),
+            parent: None,
+            rel: SigRel::None,
+            mult: SigMult::None,
+            atoms: step_atoms.clone(),
+        },
+    );
 
     Ok(Resolved {
         universe,
         bitwidth,
         int_count,
+        step_atoms: step_atoms.clone(),
         sigs,
         sig_rel: HashMap::new(),
-        closure_atoms: closure,
+        closure_atoms: {
+            let mut c = closure;
+            c.insert("Step".to_string(), step_atoms);
+            c
+        },
         in_children_atoms,
     })
 }
@@ -398,7 +438,8 @@ pub fn bind_sigs(
         }
         let lo = TupleSet::new(&res.universe, 1).map_err(|e| e.to_string())?;
         let is_exact = *exact.get(name).unwrap_or(&false)
-            || (cmd_scope.overall_exact && !cmd_scope.entries.iter().any(|(n, _)| n == name));
+            || (cmd_scope.overall_exact && !cmd_scope.entries.iter().any(|(n, _)| n == name))
+            || name == "Step";
         // `some sig` requires a non-empty lower bound
         let has_some_mult = module
             .sigs

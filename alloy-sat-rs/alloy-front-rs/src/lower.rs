@@ -757,6 +757,11 @@ impl<'m> Lowerer<'m> {
                 Ok(all.into_iter().map(|a| vec![a]).collect())
             }
             Expr::None_ | Expr::Iden => Ok(Vec::new()),
+            Expr::StepAtom => Ok(res
+                .step_atoms
+                .iter()
+                .map(|a| vec![a.clone()])
+                .collect()),
             Expr::IntAtom => {
                 // Int atoms: named by their numeric value over the
                 // resolved atom count (`{0, .., W-1}`).
@@ -1757,6 +1762,32 @@ impl<'a> Ctx<'a> {
                     acc = Some(match acc {
                         Some(a) => arena
                             .binary_expr(kk::BinaryOp::Union, a, s)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?,
+                        None => s,
+                    });
+                }
+                match acc {
+                    Some(a) => (a, 1),
+                    None => (arena.constant(kk::ConstantExpr::Empty), 1),
+                }
+            }
+            Expr::StepAtom => {
+                // Builtin `Step`: the interned unary relation (exact over
+                // `Step$*`; empty in static commands).
+                if let Some(r) = self.lookup_rel("Step") {
+                    let ar = arena.relation_arity(r);
+                    return Ok((arena.expr_relation(r), ar));
+                }
+                // Fallback: union of singletons (query ctx without rels).
+                let mut acc: Option<ExprId> = None;
+                for a in &self.res.step_atoms {
+                    let idx = self.res.universe.index(a).map_err(|e| {
+                        FrontError::Resolve(format!("Step atom '{a}' missing: {e}"))
+                    })?;
+                    let s = arena.expr_atoms(vec![idx]);
+                    acc = Some(match acc {
+                        Some(x) => arena
+                            .binary_expr(kk::BinaryOp::Union, x, s)
                             .map_err(|e| FrontError::Resolve(e.to_string()))?,
                         None => s,
                     });
@@ -2983,7 +3014,7 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
 fn subst_expr(e: &Expr, from: &str, to: &str) -> Expr {
     match e {
         Expr::Name(n, p) if n == from => Expr::Name(to.to_string(), *p),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => {
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) => {
             e.clone()
         }
         Expr::Bin(op, a, b) => Expr::Bin(
@@ -3100,7 +3131,7 @@ fn strip_mult(e: &Expr) -> Expr {
         Expr::Prime(x) => Expr::Prime(Box::new(strip_mult(x))),
         Expr::AtExpr(x) => Expr::AtExpr(Box::new(strip_mult(x))),
         Expr::LetBind(binds, body) => Expr::LetBind(binds.clone(), Box::new(strip_mult(body))),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => {
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) => {
             e.clone()
         }
     }
@@ -3130,7 +3161,7 @@ fn mentions_int_expr(e: &Expr) -> bool {
         Expr::LetBind(binds, body) => {
             binds.iter().any(|(_, ex)| mentions_int_expr(ex)) || mentions_int_expr(body)
         }
-        Expr::Univ | Expr::None_ | Expr::Iden => false,
+        Expr::Univ | Expr::None_ | Expr::Iden | Expr::StepAtom => false,
     }
 }
 
@@ -3473,6 +3504,7 @@ fn field_mult_constraint(
             Expr::Name(..)
             | Expr::Univ
             | Expr::IntAtom
+            | Expr::StepAtom
             | Expr::Bits(..)
             | Expr::None_
             | Expr::Iden => {
@@ -3639,7 +3671,7 @@ fn field_mult_constraint(
 fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
     match e {
         Expr::Name(n, _) if n == from => to.clone(),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::Bits(..) => {
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) => {
             e.clone()
         }
         Expr::Bin(op, a, b) => Expr::Bin(

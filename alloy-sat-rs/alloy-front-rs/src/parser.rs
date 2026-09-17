@@ -2,7 +2,7 @@
 
 use crate::ast::*;
 use crate::lex::{Tok, Token};
-use crate::types::{int_left_of_in_is_error, set_eq_rhs_is_int, should_rewind_eq};
+use crate::types::{int_left_of_in_is_error, should_rewind_eq};
 use crate::FrontError;
 
 pub struct Parser {
@@ -1271,6 +1271,11 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Iden)
             }
+            Tok::Steps => {
+                // Builtin `Step` (any case, singular/plural).
+                self.bump();
+                Ok(Expr::StepAtom)
+            }
             Tok::IntTy | Tok::IntKw => {
                 self.bump();
                 // Bit-vector model: `Int[w]` per-occurrence widths are gone.
@@ -1967,16 +1972,26 @@ impl Parser {
         // `#`/`sum`/`(`/literals never start a set expression, so
         // attempting int-first here cannot regress: on failure or brace
         // rewind the original relational path surfaces unchanged.
+        // A bare-`Ident` RHS gets the same probe so `X = A - 0` and
+        // `X = 0 - A` agree: a lone `Val` (`X = A`) rewinds (mixed_int
+        // is false), while a mixed tree (`0 - A`, `2 * A`) commits to
+        // integer semantics with the set operand read as its bitmask
+        // value (the lowerer's flavor gate rejects non-Int sets).
         if matches!(kind, CmpKind::Eq | CmpKind::Neq)
             && matches!(
                 self.peek_at(1),
-                Tok::Hash | Tok::Sum | Tok::LParen | Tok::Int(_) | Tok::Minus
+                Tok::Hash
+                    | Tok::Sum
+                    | Tok::LParen
+                    | Tok::Int(_)
+                    | Tok::Minus
+                    | Tok::Ident(_)
             )
         {
             let save = self.pos;
             self.bump(); // consume `=` / `!=`
             if let Ok(ie) = self.int_expr() {
-                if set_eq_rhs_is_int(&ie) {
+                if ie.mixed_int() && !ie.brace_pure() {
                     let neg = matches!(kind, CmpKind::Neq);
                     return Ok(set_eq_int(l, ie, pos, neg));
                 }

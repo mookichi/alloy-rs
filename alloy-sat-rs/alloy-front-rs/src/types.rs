@@ -54,6 +54,10 @@ pub const INT_MISMATCH_MSG: &str = "type mismatch: integer comparison/arithmetic
 
 /// `=`/`!=` rewind rule (`parser.rs::parse_comparison`): when the
 /// relational (set) reading wins over the speculative int reading.
+/// NOTE: deliberately stricter than the `set = int-expr` probe: a
+/// leading int shape with a set-typed operand (`0 - A = X`, `{} = none`)
+/// stays relational here; the integer route for mixed trees applies on
+/// the right of `=`/`!=` only (write `X = 0 - A`).
 pub fn should_rewind_eq(l: &IntExpr, r: &IntExpr) -> bool {
     (!r.int_typed() && !l.bare_int()) || (l.brace_pure() && r.brace_pure())
 }
@@ -109,7 +113,7 @@ pub fn leaf_kind(e: &Expr) -> Option<SetKind> {
                 None
             }
         }
-        Expr::Univ | Expr::None_ => Some(SetKind::Plain),
+        Expr::Univ | Expr::None_ | Expr::StepAtom => Some(SetKind::Plain),
         Expr::Comprehension(..) => Some(SetKind::Unknown),
         _ => None,
     }
@@ -173,6 +177,45 @@ mod tests {
         // `#A = 4`: both int-typed, not brace-pure -> no rewind.
         let card = IntExpr::Card(Box::new(name("A")), 0);
         assert!(!should_rewind_eq(&card, &lit(4)));
+        // Leading mixed shapes stay relational here (`0 - A = X` rewinds;
+        // the integer route applies on the right of `=` only).
+        let sub = IntExpr::Bin(
+            crate::ast::IntBinOp::Sub,
+            Box::new(lit(0)),
+            Box::new(val(name("A"))),
+        );
+        assert!(should_rewind_eq(&sub, &val(name("X"))));
+        // `(A + B) = S`: lone Vals on both sides -> rewind to set.
+        let add = IntExpr::Bin(
+            crate::ast::IntBinOp::Add,
+            Box::new(val(name("A"))),
+            Box::new(val(name("B"))),
+        );
+        assert!(should_rewind_eq(&add, &val(name("S"))));
+    }
+
+    #[test]
+    fn mixed_int_table() {
+        // Lone Val stays relational.
+        assert!(!val(name("A")).mixed_int());
+        // Hard-int leaves commit.
+        assert!(lit(1).mixed_int());
+        assert!(bits(name("0")).mixed_int());
+        // Mixed trees commit even with Val inside.
+        let sub = IntExpr::Bin(
+            crate::ast::IntBinOp::Sub,
+            Box::new(lit(0)),
+            Box::new(val(name("A"))),
+        );
+        assert!(sub.mixed_int());
+        assert!(!sub.brace_pure());
+        // Pure Val combinations stay relational.
+        let add = IntExpr::Bin(
+            crate::ast::IntBinOp::Add,
+            Box::new(val(name("A"))),
+            Box::new(val(name("B"))),
+        );
+        assert!(!add.mixed_int());
     }
 
     #[test]

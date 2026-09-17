@@ -384,6 +384,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, crate::FrontError> {
                     i += 1;
                 }
                 let word = &src[start..i];
+                // `Step`/`steps` (any case, singular/plural) is a reserved
+                // builtin: normalize case-insensitively before keywords.
+                let lower = word.to_ascii_lowercase();
+                if lower == "step" || lower == "steps" {
+                    out.push(Token {
+                        tok: Tok::Steps,
+                        pos: start,
+                    });
+                    continue;
+                }
                 let kw = match word {
                     "module" => Tok::Module,
                     "sig" => Tok::Sig,

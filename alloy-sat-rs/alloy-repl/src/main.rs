@@ -20,10 +20,11 @@ use std::collections::{HashMap, HashSet};
 
 use alloy_front_rs::{
     check, command_needs_opt, eval, fragment_keys, optimize, parse_int_expr, parse_module,
-    query_value, run, run_opt_command, solve, validate, Cnf, CnfKind, CommandKind, Expr,
-    IncrementalSession, Instance, KkOptSense, Module, OptSolution, OptTarget, PartialInstance,
-    QueryValue,
+    query_value, run, run_opt_command, solve, solve_temporal, validate, validate_temporal, Cnf,
+    CnfKind, CommandKind, Expr, IncrementalSession, Instance, KkOptSense, Module, OptSolution,
+    OptTarget, PartialInstance, QueryValue,
 };
+use alloy_kodkod_rs::TemporalInstance;
 
 mod fmt;
 use clap::Parser as ClapParser;
@@ -78,6 +79,10 @@ struct Pending {
 struct StoredSol {
     sat: bool,
     instance: Option<Instance>,
+    /// Full lasso trace for temporal Cnfs (`None` for static / `:eval` /
+    /// optimizer solutions). `instance` still holds `states[0]` so `:query`
+    /// / `:psave` keep working on the first state.
+    temporal: Option<TemporalInstance>,
     /// Optimum cost for `:max`/`:min`/`:maxw`/`:minw` solutions.
     cost: Option<i64>,
     /// Origin Cnf store name; empty for `:eval` solutions (no Cnf context).
@@ -297,10 +302,15 @@ impl Session {
                         .cost
                         .map(|c| format!(" cost={c}"))
                         .unwrap_or_default();
+                    let trace = s
+                        .temporal
+                        .as_ref()
+                        .map(|t| format!(" temporal steps={} loop={}", t.len(), t.loop_state()))
+                        .unwrap_or_default();
                     if s.from_cnf.is_empty() {
-                        println!("{mark} {name}  {st}{cost} (from :eval)");
+                        println!("{mark} {name}  {st}{cost}{trace} (from :eval)");
                     } else {
-                        println!("{mark} {name}  {st}{cost} <- {}", s.from_cnf);
+                        println!("{mark} {name}  {st}{cost}{trace} <- {}", s.from_cnf);
                     }
                 }
                 None => println!("{mark} {name}  (gone)"),
@@ -414,6 +424,8 @@ impl Session {
             None => {
                 if m.commands.len() == 1 {
                     Ok(0)
+                } else if m.commands.is_empty() {
+                    Err("no commands in module (add a run/check/maximize line)".into())
                 } else {
                     Err(
                         "usage: :run|:check <index|name> [as <cnf>] (module has several commands)"
@@ -478,6 +490,7 @@ impl Session {
         sat: bool,
         instance: Option<Instance>,
         cost: Option<i64>,
+        temporal: Option<TemporalInstance>,
     ) -> String {
         match want {
             Some(n) => {
@@ -490,6 +503,7 @@ impl Session {
                     StoredSol {
                         sat,
                         instance,
+                        temporal,
                         cost,
                         from_cnf: from_cnf.to_string(),
                     },
@@ -513,6 +527,7 @@ impl Session {
                     StoredSol {
                         sat,
                         instance,
+                        temporal,
                         cost,
                         from_cnf: from_cnf.to_string(),
                     },
@@ -624,6 +639,30 @@ impl Session {
         }
     }
 
+    fn print_temporal_solution(&self, trace: &Option<TemporalInstance>, is_check: bool) {
+        match trace {
+            Some(ti) => {
+                if is_check {
+                    println!("SAT -- counterexample found: temporal trace");
+                } else {
+                    println!("SAT -- example found: temporal trace");
+                }
+                println!("trace: steps={} loop={}", ti.len(), ti.loop_state());
+                for (i, st) in ti.states().iter().enumerate() {
+                    println!("--- state {i} ---");
+                    println!("{}", fmt::instance_alloy_hinted(st, &self.display_hints()));
+                }
+                println!("note: :query/:psave see state 0; :show <sol> reprints the trace");
+            }
+            None => {
+                if is_check {
+                    println!("UNSAT -- no counterexample (assertion holds; empty)");
+                } else {
+                    println!("UNSAT -- no example (empty)");
+                }
+            }
+        }
+    }
     fn resolve_cnf(&self, name: &str) -> Option<&Cnf> {
         self.cnfs.get(name)
     }
@@ -665,11 +704,25 @@ impl Session {
                 return;
             }
         };
+        if cnf.is_temporal {
+            match solve_temporal(&cnf) {
+                Ok(trace) => {
+                    let sat = trace.is_some();
+                    self.print_temporal_solution(&trace, cnf.is_check());
+                    let first = trace.as_ref().and_then(|t| t.states().first().cloned());
+                    let sol_name =
+                        self.store_sol(as_name, &cnf_name, sat, first, None, trace);
+                    println!("saved solution `{sol_name}` <- `{cnf_name}` *default");
+                }
+                Err(e) => println!("solve error: {e}"),
+            }
+            return;
+        }
         match solve(&cnf) {
             Ok(inst) => {
                 let sat = inst.is_some();
                 self.print_solution(&inst, cnf.is_check());
-                let sol_name = self.store_sol(as_name, &cnf_name, sat, inst, None);
+                let sol_name = self.store_sol(as_name, &cnf_name, sat, inst, None, None);
                 println!("saved solution `{sol_name}` <- `{cnf_name}` *default");
             }
             Err(e) => println!("solve error: {e}"),
@@ -710,6 +763,10 @@ impl Session {
                 return;
             }
         };
+        if cnf.is_temporal {
+            println!("temporal cnf `{cnf_name}` is not supported by :max/:min (objectives over traces are undefined; solve the trace with :solve instead)");
+            return;
+        }
         match optimize(module, &cnf, &target) {
             Ok(sol) => {
                 self.print_store_opt_solution(sol, &cnf_name, as_name);
@@ -767,6 +824,8 @@ impl Session {
     /// Print an optimization result and save it as a solution.
     /// `from_label` names the origin (a Cnf name, or a command label for
     /// `:optimize`, which carries no Cnf context like `:eval` solutions).
+    /// Temporal optima carry the projected lasso trace: it is printed and
+    /// stored (with state 0 kept as the queryable instance).
     fn print_store_opt_solution(
         &mut self,
         sol: OptSolution,
@@ -778,14 +837,25 @@ impl Session {
                 Some(c) => println!("SAT -- optimum found: cost={c}"),
                 None => println!("SAT -- optimum found"),
             }
-            if let Some(ref inst) = sol.instance {
+            if let Some(ref ti) = sol.temporal {
+                println!("trace: steps={} loop={}", ti.len(), ti.loop_state());
+                for (i, st) in ti.states().iter().enumerate() {
+                    println!("--- state {i} ---");
+                    println!("{}", fmt::instance_alloy_hinted(st, &self.display_hints()));
+                }
+                println!("note: :query/:psave see state 0; :show <sol> reprints the trace");
+            } else if let Some(ref inst) = sol.instance {
                 println!("{}", fmt::instance_alloy_hinted(inst, &self.display_hints()));
             }
         } else {
             println!("UNSAT -- no model (empty)");
         }
         let sat = sol.satisfiable;
-        let sol_name = self.store_sol(as_name, from_label, sat, sol.instance, sol.cost);
+        let (instance, temporal) = match sol.temporal {
+            Some(ti) => (ti.states().first().cloned(), Some(ti)),
+            None => (sol.instance, None),
+        };
+        let sol_name = self.store_sol(as_name, from_label, sat, instance, sol.cost, temporal);
         println!("saved solution `{sol_name}` <- `{from_label}` *default");
     }
 
@@ -805,7 +875,7 @@ impl Session {
                 self.print_solution(&sol.instance, false);
                 if let Some(n) = save_as {
                     let sat = sol.satisfiable;
-                    let name = self.store_sol(Some(n), "", sat, sol.instance, None);
+                    let name = self.store_sol(Some(n), "", sat, sol.instance, None, None);
                     println!("saved solution `{name}` (from :eval; no Cnf context) *default");
                 }
             }
@@ -825,13 +895,20 @@ impl Session {
             },
         };
         let stored = match self.sols.get(&sol_name) {
-            Some(s) => (s.from_cnf.clone(), s.instance.clone()),
+            Some(s) => (
+                s.from_cnf.clone(),
+                s.instance.clone(),
+                s.temporal.is_some(),
+            ),
             None => {
                 println!("no solution named `{sol_name}` (:sols to list)");
                 return;
             }
         };
-        let (from_cnf, inst_owned) = stored;
+        let (from_cnf, inst_owned, is_temporal) = stored;
+        if is_temporal {
+            println!("note: temporal solution `{sol_name}`: querying state 0");
+        }
         if from_cnf.is_empty() {
             println!("solution `{sol_name}` is from :eval (no Cnf context for :query)");
             return;
@@ -989,6 +1066,24 @@ impl Session {
                 return;
             }
         };
+        if cnf.is_temporal {
+            match &stored.temporal {
+                Some(ti) => match validate_temporal(cnf, ti) {
+                    Some(_) => println!(
+                        "valid -- `{sol_name}` is a model of `{cnf_name}` (temporal steps={} loop={})",
+                        ti.len(),
+                        ti.loop_state()
+                    ),
+                    None => println!(
+                        "invalid -- `{sol_name}` is not a model of `{cnf_name}` (none/empty)"
+                    ),
+                },
+                None => println!(
+                    "solution `{sol_name}` has no temporal trace (re-:solve `{cnf_name}` to record one)"
+                ),
+            }
+            return;
+        }
         match validate(cnf, inst) {
             Some(back) => {
                 println!("valid -- `{sol_name}` is a model of `{cnf_name}`, as-is:");
@@ -1072,6 +1167,10 @@ impl Session {
                 return;
             }
         };
+        if cnf.is_temporal {
+            println!("temporal cnf `{cnf_name}` is not supported by :ppin yet (expanded bounds)");
+            return;
+        }
         let mut sess = match IncrementalSession::open(&cnf) {
             Ok(s) => s,
             Err(e) => {
@@ -1095,7 +1194,7 @@ impl Session {
                 Ok(inst) => {
                     self.print_solution(&inst, cnf.is_check());
                     let sat = inst.is_some();
-                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None);
+                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None, None);
                     println!("saved solution `{name}` <- `{cnf_name}` *default");
                 }
                 Err(e) => println!("solve error: {e}"),
@@ -1116,7 +1215,7 @@ impl Session {
                 Ok(inst) => {
                     self.print_solution(&inst, cnf.is_check());
                     let sat = inst.is_some();
-                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None);
+                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None, None);
                     println!("saved solution `{name}` <- `{cnf_name}` *default");
                 }
                 Err(e) => println!("solve error: {e}"),
@@ -1154,6 +1253,10 @@ impl Session {
                 return;
             }
         };
+        if cnf.is_temporal {
+            println!("temporal cnf `{cnf_name}` is not supported by :pavoid yet (expanded bounds)");
+            return;
+        }
         let mut sess = match IncrementalSession::open(&cnf) {
             Ok(s) => s,
             Err(e) => {
@@ -1194,7 +1297,7 @@ impl Session {
                 Ok(inst) => {
                     self.print_solution(&inst, cnf.is_check());
                     let sat = inst.is_some();
-                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None);
+                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None, None);
                     println!("saved solution `{name}` <- `{cnf_name}` *default");
                 }
                 Err(e) => println!("solve error: {e}"),
@@ -1216,7 +1319,7 @@ impl Session {
                 Ok(inst) => {
                     self.print_solution(&inst, cnf.is_check());
                     let sat = inst.is_some();
-                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None);
+                    let name = self.store_sol(sol_arg, &cnf_name, sat, inst, None, None);
                     println!("saved solution `{name}` <- `{cnf_name}` *default");
                 }
                 Err(e) => println!("solve error: {e}"),
@@ -1277,6 +1380,13 @@ impl Session {
                 return;
             }
         };
+        if self
+            .sols
+            .get(&sol_name)
+            .is_some_and(|s| s.temporal.is_some())
+        {
+            println!("note: temporal solution `{sol_name}`: saving state 0");
+        }
         let pool = inst.pool();
         let all_names: Vec<String> = inst
             .relation_tuples()
@@ -1339,6 +1449,9 @@ impl Session {
         };
         println!("cnf `{name}`: {}", cnf.summary());
         println!("  bitwidth={} skolemize={}", cnf.bitwidth, cnf.skolemize);
+        if cnf.is_temporal {
+            println!("  temporal steps={} (expanded {} vars)", cnf.steps, cnf.num_vars);
+        }
         for (i, cl) in cnf.clauses.iter().take(limit).enumerate() {
             let line: Vec<String> = cl.iter().map(|l| l.to_string()).collect();
             println!("  c{i}: {}", line.join(" "));
@@ -1363,10 +1476,25 @@ impl Session {
                 } else {
                     format!("SAT <- `{}`", s.from_cnf)
                 };
-                println!(
-                    "solution `{name}`: {kind}\n{}",
-                    fmt::instance_alloy_hinted(inst, &self.display_hints())
-                );
+                if let Some(ti) = &s.temporal {
+                    let mut out = format!(
+                        "solution `{name}`: {kind} temporal trace steps={} loop={}",
+                        ti.len(),
+                        ti.loop_state()
+                    );
+                    for (i, st) in ti.states().iter().enumerate() {
+                        out.push_str(&format!(
+                            "\n--- state {i} ---\n{}",
+                            fmt::instance_alloy_hinted(st, &self.display_hints())
+                        ));
+                    }
+                    println!("{out}");
+                } else {
+                    println!(
+                        "solution `{name}`: {kind}\n{}",
+                        fmt::instance_alloy_hinted(inst, &self.display_hints())
+                    );
+                }
             }
             None => println!("solution `{name}`: UNSAT (none / empty)"),
         }
@@ -1436,6 +1564,7 @@ fn print_help() {
     println!("  :run <i|name> [as <cnf>]    build Cnf, save it (auto: command name, else run0..)");
     println!("  :check <i|name> [as <cnf>]  build negated Cnf, save it");
     println!("  :solve [<cnf>] [as <sol>]   solve named Cnf (no arg = *default), save solution");
+    println!("                              temporal Cnfs print the full trace (steps + loop)");
     println!("  :optimize [<i|name>] [as <sol>]  run a stored maximize/minimize command, save optimum");
     println!("  minimize ... / maximize ... (bare line: reference runs optimizer, else a model fragment)");
     println!("  :query <expr> [in <sol>]    evaluate against named solution (no in = *default)");
@@ -2191,10 +2320,26 @@ fn main() {
 
         // Bare `minimize`/`maximize`: optimize when it names a stored
         // optimization command, else a model fragment (mirrors run/check).
-        if head == "minimize" || head == "maximize" {
+        // A definition tail (`:`/`{`/`weights`/`for` tokens) is always a
+        // fragment (this covers `maximize: Aopt ...` where the colon sticks
+        // to the keyword); anything else tries the optimizer reference.
+        // Misclassified references are harmless: they would fail
+        // `resolve_index` and land in `Decl` below anyway.
+        if head == "minimize"
+            || head == "maximize"
+            || head == "minimize:"
+            || head == "maximize:"
+        {
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
-            // toks[0] is minimize|maximize; support optional trailing `as <sol>`.
+            // toks[0] is minimize|maximize[:]; support optional trailing `as <sol>`.
             let tail = &toks[1..];
+            let is_def = tail
+                .iter()
+                .any(|t| *t == ":" || *t == "{" || *t == "weights" || *t == "for");
+            if is_def {
+                start_or_submit(&mut sess, InputKind::Decl, trimmed, None);
+                continue;
+            }
             let (head_t, as_name) = split_as(tail);
             let arg_owned: Option<String> = head_t.first().map(|s| s.to_string());
             if as_name == Some("__bad_as__") || head_t.len() > 1 {

@@ -438,6 +438,9 @@ fn int_var_lt_parses_as_int_cmp() {
 
 /// `=` with an int right side takes the bitmask route (`x = 5` is
 /// `bitmask(x) = 5`); `A = B` stays relational; `#A = 4` stays IntCmp.
+/// Mixed literal-plus-`Val` trees (`X = 0 - A`) commit to integer
+/// semantics with the set operand read as its bitmask value; pure
+/// `Val` combinations (`X = A - B`) stay relational (set difference).
 #[test]
 fn int_eq_stays_relational() {
     let f = alloy_front_rs::parse_formula("x = 5").expect("parse");
@@ -448,6 +451,46 @@ fn int_eq_stays_relational() {
     // genuinely int-typed `=` keeps the int route (`#A` is cardinality)
     let f = alloy_front_rs::parse_formula("#A = 4").expect("parse");
     assert!(format!("{f:?}").contains("IntCmp"), "got: {f:?}");
+    // mixed literal-minus-set takes the int route (bitmask arithmetic)
+    let f = alloy_front_rs::parse_formula("X = 0 - A").expect("parse");
+    let dbg = format!("{f:?}");
+    assert!(dbg.contains("IntCmp"), "got: {dbg}");
+    assert!(dbg.contains("Sub"), "got: {dbg}");
+    // pure set-minus-set stays relational (set difference)
+    let f = alloy_front_rs::parse_formula("X = A - B").expect("parse");
+    assert!(format!("{f:?}").starts_with("Cmp("), "got: {f:?}");
+    // symmetric `!=` probe
+    let f = alloy_front_rs::parse_formula("X != 0 - A").expect("parse");
+    assert!(format!("{f:?}").contains("IntCmp"), "got: {f:?}");
+}
+
+/// Static discriminator: with `A = 0`, integer reading gives
+/// `A = 0 - A` as `0 = 0` (SAT) while set-difference reading gives
+/// `{} = {atom0}` (UNSAT).
+#[test]
+fn int_minus_zero_literal_sat() {
+    let src = r#"
+        module t
+        sig A in Signed {}
+        fact { A = 0 }
+        run { A = 0 - A } for 3 Int
+    "#;
+    assert_eq!(outcome(src, 0), "SAT");
+}
+
+/// `0 - B` over a non-Int set is a type error (was silently set
+/// difference); the lowerer's flavor gate reports it.
+#[test]
+fn int_minus_plain_set_is_type_error() {
+    let src = r#"
+        module t
+        sig X in Signed {}
+        sig B {}
+        pred p { X = 0 - B }
+        run p for 3 Int
+    "#;
+    let out = outcome(src, 0);
+    assert!(out.contains("type mismatch"), "unexpected: {out}");
 }
 
 /// Integer literal in set position: `some 5` (the `{5}` singleton).

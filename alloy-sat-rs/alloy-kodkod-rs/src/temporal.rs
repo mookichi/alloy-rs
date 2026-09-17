@@ -24,8 +24,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::ast::{
-    AstArena, BinaryOp, ConstantExpr, ExprCompOp, ExprId, FormulaBinOp, FormulaId, IntCompOp,
-    IntId, Multiplicity, Quantifier, TemporalBinaryOp, TemporalExprOp, TemporalFormulaOp, VarId,
+    AstArena, BinaryOp, ConstantExpr, ExprCompOp, ExprId, FormulaBinOp, FormulaId, IntBinOp,
+    IntCompOp, IntId, Multiplicity, Quantifier, TemporalBinaryOp, TemporalExprOp, TemporalFormulaOp,
+    VarId,
 };
 use crate::eval::{
     closure, cross, difference, intersection, join, override_sets, transpose, union, EvalError,
@@ -36,8 +37,8 @@ use crate::relation::{RelationId, RelationPool};
 use crate::tupleset::TupleSet;
 use crate::universe::Universe;
 
-pub const STATE_ATOM: &str = "Time";
-pub const STATE_SEP: &str = "_";
+pub const STATE_ATOM: &str = "Step";
+pub const STATE_SEP: &str = "$";
 
 #[derive(Debug, thiserror::Error)]
 pub enum TemporalError {
@@ -74,7 +75,7 @@ pub struct TraceIds {
 }
 
 /// Result of bounds expansion.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TemporalExpansion {
     /// expanded static bounds over the extended universe
     pub bounds: crate::bounds::Bounds,
@@ -116,7 +117,11 @@ impl TemporalExpansion {
     }
 
     pub fn state_atom_name(i: usize, j: usize) -> String {
-        format!("{STATE_ATOM}{i}{STATE_SEP}{j}")
+        if j == 0 {
+            format!("{STATE_ATOM}{STATE_SEP}{i}")
+        } else {
+            format!("{STATE_ATOM}{i}{STATE_SEP}{j}")
+        }
     }
 }
 
@@ -200,16 +205,47 @@ pub fn expand_bounds(
     let orig_universe = bounds.universe().clone();
     let pool = bounds.pool().clone();
 
-    // --- expanded universe: original atoms, then Time{i}_{j} ---
-    let mut names: Vec<String> = orig_universe.iter().map(|a| a.to_string()).collect();
-    for j in 0..unrolls {
+    // --- expanded universe: reuse preallocated `Step$i` atoms when the
+    // frontend already materialized them (builtin `Step`), else append ---
+    let mut reuse: Option<Vec<usize>> = None;
+    if unrolls == 1 {
+        let mut idxs = Vec::with_capacity(steps);
+        let mut ok = true;
         for i in 0..steps {
-            names.push(TemporalExpansion::state_atom_name(i, j));
+            match orig_universe.index(&format!("{STATE_ATOM}{STATE_SEP}{i}")) {
+                Ok(k) => idxs.push(k as usize),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            reuse = Some(idxs);
         }
     }
-    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let uni = Universe::new(refs).map_err(|_| TemporalError::BadTraceLength)?;
-    let base = orig_universe.size();
+    let (uni, base): (Arc<Universe>, usize) = match reuse {
+        Some(idxs) => {
+            // Contiguous tail in practice (frontend appends Step atoms
+            // last); downstream code assumes `base..base+steps`.
+            let b = idxs[0];
+            debug_assert!(idxs.iter().enumerate().all(|(k, &v)| v == b + k));
+            (orig_universe.clone(), b)
+        }
+        None => {
+            let mut names: Vec<String> =
+                orig_universe.iter().map(|a| a.to_string()).collect();
+            for j in 0..unrolls {
+                for i in 0..steps {
+                    names.push(TemporalExpansion::state_atom_name(i, j));
+                }
+            }
+            let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            let u = Universe::new(refs).map_err(|_| TemporalError::BadTraceLength)?;
+            let b = orig_universe.size();
+            (u, b)
+        }
+    };
 
     let state_rel = arena.relation("$t_state", 1);
     let first = arena.relation("$t_first", 1);
@@ -835,12 +871,14 @@ impl<'a> Ltl2Fol<'a> {
                 TemporalFormulaOp::Always | TemporalFormulaOp::Eventually => {
                     let always = op == TemporalFormulaOp::Always;
                     // ALWAYS f ≡ all s: reach | f[s];  ¬◇g ≡ all ¬g; etc.
+                    // Under negative polarity the dual quantifier ranges
+                    // over the NEGATED body (De Morgan).
                     let positive_always = always == pol;
                     let v = self.fresh_var("q");
                     let domain = self.reach_expr(t);
                     let d = self.arena.decl(v, Multiplicity::One, domain)?;
                     let ds = self.arena.add_decls(vec![d]);
-                    let body = self.formula(child, true, &T::At(v))?;
+                    let body = self.formula(child, pol, &T::At(v))?;
                     let q = if positive_always {
                         Quantifier::All
                     } else {
@@ -855,12 +893,13 @@ impl<'a> Ltl2Fol<'a> {
                 // --- Past-time LTL ---
                 TemporalFormulaOp::Historically => {
                     // HISTORICALLY f ≡ all s: t.*~TRACE | f[s]
+                    // (¬H f ≡ ONCE ¬f: dual quantifier, negated body).
                     let positive_hist = pol;
                     let v = self.fresh_var("h");
                     let domain = self.rev_reach_expr(t);
                     let d = self.arena.decl(v, Multiplicity::One, domain)?;
                     let ds = self.arena.add_decls(vec![d]);
-                    let body = self.formula(child, true, &T::At(v))?;
+                    let body = self.formula(child, pol, &T::At(v))?;
                     let q = if positive_hist {
                         Quantifier::All
                     } else {
@@ -870,12 +909,13 @@ impl<'a> Ltl2Fol<'a> {
                 }
                 TemporalFormulaOp::Once => {
                     // ONCE f ≡ some s: t.*~TRACE | f[s]
+                    // (¬O f ≡ HISTORICALLY ¬f).
                     let positive_once = pol;
                     let v = self.fresh_var("o");
                     let domain = self.rev_reach_expr(t);
                     let d = self.arena.decl(v, Multiplicity::One, domain)?;
                     let ds = self.arena.add_decls(vec![d]);
-                    let body = self.formula(child, true, &T::At(v))?;
+                    let body = self.formula(child, pol, &T::At(v))?;
                     let q = if positive_once {
                         Quantifier::Some
                     } else {
@@ -895,12 +935,13 @@ impl<'a> Ltl2Fol<'a> {
                     Ok(if pol { inner } else { self.arena.not(inner) })
                 }
                 TemporalFormulaOp::Goal => {
-                    // GOAL f ≡ f @ LAST  (quantify over LAST)
+                    // GOAL f ≡ f @ LAST  (quantify over LAST;
+                    // negated: some s: LAST | ¬f[s]).
                     let v = self.fresh_var("g");
                     let domain = self.last_expr();
                     let d = self.arena.decl(v, Multiplicity::One, domain)?;
                     let ds = self.arena.add_decls(vec![d]);
-                    let body = self.formula(child, true, &T::At(v))?;
+                    let body = self.formula(child, pol, &T::At(v))?;
                     let q = if pol {
                         Quantifier::All
                     } else {
@@ -909,12 +950,12 @@ impl<'a> Ltl2Fol<'a> {
                     Ok(self.arena.quantified(q, ds, body))
                 }
                 TemporalFormulaOp::Restore => {
-                    // RESTORE f ≡ f @ LOOP  (quantify over LOOP)
+                    // RESTORE f ≡ f @ LOOP  (negated: some s: LOOP | ¬f[s]).
                     let v = self.fresh_var("rs");
                     let domain = self.loop_expr();
                     let d = self.arena.decl(v, Multiplicity::One, domain)?;
                     let ds = self.arena.add_decls(vec![d]);
-                    let body = self.formula(child, true, &T::At(v))?;
+                    let body = self.formula(child, pol, &T::At(v))?;
                     let q = if pol {
                         Quantifier::All
                     } else {
@@ -924,6 +965,7 @@ impl<'a> Ltl2Fol<'a> {
                 }
                 TemporalFormulaOp::Keeping => {
                     // KEEPING f ≡ all s: STATE - LAST | f[s]
+                    // (negated: some s | ¬f[s]).
                     let v = self.fresh_var("k");
                     let state = self.state_expr();
                     let last = self.last_expr();
@@ -933,7 +975,7 @@ impl<'a> Ltl2Fol<'a> {
                         .unwrap();
                     let d = self.arena.decl(v, Multiplicity::One, domain)?;
                     let ds = self.arena.add_decls(vec![d]);
-                    let body = self.formula(child, true, &T::At(v))?;
+                    let body = self.formula(child, pol, &T::At(v))?;
                     let q = if pol {
                         Quantifier::All
                     } else {
@@ -943,6 +985,7 @@ impl<'a> Ltl2Fol<'a> {
                 }
                 TemporalFormulaOp::Consistently => {
                     // CONSISTENTLY f ≡ all s: LOOP.*TRACE | f[s]
+                    // (negated: some s | ¬f[s]).
                     let v = self.fresh_var("c");
                     let loop_reach = {
                         let le = self.loop_expr();
@@ -955,7 +998,7 @@ impl<'a> Ltl2Fol<'a> {
                     };
                     let d = self.arena.decl(v, Multiplicity::One, loop_reach)?;
                     let ds = self.arena.add_decls(vec![d]);
-                    let body = self.formula(child, true, &T::At(v))?;
+                    let body = self.formula(child, pol, &T::At(v))?;
                     let q = if pol {
                         Quantifier::All
                     } else {
@@ -965,6 +1008,7 @@ impl<'a> Ltl2Fol<'a> {
                 }
                 TemporalFormulaOp::Regularly => {
                     // REGULARLY f ≡ some s: LOOP.*TRACE | f[s]
+                    // (negated: all s | ¬f[s]).
                     let v = self.fresh_var("rg");
                     let loop_reach = {
                         let le = self.loop_expr();
@@ -977,7 +1021,7 @@ impl<'a> Ltl2Fol<'a> {
                     };
                     let d = self.arena.decl(v, Multiplicity::One, loop_reach)?;
                     let ds = self.arena.add_decls(vec![d]);
-                    let body = self.formula(child, true, &T::At(v))?;
+                    let body = self.formula(child, pol, &T::At(v))?;
                     let q = if pol {
                         Quantifier::Some
                     } else {
@@ -987,144 +1031,176 @@ impl<'a> Ltl2Fol<'a> {
                 }
             },
             crate::ast::FormulaNode::TemporalBinary { op, left, right } => match op {
-                TemporalBinaryOp::Until => {
-                    if pol {
-                        self.until(left, right, t)
-                    } else {
-                        // ¬(a U b) ≡ releases(¬a, ¬b)
-                        self.releases(left, right, t)
-                    }
-                }
-                TemporalBinaryOp::Releases => {
-                    if pol {
-                        self.releases(left, right, t)
-                    } else {
-                        // ¬(a R b) ≡ until(¬a, ¬b)
-                        self.until(left, right, t)
-                    }
-                }
-                TemporalBinaryOp::Since => {
-                    if pol {
-                        self.since(left, right, t)
-                    } else {
-                        // ¬(a S b) ≡ triggered(¬a, ¬b)
-                        self.triggered(left, right, t)
-                    }
-                }
-                TemporalBinaryOp::Triggered => {
-                    if pol {
-                        self.triggered(left, right, t)
-                    } else {
-                        // ¬(a T b) ≡ since(¬a, ¬b)
-                        self.since(left, right, t)
-                    }
-                }
+                TemporalBinaryOp::Until => self.until(left, right, t, pol),
+                TemporalBinaryOp::Releases => self.releases(left, right, t, pol),
+                TemporalBinaryOp::Since => self.since(left, right, t, pol),
+                TemporalBinaryOp::Triggered => self.triggered(left, right, t, pol),
             },
         }
     }
 
-    /// a U b @ t = some r: t.*TRACE | b[r] && all l: upTo(t, r): a[l]
+    /// a U b @ t = some r: t.*TRACE | b[r] && all l: upTo(t, r): a[l].
+    /// Negated (pol=false): all r | ¬b[r] || some l: ¬a[l] (De Morgan).
     fn until(
         &mut self,
         left: FormulaId,
         right: FormulaId,
         t: &T,
+        pol: bool,
     ) -> Result<FormulaId, TemporalError> {
         let v = self.fresh_var("u");
         let domain = self.reach_expr(t);
         let d = self.arena.decl(v, Multiplicity::One, domain)?;
         let ds = self.arena.add_decls(vec![d]);
 
-        let rb = self.formula(right, true, &T::At(v))?;
+        let rb = self.formula(right, pol, &T::At(v))?;
 
         let lvar = self.fresh_var("w");
         let range = self.upto_expr(t, v, false);
         let dl = self.arena.decl(lvar, Multiplicity::One, range)?;
         let dsl = self.arena.add_decls(vec![dl]);
-        let la = self.formula(left, true, &T::At(lvar))?;
-        let forall_a = self.arena.quantified(Quantifier::All, dsl, la);
+        let la = self.formula(left, pol, &T::At(lvar))?;
+        let inner = if pol {
+            Quantifier::All
+        } else {
+            Quantifier::Some
+        };
+        let forall_a = self.arena.quantified(inner, dsl, la);
 
-        let body = self.arena.and(&[rb, forall_a]);
-        Ok(self.arena.quantified(Quantifier::Some, ds, body))
+        let body = if pol {
+            self.arena.and(&[rb, forall_a])
+        } else {
+            self.arena.or(&[rb, forall_a])
+        };
+        let outer = if pol {
+            Quantifier::Some
+        } else {
+            Quantifier::All
+        };
+        Ok(self.arena.quantified(outer, ds, body))
     }
 
-    /// a R b @ t = all r: t.*TRACE | b[r] || (a[r] && all l: upTo(t, r): b[l])
+    /// a R b @ t = all r: t.*TRACE | b[r] || (a[r] && all l: upTo(t, r): b[l]).
+    /// Negated (pol=false): some r | ¬b[r] && (¬a[r] || some l: ¬b[l]).
     fn releases(
         &mut self,
         left: FormulaId,
         right: FormulaId,
         t: &T,
+        pol: bool,
     ) -> Result<FormulaId, TemporalError> {
         let v = self.fresh_var("r");
         let domain = self.reach_expr(t);
         let d = self.arena.decl(v, Multiplicity::One, domain)?;
         let ds = self.arena.add_decls(vec![d]);
 
-        let ra = self.formula(left, true, &T::At(v))?;
-        let rb = self.formula(right, true, &T::At(v))?;
+        let ra = self.formula(left, pol, &T::At(v))?;
+        let rb = self.formula(right, pol, &T::At(v))?;
 
         let lvar = self.fresh_var("s");
         let range = self.upto_expr(t, v, false);
         let dl = self.arena.decl(lvar, Multiplicity::One, range)?;
         let dsl = self.arena.add_decls(vec![dl]);
-        let lb = self.formula(right, true, &T::At(lvar))?;
-        let forall_b = self.arena.quantified(Quantifier::All, dsl, lb);
+        let lb = self.formula(right, pol, &T::At(lvar))?;
+        let inner = if pol {
+            Quantifier::All
+        } else {
+            Quantifier::Some
+        };
+        let forall_b = self.arena.quantified(inner, dsl, lb);
 
-        let conj = self.arena.and(&[ra, forall_b]);
-        let disj = self.arena.or(&[rb, conj]);
-        Ok(self.arena.quantified(Quantifier::All, ds, disj))
+        let (body, outer) = if pol {
+            let conj = self.arena.and(&[ra, forall_b]);
+            let disj = self.arena.or(&[rb, conj]);
+            (disj, Quantifier::All)
+        } else {
+            let disj = self.arena.or(&[ra, forall_b]);
+            let conj = self.arena.and(&[rb, disj]);
+            (conj, Quantifier::Some)
+        };
+        Ok(self.arena.quantified(outer, ds, body))
     }
 
-    /// a S b @ t = some r: t.*~TRACE | b[r] && all l: downTo(t, r): a[l]
+    /// a S b @ t = some r: t.*~TRACE | b[r] && all l: downTo(t, r): a[l].
+    /// Negated (pol=false): all r | ¬b[r] || some l: ¬a[l].
     fn since(
         &mut self,
         left: FormulaId,
         right: FormulaId,
         t: &T,
+        pol: bool,
     ) -> Result<FormulaId, TemporalError> {
         let v = self.fresh_var("su");
         let domain = self.rev_reach_expr(t);
         let d = self.arena.decl(v, Multiplicity::One, domain)?;
         let ds = self.arena.add_decls(vec![d]);
 
-        let rb = self.formula(right, true, &T::At(v))?;
+        let rb = self.formula(right, pol, &T::At(v))?;
 
         let lvar = self.fresh_var("w");
         let range = self.down_to(t, v, false);
         let dl = self.arena.decl(lvar, Multiplicity::One, range)?;
         let dsl = self.arena.add_decls(vec![dl]);
-        let la = self.formula(left, true, &T::At(lvar))?;
-        let forall_a = self.arena.quantified(Quantifier::All, dsl, la);
+        let la = self.formula(left, pol, &T::At(lvar))?;
+        let inner = if pol {
+            Quantifier::All
+        } else {
+            Quantifier::Some
+        };
+        let forall_a = self.arena.quantified(inner, dsl, la);
 
-        let body = self.arena.and(&[rb, forall_a]);
-        Ok(self.arena.quantified(Quantifier::Some, ds, body))
+        let body = if pol {
+            self.arena.and(&[rb, forall_a])
+        } else {
+            self.arena.or(&[rb, forall_a])
+        };
+        let outer = if pol {
+            Quantifier::Some
+        } else {
+            Quantifier::All
+        };
+        Ok(self.arena.quantified(outer, ds, body))
     }
 
-    /// a T b @ t = all r: t.*~TRACE | b[r] || (a[r] && all l: downTo(t, r): b[l])
+    /// a T b @ t = all r: t.*~TRACE | b[r] || (a[r] && all l: downTo(t, r): b[l]).
+    /// Negated (pol=false): some r | ¬b[r] && (¬a[r] || some l: ¬b[l]).
     fn triggered(
         &mut self,
         left: FormulaId,
         right: FormulaId,
         t: &T,
+        pol: bool,
     ) -> Result<FormulaId, TemporalError> {
         let v = self.fresh_var("tr");
         let domain = self.rev_reach_expr(t);
         let d = self.arena.decl(v, Multiplicity::One, domain)?;
         let ds = self.arena.add_decls(vec![d]);
 
-        let ra = self.formula(left, true, &T::At(v))?;
-        let rb = self.formula(right, true, &T::At(v))?;
+        let ra = self.formula(left, pol, &T::At(v))?;
+        let rb = self.formula(right, pol, &T::At(v))?;
 
         let lvar = self.fresh_var("s");
         let range = self.down_to(t, v, false);
         let dl = self.arena.decl(lvar, Multiplicity::One, range)?;
         let dsl = self.arena.add_decls(vec![dl]);
-        let lb = self.formula(right, true, &T::At(lvar))?;
-        let forall_b = self.arena.quantified(Quantifier::All, dsl, lb);
+        let lb = self.formula(right, pol, &T::At(lvar))?;
+        let inner = if pol {
+            Quantifier::All
+        } else {
+            Quantifier::Some
+        };
+        let forall_b = self.arena.quantified(inner, dsl, lb);
 
-        let conj = self.arena.and(&[ra, forall_b]);
-        let disj = self.arena.or(&[rb, conj]);
-        Ok(self.arena.quantified(Quantifier::All, ds, disj))
+        let (body, outer) = if pol {
+            let conj = self.arena.and(&[ra, forall_b]);
+            let disj = self.arena.or(&[rb, conj]);
+            (disj, Quantifier::All)
+        } else {
+            let disj = self.arena.or(&[ra, forall_b]);
+            let conj = self.arena.and(&[rb, disj]);
+            (conj, Quantifier::Some)
+        };
+        Ok(self.arena.quantified(outer, ds, body))
     }
 
     fn int_expr(&mut self, i: IntId, t: &T) -> Result<IntId, TemporalError> {
@@ -1871,9 +1947,65 @@ impl<'a> TemporalEval<'a> {
         env: &Env,
         pos: usize,
     ) -> Result<i64, EvalError> {
-        // primes cannot appear under int expressions except via OfExpr; the
-        // plain evaluator on the shifted state handles those
-        let ev = Evaluator::new(self.ti.state_at(pos));
-        ev.int_value(arena, i, env)
+        // Position-aware integer evaluation: primes under the operand shift
+        // the state (via `expr_at`), unlike the plain evaluator which only
+        // sees one state. Casts apply to the shifted set, mirroring
+        // `Evaluator::int_value`/`int_of_set`.
+        match arena.int(i).clone() {
+            crate::ast::IntNode::Constant(v) => Ok(v),
+            crate::ast::IntNode::OfExpr { op, expr } => {
+                let m = self.expr_at(arena, expr, env, pos)?;
+                let ev = Evaluator::new(self.ti.state_at(pos));
+                Ok(ev.int_of_set(op, &m))
+            }
+            crate::ast::IntNode::Binary { op, left, right } => {
+                let l = self.int_at(arena, left, env, pos)?;
+                let r = self.int_at(arena, right, env, pos)?;
+                Ok(match op {
+                    IntBinOp::Plus => l.wrapping_add(r),
+                    IntBinOp::Minus => l.wrapping_sub(r),
+                    IntBinOp::Times => l.wrapping_mul(r),
+                    IntBinOp::Divide => {
+                        if r == 0 {
+                            return Err(EvalError::DivideByZero);
+                        }
+                        l.wrapping_div(r)
+                    }
+                    IntBinOp::Modulo => {
+                        if r == 0 {
+                            return Err(EvalError::DivideByZero);
+                        }
+                        l.wrapping_rem(r)
+                    }
+                    IntBinOp::And => l & r,
+                    IntBinOp::Or => l | r,
+                    IntBinOp::Xor => l ^ r,
+                    IntBinOp::Shl => l << (r as u32 % 64),
+                    IntBinOp::Shr => ((l as u64) >> (r as u32 % 64)) as i64,
+                })
+            }
+            crate::ast::IntNode::If { cond, then, els } => {
+                if self.formula_at(arena, cond, env, pos)? {
+                    self.int_at(arena, then, env, pos)
+                } else {
+                    self.int_at(arena, els, env, pos)
+                }
+            }
+            crate::ast::IntNode::Sum { decls, body } => {
+                let decl_list = arena.decls(decls).to_vec();
+                let mut domains = Vec::with_capacity(decl_list.len());
+                let mut vars = Vec::with_capacity(decl_list.len());
+                for d in &decl_list {
+                    let m = self.expr_at(arena, d.expr, env, pos)?;
+                    domains.push(m);
+                    vars.push(d.variable);
+                }
+                let mut total = 0i64;
+                for b in self.bindings(&domains, &vars, env) {
+                    total += self.int_at(arena, body, &b, pos)?;
+                }
+                Ok(total)
+            }
+        }
     }
 }

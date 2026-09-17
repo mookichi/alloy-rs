@@ -163,3 +163,97 @@ fn run_command_rejects_soft() {
     let m = parse_module("sig A {}\nrun { maxsome A } for 2").expect("parse");
     assert!(run_command(&m, 0).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Temporal optimization via a static mirror (`goal Aopt = A`): the
+// objective must reference static relations only (var is uniformly
+// excluded); softs + temporal is uniformly rejected.
+// ---------------------------------------------------------------------------
+
+const TEMP_MIRROR: &str = "module t
+var sig A in Signed
+sig Aopt in Signed
+fact {always {A' = 0 - A}}
+fact {goal Aopt = A}
+";
+
+#[test]
+fn temporal_opt_maximize_static_mirror() {
+    // A(0) free; dynamics force A(2k) = A(0), A(2k+1) = -A(0).
+    // Last state (4) mirrors A(0); max bitmask over W=3 subsets is 3
+    // ({0, 1}: -3's negation {0, 2} stays representable, unlike -4's 4).
+    let src = format!("{TEMP_MIRROR}maximize: Aopt for 5 steps, 3 int");
+    let m = parse_module(&src).expect("parse");
+    let sol = run_opt_command(&m, 0).expect("solve");
+    assert!(sol.satisfiable);
+    assert_eq!(sol.cost, Some(3));
+    let ti = sol.temporal.expect("temporal trace attached");
+    assert_eq!(ti.len(), 5);
+    // Aopt is static: identical in every state, equal to the last A.
+    let vals: Vec<i64> = ti
+        .states()
+        .iter()
+        .map(|st| {
+            let r = st.find_relation_by_name("Aopt").expect("Aopt");
+            let ts = st.tuples(r).expect("tuples");
+            ts.index_view()
+                .iter()
+                .map(|idx| {
+                    let v: i64 = st.universe().atom(idx as usize).expect("atom").parse().expect("int");
+                    if v == 2 { -(1i64 << 2) } else { 1i64 << v }
+                })
+                .sum()
+        })
+        .collect();
+    assert_eq!(vals, vec![3, 3, 3, 3, 3]);
+}
+
+#[test]
+fn temporal_opt_minimize_static_mirror() {
+    // Min bitmask: -4 ({2}) is infeasible since -(−4) = 4 is
+    // unrepresentable at W=3; optimum is -3 ({0, 2}).
+    let src = format!("{TEMP_MIRROR}minimize: Aopt for 5 steps, 3 int");
+    let m = parse_module(&src).expect("parse");
+    let sol = run_opt_command(&m, 0).expect("solve");
+    assert!(sol.satisfiable);
+    assert_eq!(sol.cost, Some(-3));
+    assert!(sol.temporal.is_some());
+}
+
+#[test]
+fn temporal_opt_rejects_var_objective() {
+    // Direct var reference: explicit error naming the relation.
+    let src = "module t
+var sig A in Signed
+fact {always {A' = 0 - A}}
+maximize: A for 5 steps, 3 int";
+    let m = parse_module(src).expect("parse");
+    let e = run_opt_command(&m, 0).expect_err("var objective must fail");
+    assert!(e.to_string().contains("static relations only"), "got: {e}");
+    assert!(e.to_string().contains('A'), "got: {e}");
+}
+
+#[test]
+fn temporal_opt_rejects_var_weights() {
+    let src = "module t
+var sig A {}
+sig B {}
+maximize weights { A: 1 } for 3 steps but A 1, B 1";
+    let m = parse_module(src).expect("parse");
+    let e = run_opt_command(&m, 0).expect_err("var weights must fail");
+    assert!(e.to_string().contains("static relations only"), "got: {e}");
+}
+
+#[test]
+fn temporal_opt_rejects_softs() {
+    let src = "module t
+var sig A {}
+sig Aopt in Signed
+fact {always (some A)}
+fact {goal Aopt = A}
+fact { maxsome Aopt }
+maximize: Aopt for 3 steps but A 1";
+    let m = parse_module(src).expect("parse");
+    let e = run_opt_command(&m, 0).expect_err("softs+temporal must fail");
+    assert!(e.to_string().contains("soft"), "got: {e}");
+}

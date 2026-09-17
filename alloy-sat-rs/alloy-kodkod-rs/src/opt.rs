@@ -169,6 +169,10 @@ pub struct OptSolution {
     /// Number of `solve()` calls issued (initial feasibility + loop).
     pub sat_calls: usize,
     pub num_primary_variables: usize,
+    /// Projected lasso trace for temporal optimization (populated by the
+    /// temporal optimizer path; `None` for static optimization).
+    /// `instance` then holds the flat time-expanded model.
+    pub temporal: Option<crate::temporal::TemporalInstance>,
 }
 
 /// Core-guided optimization generic over any assumption-capable
@@ -372,6 +376,7 @@ pub fn solve_opt_with<S: SatSolver>(
             cost: Some(cost),
             sat_calls,
             num_primary_variables: max_primary,
+            temporal: None,
         });
     }
 
@@ -426,6 +431,7 @@ pub fn solve_opt_with<S: SatSolver>(
                 cost: Some(cost),
                 sat_calls,
                 num_primary_variables: max_primary,
+                temporal: None,
             });
         }
         // Core inheritance: the failed selectors name the culprits.
@@ -633,6 +639,7 @@ fn unsat_solution(max_primary: usize) -> OptSolution {
         cost: None,
         sat_calls: 1,
         num_primary_variables: max_primary,
+        temporal: None,
     }
 }
 

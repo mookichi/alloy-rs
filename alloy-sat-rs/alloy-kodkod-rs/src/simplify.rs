@@ -15,6 +15,13 @@
 //! and everything else decline by returning `None`, which only skips).
 //! Shrinking is iterated to a fixpoint (bounded rounds). This is purely
 //! an optimization: it never changes the solution set.
+//!
+//! Temporal soundness: top-level `=`/`in` facts constrain a `var`
+//! relation only at the initial time (the `r ↦ r$t.t` rewrite runs
+//! later in `temporal::translate_temporal_formula`), so bounds of
+//! variable relations are never narrowed here. Static relations may
+//! still be narrowed using a variable relation's bounds (its static
+//! lower/upper bracket every time slice).
 
 use crate::ast::{
     AstArena, BinaryOp, ConstantExpr, ExprCompOp, ExprId, ExprNode, FormulaBinOp, FormulaId,
@@ -109,6 +116,12 @@ fn simplify_in(
         ExprNode::Relation(r) => *r,
         _ => return Ok(false),
     };
+    // Temporal `var` relations are time-indexed later; a top-level fact
+    // constrains only the initial slice, so narrowing (or an UNSAT
+    // verdict from) the static bound is unsound. Skip.
+    if arena.is_variable(r) {
+        return Ok(false);
+    };
     let (lb, ub) = match bounds_pair(bounds, r) {
         Some(p) => p,
         None => return Ok(false),
@@ -134,6 +147,10 @@ fn shrink_in(
         ExprNode::Relation(r) => *r,
         _ => return Ok(false),
     };
+    // See `simplify_in`: never narrow a temporal `var` relation here.
+    if arena.is_variable(r) {
+        return Ok(false);
+    }
     let (lb, ub) = match bounds_pair(bounds, r) {
         Some((lb, ub)) => (lb.clone(), ub.clone()),
         None => return Ok(false),
@@ -183,7 +200,11 @@ fn simplify_equal(
     };
     let mut changed = false;
     // Java order: a-lower, a-upper, b-lower, b-upper.
-    if let Some(r) = ra {
+    // Writes targeting a temporal `var` relation are skipped: a
+    // top-level equality constrains it only at the initial time.
+    // (Reading a var relation's bounds to narrow the OTHER side stays
+    // sound: its static lower/upper bracket every time slice.)
+    if let Some(r) = ra.filter(|r| !arena.is_variable(*r)) {
         if b0.len() > a0.len() && b0.covers(&a0) && a1.covers(&b0) {
             bounds.bound(r, &b0, &a1)?;
             changed = true;
@@ -198,7 +219,7 @@ fn simplify_equal(
             changed = true;
         }
     }
-    if let Some(r) = rb {
+    if let Some(r) = rb.filter(|r| !arena.is_variable(*r)) {
         if a0.len() > b0.len() && a0.covers(&b0) && b1.covers(&a0) {
             bounds.bound(r, &a0, &b1)?;
             changed = true;

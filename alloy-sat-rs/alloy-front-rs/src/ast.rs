@@ -61,6 +61,9 @@ pub enum Expr {
     /// W-bit circuits capped at 30 (`E = min(W, 30)`); `Int[w]` widths are
     /// no longer supported (parsed as a join, i.e. an arity error).
     IntAtom,
+    /// Builtin temporal `Step` (`Step`/`step`/`steps`, any case): the trace
+    /// state set `{Step$0, ..}`. Empty in static commands.
+    StepAtom,
     /// Bitset of an integer literal: `Bits(n)` denotes `{i < W : bit i of
     /// the E-bit wrap of n is set}`, so `Bits(7)` is `{0, 1, 2}`. Built by
     /// the parser for `=`/`!=` with a numeric-literal side.
@@ -192,6 +195,8 @@ impl IntExpr {
     /// `BitsVal`, no `Val` other than the MSB scalar). Such a tree can
     /// only be read as an integer, so in `5 = X` / `sum X = Y` the other
     /// side reads as a bitmask value rather than rewinding.
+    /// (`should_rewind_eq` uses this for leading int shapes; the
+    /// `set = int-expr` probe uses `mixed_int` instead.)
     pub(crate) fn bare_int(&self) -> bool {
         match self {
             IntExpr::Lit(..) | IntExpr::Card(..) | IntExpr::SumOf(..) => true,
@@ -199,6 +204,25 @@ impl IntExpr {
             IntExpr::Bin(_, a, b) => a.bare_int() && b.bare_int(),
             IntExpr::Sum(_, body, _) => body.bare_int(),
             IntExpr::BitsVal(..) => false,
+        }
+    }
+    /// Mixed integer shape for the `set = int-expr` probe: an int tree that
+    /// is not brace-pure and contains at least one hard-int node (literal,
+    /// cardinality, sum, bit-value, or a combination thereof). `Val` (a
+    /// set-typed operand) is allowed inside: the lowerer's flavor gate
+    /// (`lower_int_cast`) validates it via the BITS bitmask cast and errors
+    /// on non-Int sets. A lone `Val` (`X = A`) returns false so plain
+    /// sig-to-sig equality stays relational (bitmask comparison would
+    /// collapse distinct non-Int-atom sets to 0).
+    pub(crate) fn mixed_int(&self) -> bool {
+        match self {
+            IntExpr::Lit(..)
+            | IntExpr::Card(..)
+            | IntExpr::Sum(..)
+            | IntExpr::SumOf(..)
+            | IntExpr::BitsVal(..) => true,
+            IntExpr::Val(..) => false,
+            IntExpr::Bin(_, a, b) => a.mixed_int() || b.mixed_int(),
         }
     }
     /// Rewind-to-relational test for an integer LEFT of `in`: a brace-pure
@@ -356,6 +380,7 @@ impl Expr {
             | Expr::None_
             | Expr::Iden
             | Expr::IntAtom
+            | Expr::StepAtom
             | Expr::Bits(..) => false,
             Expr::LetBind(binds, body) => {
                 body.has_temporal() || binds.iter().any(|(_, e)| e.has_temporal())
@@ -389,6 +414,7 @@ impl Expr {
             | Expr::None_
             | Expr::Iden
             | Expr::IntAtom
+            | Expr::StepAtom
             | Expr::Bits(..) => false,
         }
     }
@@ -703,7 +729,7 @@ pub(crate) fn scan_expr_int_set(e: &Expr, needs: &mut bool) {
         {
             *needs = true;
         }
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden => {}
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::StepAtom => {}
         Expr::Bin(_, a, b) => {
             scan_expr_int_set(a, needs);
             scan_expr_int_set(b, needs);

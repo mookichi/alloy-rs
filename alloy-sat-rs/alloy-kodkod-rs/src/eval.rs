@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::ast::{
-    AstArena, BinaryOp, ConstantExpr, ExprId, FormulaId, IntBinOp, IntCompOp, IntId, IntNode,
-    Multiplicity, Quantifier, VarId,
+    AstArena, BinaryOp, CastToIntOp, ConstantExpr, ExprId, FormulaId, IntBinOp, IntCompOp, IntId,
+    IntNode, Multiplicity, Quantifier, VarId,
 };
 use crate::instance::Instance;
 use crate::intset::{Int, IntSet};
@@ -262,84 +262,90 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Applies an integer cast to an already-evaluated set. Shared with
+    /// temporal validation (`TemporalEval::int_at`), which evaluates the
+    /// operand with prime-shifted positions before casting.
+    pub(crate) fn int_of_set(&self, op: CastToIntOp, m: &TupleSet) -> i64 {
+        match op {
+            CastToIntOp::Cardinality => m.len() as i64,
+            CastToIntOp::Sum => {
+                let mut total = 0i64;
+                let mut layered = false;
+                for (val, ts) in self.instance.int_tuples() {
+                    layered = true;
+                    for idx in ts.index_view().iter() {
+                        if m.contains_index(idx) {
+                            total += val;
+                        }
+                    }
+                }
+                if !layered {
+                    // Solve-derived instances leave the integer layer
+                    // empty; resolve int atoms by universe name
+                    // (int atoms are named by their numeric value).
+                    for idx in m.index_view().iter() {
+                        if let Ok(atom) = self.instance.universe().atom(idx as usize) {
+                            if let Ok(v) = atom.parse::<i64>() {
+                                total += v;
+                            }
+                        }
+                    }
+                }
+                total
+            }
+            CastToIntOp::Bits => {
+                // Bit-vector value with signed MSB weight:
+                // Σ weight(v), weight(v) = -2^(W-1) for the top
+                // atom (W-1), +2^v otherwise. Resolve int atoms by
+                // the integer layer, or by universe name.
+                let mut max_val: i64 = -1;
+                for (val, _) in self.instance.int_tuples() {
+                    max_val = max_val.max(val);
+                }
+                for idx in 0..self.instance.universe().size() {
+                    if let Ok(atom) = self.instance.universe().atom(idx) {
+                        if let Ok(v) = atom.parse::<i64>() {
+                            max_val = max_val.max(v);
+                        }
+                    }
+                }
+                let top = max_val; // W - 1
+                let weight_of = |v: i64| -> Option<i64> { crate::int::bit_weight(v, top) };
+                let mut total = 0i64;
+                let mut layered = false;
+                for (val, ts) in self.instance.int_tuples() {
+                    layered = true;
+                    for idx in ts.index_view().iter() {
+                        if m.contains_index(idx) {
+                            if let Some(wt) = weight_of(val) {
+                                total += wt;
+                            }
+                        }
+                    }
+                }
+                if !layered {
+                    for idx in m.index_view().iter() {
+                        if let Ok(atom) = self.instance.universe().atom(idx as usize) {
+                            if let Ok(v) = atom.parse::<i64>() {
+                                if let Some(wt) = weight_of(v) {
+                                    total += wt;
+                                }
+                            }
+                        }
+                    }
+                }
+                total
+            }
+        }
+    }
+
     pub fn int_value(&self, arena: &AstArena, i: IntId, env: &Env) -> Result<i64, EvalError> {
-        use crate::ast::CastToIntOp;
         let node = arena.int(i).clone();
         match node {
             IntNode::Constant(v) => Ok(v),
             IntNode::OfExpr { op, expr } => {
                 let m = self.expr_set(arena, expr, env)?;
-                match op {
-                    CastToIntOp::Cardinality => Ok(m.len() as i64),
-                    CastToIntOp::Sum => {
-                        let mut total = 0i64;
-                        let mut layered = false;
-                        for (val, ts) in self.instance.int_tuples() {
-                            layered = true;
-                            for idx in ts.index_view().iter() {
-                                if m.contains_index(idx) {
-                                    total += val;
-                                }
-                            }
-                        }
-                        if !layered {
-                            // Solve-derived instances leave the integer layer
-                            // empty; resolve int atoms by universe name
-                            // (int atoms are named by their numeric value).
-                            for idx in m.index_view().iter() {
-                                if let Ok(atom) = self.instance.universe().atom(idx as usize) {
-                                    if let Ok(v) = atom.parse::<i64>() {
-                                        total += v;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(total)
-                    }
-                    CastToIntOp::Bits => {
-                        // Bit-vector value with signed MSB weight:
-                        // Σ weight(v), weight(v) = -2^(W-1) for the top
-                        // atom (W-1), +2^v otherwise. Resolve int atoms by
-                        // the integer layer, or by universe name.
-                        let mut max_val: i64 = -1;
-                        for (val, _) in self.instance.int_tuples() {
-                            max_val = max_val.max(val);
-                        }
-                        for idx in 0..self.instance.universe().size() {
-                            if let Ok(atom) = self.instance.universe().atom(idx) {
-                                if let Ok(v) = atom.parse::<i64>() {
-                                    max_val = max_val.max(v);
-                                }
-                            }
-                        }
-                        let top = max_val; // W - 1
-                        let weight_of = |v: i64| -> Option<i64> { crate::int::bit_weight(v, top) };
-                        let mut total = 0i64;
-                        let mut layered = false;
-                        for (val, ts) in self.instance.int_tuples() {
-                            layered = true;
-                            for idx in ts.index_view().iter() {
-                                if m.contains_index(idx) {
-                                    if let Some(wt) = weight_of(val) {
-                                        total += wt;
-                                    }
-                                }
-                            }
-                        }
-                        if !layered {
-                            for idx in m.index_view().iter() {
-                                if let Ok(atom) = self.instance.universe().atom(idx as usize) {
-                                    if let Ok(v) = atom.parse::<i64>() {
-                                        if let Some(wt) = weight_of(v) {
-                                            total += wt;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(total)
-                    }
-                }
+                Ok(self.int_of_set(op, &m))
             }
             IntNode::Binary { op, left, right } => {
                 let l = self.int_value(arena, left, env)?;
