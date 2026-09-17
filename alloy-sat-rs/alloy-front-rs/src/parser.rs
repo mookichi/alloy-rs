@@ -1908,7 +1908,40 @@ impl Parser {
                 CmpKind::NotIn
             }
             other => {
-                return Err(self.err(&format!("expected comparison, got {}", other.describe())))
+                // `*`/`/`/`%` have no relational reading (only prefix `*`
+                // for closure). A bare-`Ident` LHS (e.g. `A in Signed`)
+                // commits to the set path above, leaving `A * A = 9`
+                // stranded here. Rewind and retry as integer arithmetic,
+                // like `+` is already usable in both positions.
+                // `A+B=5` keeps its legacy `BitsVal(union)` path; this
+                // fallback only triggers when the relational continuation
+                // is impossible.
+                let desc = other.describe();
+                let is_arith = matches!(other, Tok::Star | Tok::Slash | Tok::Percent);
+                if is_arith {
+                    self.pos = start;
+                    if let Ok(f) = self.int_cmp_tail() {
+                        return Ok(f);
+                    }
+                    // Also surface `A*A in B` as the standard int-left-of-
+                    // `in` type error instead of a bare parse error.
+                    self.pos = start;
+                    if let Ok(ie) = self.int_expr() {
+                        // `*`/`/`/`%` have no set reading, so `A*A in B`
+                        // is definitely integer-typed even though `Val`
+                        // leaves `int_typed()` false (same reason the
+                        // `int_cmp_tail` retry above succeeds for `=`).
+                        if matches!(self.peek(), Tok::In)
+                            && (int_left_of_in_is_error(&ie)
+                                || int_expr_has_mul_div_rem(&ie))
+                        {
+                            return Err(self.err(
+                                "type mismatch: integer expression cannot appear left of `in` (both sides must be sets, e.g. `{0, 2} in X`)",
+                            ));
+                        }
+                    }
+                }
+                return Err(self.err(&format!("expected comparison, got {desc}")))
             }
         };
         // Bit-vector model: an integer expression left of `in` is a type
@@ -2179,6 +2212,22 @@ fn fold_int_literal(ie: &crate::ast::IntExpr) -> Option<i64> {
             })
         }
         _ => None,
+    }
+}
+
+/// True when an integer tree uses `*`/`/`/`%`: operators with no
+/// relational (set) reading, so the tree can only be arithmetic
+/// (`A*A in B` is a type error, never a set).
+fn int_expr_has_mul_div_rem(ie: &crate::ast::IntExpr) -> bool {
+    match ie {
+        crate::ast::IntExpr::Bin(op, a, b) => {
+            matches!(
+                op,
+                crate::ast::IntBinOp::Mul | crate::ast::IntBinOp::Div | crate::ast::IntBinOp::Rem
+            ) || int_expr_has_mul_div_rem(a) || int_expr_has_mul_div_rem(b)
+        }
+        crate::ast::IntExpr::Sum(_, body, _) => int_expr_has_mul_div_rem(body),
+        _ => false,
     }
 }
 
