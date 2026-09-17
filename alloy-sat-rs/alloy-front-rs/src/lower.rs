@@ -2482,6 +2482,11 @@ impl<'a> Ctx<'a> {
                             args.len()
                         )));
                     }
+                    if total_order_target(&args[0], &args[1]).is_none() {
+                        return Err(FrontError::Resolve(
+                            "'totalOrder' expects (S, S<:f) or (S, S.f) or (S, f)".into(),
+                        ));
+                    }
                     return Ok(arena.bool_formula(true));
                 }
                 // Check ordering builtins first
@@ -3338,15 +3343,21 @@ fn scan_total_order_intexpr(e: &IntExpr, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// Extract `(sig, field)` from `totalOrder[S, S.next]` arguments.
+/// Extract `(sig, field)` from `totalOrder` arguments.
 /// The second argument designates the binary links (i.e. `S<:next`):
-/// either `S.next` (a join of the sig and field names) or a bare field
+/// `S<:f` (domain restriction), `S.f` (a join of the sig and field
+/// names), or a bare field name (resolved against the first argument's
+/// sig).
 fn total_order_target(sig_arg: &Expr, rel_arg: &Expr) -> Option<(String, String)> {
     let Expr::Name(sig, _) = sig_arg else {
         return None;
     };
     match rel_arg {
-        Expr::Bin(BinOp::Join, _, right) => {
+        Expr::Bin(
+            BinOp::DomainRestrict | BinOp::RangeRestrict | BinOp::Join,
+            _,
+            right,
+        ) => {
             if let Expr::Name(field, _) = right.as_ref() {
                 Some((sig.clone(), field.clone()))
             } else {
