@@ -899,3 +899,189 @@ impl AstArena {
         self.push_formula(FormulaNode::TemporalBinary { op, left, right })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Relation substitution
+// ---------------------------------------------------------------------------
+
+/// Rebuilds `i` with every `ExprNode::Relation(r)` leaf replaced by
+/// `map[&r]` (relations absent from `map` are left as they are).
+///
+/// Used by the temporal optimizer to evaluate an integer objective at a
+/// trace state: `r` is replaced by its state projection
+/// `r$t . $t_first|$t_last|$t_loop`. Substitution is uniform (no scope
+/// tracking): the targets are closed integer expressions.
+pub fn subst_relation_int(
+    arena: &mut AstArena,
+    i: IntId,
+    map: &HashMap<RelationId, ExprId>,
+) -> IntId {
+    match arena.int(i).clone() {
+        IntNode::Constant(_) => i,
+        IntNode::OfExpr { op, expr } => {
+            let e = subst_relation_expr(arena, expr, map);
+            arena.cast_to_int(op, e).unwrap_or(i)
+        }
+        IntNode::Binary { op, left, right } => {
+            let l = subst_relation_int(arena, left, map);
+            let r = subst_relation_int(arena, right, map);
+            arena.binary_int(op, l, r)
+        }
+        IntNode::If { cond, then, els } => {
+            let c = subst_relation_formula(arena, cond, map);
+            let t = subst_relation_int(arena, then, map);
+            let e = subst_relation_int(arena, els, map);
+            arena.if_int(c, t, e)
+        }
+        IntNode::Sum { decls, body } => {
+            let list = arena.decls(decls).to_vec();
+            let new_decls: Vec<Decl> = list
+                .iter()
+                .map(|d| Decl {
+                    mult: d.mult,
+                    variable: d.variable,
+                    expr: subst_relation_expr(arena, d.expr, map),
+                })
+                .collect();
+            let b = subst_relation_int(arena, body, map);
+            let ds = arena.add_decls(new_decls);
+            arena.sum_int(ds, b)
+        }
+    }
+}
+
+/// `ExprId` variant of [`subst_relation_int`].
+pub fn subst_relation_expr(
+    arena: &mut AstArena,
+    e: ExprId,
+    map: &HashMap<RelationId, ExprId>,
+) -> ExprId {
+    match arena.expr(e).clone() {
+        ExprNode::Relation(r) => map.get(&r).copied().unwrap_or(e),
+        ExprNode::Variable(_)
+        | ExprNode::Constant(_)
+        | ExprNode::Atoms(_)
+        | ExprNode::FromInt(_) => e,
+        ExprNode::Unary { op, child } => {
+            let c = subst_relation_expr(arena, child, map);
+            arena.unary_expr(op, c).unwrap_or(e)
+        }
+        ExprNode::Temporal { op, child } => {
+            let c = subst_relation_expr(arena, child, map);
+            match op {
+                TemporalExprOp::Prime => arena.prime(c),
+            }
+        }
+        ExprNode::Binary { op, left, right } => {
+            let l = subst_relation_expr(arena, left, map);
+            let r = subst_relation_expr(arena, right, map);
+            arena.binary_expr(op, l, r).unwrap_or(e)
+        }
+        ExprNode::Nary { op, children } => {
+            let out: Vec<ExprId> = children
+                .iter()
+                .map(|&c| subst_relation_expr(arena, c, map))
+                .collect();
+            arena.compose_expr(op, &out).unwrap_or(e)
+        }
+        ExprNode::If { cond, then, els } => {
+            let c = subst_relation_formula(arena, cond, map);
+            let t = subst_relation_expr(arena, then, map);
+            let el = subst_relation_expr(arena, els, map);
+            arena.if_expr(c, t, el).unwrap_or(e)
+        }
+        ExprNode::Project { expr, columns } => {
+            let c = subst_relation_expr(arena, expr, map);
+            let cols: Vec<IntId> = columns
+                .iter()
+                .map(|&i| subst_relation_int(arena, i, map))
+                .collect();
+            arena.project(c, &cols).unwrap_or(e)
+        }
+        ExprNode::Comprehension { decls, body } => {
+            let list = arena.decls(decls).to_vec();
+            let new_decls: Vec<Decl> = list
+                .iter()
+                .map(|d| Decl {
+                    mult: d.mult,
+                    variable: d.variable,
+                    expr: subst_relation_expr(arena, d.expr, map),
+                })
+                .collect();
+            let b = subst_relation_formula(arena, body, map);
+            let ds = arena.add_decls(new_decls);
+            arena.comprehension(ds, b).unwrap_or(e)
+        }
+    }
+}
+
+/// `FormulaId` variant of [`subst_relation_int`].
+pub fn subst_relation_formula(
+    arena: &mut AstArena,
+    f: FormulaId,
+    map: &HashMap<RelationId, ExprId>,
+) -> FormulaId {
+    match arena.formula(f).clone() {
+        FormulaNode::Constant(_) => f,
+        FormulaNode::Not(child) => {
+            let c = subst_relation_formula(arena, child, map);
+            arena.not(c)
+        }
+        FormulaNode::Nary { op, children } => {
+            let out: Vec<FormulaId> = children
+                .iter()
+                .map(|&c| subst_relation_formula(arena, c, map))
+                .collect();
+            arena.compose_formula(op, &out)
+        }
+        FormulaNode::Comparison { op, left, right } => {
+            let l = subst_relation_expr(arena, left, map);
+            let r = subst_relation_expr(arena, right, map);
+            arena.comparison(op, l, r).unwrap_or(f)
+        }
+        FormulaNode::IntComparison { op, left, right } => {
+            let l = subst_relation_int(arena, left, map);
+            let r = subst_relation_int(arena, right, map);
+            arena.int_comparison(op, l, r)
+        }
+        FormulaNode::Quantified { quant, decls, body } => {
+            let list = arena.decls(decls).to_vec();
+            let new_decls: Vec<Decl> = list
+                .iter()
+                .map(|d| Decl {
+                    mult: d.mult,
+                    variable: d.variable,
+                    expr: subst_relation_expr(arena, d.expr, map),
+                })
+                .collect();
+            let b = subst_relation_formula(arena, body, map);
+            let ds = arena.add_decls(new_decls);
+            arena.quantified(quant, ds, b)
+        }
+        FormulaNode::Multiplicity { mult, expr } => {
+            let e = subst_relation_expr(arena, expr, map);
+            arena.multiplicity_formula(mult, e).unwrap_or(f)
+        }
+        FormulaNode::MaxSome(e) => {
+            let e2 = subst_relation_expr(arena, e, map);
+            arena.maxsome(e2)
+        }
+        FormulaNode::MinSome(e) => {
+            let e2 = subst_relation_expr(arena, e, map);
+            arena.minsome(e2)
+        }
+        FormulaNode::SoftFact(inner) => {
+            let b = subst_relation_formula(arena, inner, map);
+            arena.soft_fact(b)
+        }
+        FormulaNode::TemporalUnary { op, child } => {
+            let c = subst_relation_formula(arena, child, map);
+            arena.temporal_unary(op, c)
+        }
+        FormulaNode::TemporalBinary { op, left, right } => {
+            let l = subst_relation_formula(arena, left, map);
+            let r = subst_relation_formula(arena, right, map);
+            arena.temporal_binary(op, l, r)
+        }
+    }
+}

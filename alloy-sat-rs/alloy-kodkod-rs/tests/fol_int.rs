@@ -242,3 +242,31 @@ fn division_and_modulo_formulas() {
     let f_h = m.icmp_eq(dr, zero);
     assert!(m.sat(f_h));
 }
+
+#[test]
+fn solver_no_overflow_option_gates_cardinality() {
+    use alloy_kodkod_rs::solver::{Solver, SolverOptions};
+
+    // Eight atoms counted at bitwidth 4 (range -8..7): the accumulation
+    // 7+1 overflows, so the gated search rejects `#r = 8` while the
+    // wrapping search keeps it (8 truncates to -8 on both sides).
+    fn sat_with(no_overflow: bool) -> bool {
+        let atoms = ["n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7"];
+        let mut m = Model::new(&atoms);
+        let r = m.rel_exact("r", 1, &atoms);
+        let c = m.card(r);
+        let eight = m.int_const(8);
+        let f = m.icmp_eq(c, eight);
+        Solver::with_options(SolverOptions {
+            bitwidth: 4,
+            no_overflow,
+            ..Default::default()
+        })
+        .solve_with(&mut RecordingSolver::new(), &m.arena, f, &m.bounds)
+        .unwrap()
+        .satisfiable
+    }
+
+    assert!(!sat_with(true), "gated: count overflow rejected");
+    assert!(sat_with(false), "wrapping: count overflow kept");
+}

@@ -21,6 +21,13 @@ pub struct FolTranslator<'a> {
     pub bounds: &'a Bounds,
     leaves: HashMap<RelationId, Rc<BooleanMatrix>>,
     bitwidth: u32,
+    /// Java `noOverflow` equivalent (default ON): integer comparisons are
+    /// gated by `AND(cmp, NOT accum_overflow)`. Division-by-zero is always
+    /// UNSAT (folded into `accum_overflow` at the circuit level).
+    /// NOTE: full `DefCond.ensureDef` polarity handling (ALL vs SOME under
+    /// negation) is backlog; the current gate is exact for positive
+    /// (existential/top-level) contexts.
+    no_overflow: bool,
     origins: Vec<VarOrigin>,
     /// Translation counters (reported under `ALLOY_TIMING`).
     pub stats: FolStats,
@@ -191,6 +198,7 @@ impl<'a> FolTranslator<'a> {
             bounds,
             leaves: HashMap::new(),
             bitwidth: 4,
+            no_overflow: true,
             origins: Vec::new(),
             stats: FolStats::default(),
             matrix_memo: HashMap::default(),
@@ -201,6 +209,22 @@ impl<'a> FolTranslator<'a> {
             memo_miss: 0,
             softs: Vec::new(),
         }
+    }
+
+    /// Standard translator setup shared by every translation entry point
+    /// (`Solver`, `ucore`, `opt`, and the front `Cnf` builders): applies
+    /// `bitwidth`/`no_overflow` in one place so new options cannot be
+    /// missed at individual call sites.
+    pub fn with_options(
+        ctx: BoolCtx,
+        bounds: &'a Bounds,
+        bitwidth: u32,
+        no_overflow: bool,
+    ) -> FolTranslator<'a> {
+        let mut t = FolTranslator::new(ctx, bounds);
+        t.set_bitwidth(bitwidth);
+        t.set_no_overflow(no_overflow);
+        t
     }
 
     /// Sorted free-variable ids of an expression. `None` = conservative
@@ -280,6 +304,15 @@ impl<'a> FolTranslator<'a> {
     pub fn set_bitwidth(&mut self, w: u32) {
         assert!((1..=30).contains(&w), "bitwidth must be 1..=30");
         self.bitwidth = w;
+    }
+
+    /// Opt-out for the overflow prohibition (`false` restores pure wrapping).
+    pub fn set_no_overflow(&mut self, v: bool) {
+        self.no_overflow = v;
+    }
+
+    pub fn no_overflow(&self) -> bool {
+        self.no_overflow
     }
 
     pub fn bitwidth(&self) -> u32 {
@@ -628,10 +661,14 @@ impl<'a> FolTranslator<'a> {
                             while term.width() < bw as usize {
                                 term.bits.push(const_false());
                             }
-                            acc = acc.add(&term, bw);
+                            // Cell-dependent: tainted, so accumulation
+                            // overflow (e.g. count exceeding range) is
+                            // detected like any other relation-derived op.
+                            acc = acc.add(&term.with_taint(true), bw);
                         }
                         let _ = &one;
-                        acc
+                        // Relation-derived: tainted (overflow-prohibited).
+                        acc.with_taint(true)
                     }
                     CastToIntOp::Sum => {
                         let mut positions: Vec<(i64, usize)> = Vec::new();
@@ -645,10 +682,13 @@ impl<'a> FolTranslator<'a> {
                         for &(val, pos) in &positions {
                             if let Some(cell) = m.get(pos) {
                                 let c = IntCircuit::constant(val, bw, &self.ctx);
-                                acc = acc.add(&c.choice(cell, &IntCircuit::zero(&self.ctx)), bw);
+                                let term =
+                                    c.choice(cell, &IntCircuit::zero(&self.ctx)).with_taint(true);
+                                acc = acc.add(&term, bw);
                             }
                         }
-                        acc
+                        // Relation-derived: tainted (overflow-prohibited).
+                        acc.with_taint(true)
                     }
                     CastToIntOp::Bits => {
                         // Bit-vector value with signed MSB weight:
@@ -673,10 +713,13 @@ impl<'a> FolTranslator<'a> {
                             };
                             if let Some(cell) = m.get(pos) {
                                 let c = IntCircuit::constant(weight, bw, &self.ctx);
-                                acc = acc.add(&c.choice(cell, &IntCircuit::zero(&self.ctx)), bw);
+                                let term =
+                                    c.choice(cell, &IntCircuit::zero(&self.ctx)).with_taint(true);
+                                acc = acc.add(&term, bw);
                             }
                         }
-                        acc
+                        // Relation-derived: tainted (overflow-prohibited).
+                        acc.with_taint(true)
                     }
                 }
             }
@@ -712,12 +755,15 @@ impl<'a> FolTranslator<'a> {
                     } else {
                         let m = this.ctx.and(lits);
                         let mask = IntCircuit::from_bits(vec![m; bw as usize], &this.ctx);
-                        Rc::new(t.bit_and(&mask))
+                        // Membership-masked: cell-dependent, hence tainted
+                        // (accumulation overflow must be detected).
+                        Rc::new(t.bit_and(&mask).with_taint(true))
                     };
                     acc = acc.add(&t, bw);
                     Ok(())
                 })?;
-                acc
+                // Relation-quantified sum: tainted (overflow-prohibited).
+                acc.with_taint(true)
             }
         };
         Ok(Rc::new(out))
@@ -886,7 +932,16 @@ impl<'a> FolTranslator<'a> {
                     crate::ast::IntCompOp::Gt => l.gt(&r),
                     crate::ast::IntCompOp::Gte => l.gte(&r),
                 };
-                Ok(cmp)
+                if !self.no_overflow {
+                    return Ok(cmp);
+                }
+                // Gate: overflowing (or dividing-by-zero) assignments make
+                // the comparison false, hence UNSAT when asserted.
+                let bad = self.ctx.or(&[l.accum_overflow(), r.accum_overflow()]);
+                if bad.is_const() && !bad.const_value() {
+                    return Ok(cmp);
+                }
+                Ok(self.ctx.and(&[cmp, self.ctx.not(bad)]))
             }
             FormulaNode::Quantified { quant, decls, body } => {
                 let decl_list = arena.decls(decls).to_vec();

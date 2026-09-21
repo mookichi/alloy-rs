@@ -1573,6 +1573,7 @@ impl Parser {
             }
             Tok::All | Tok::Some | Tok::No | Tok::Lone | Tok::One => self.parse_quant_or_cmp(),
             Tok::MaxSome | Tok::MinSome => self.parse_maxsome(),
+            Tok::Maximize | Tok::Minimize => self.parse_opt_marker(),
             Tok::Sum => {
                 // sum formula? not a formula starter; error out naturally
                 self.parse_quant_or_cmp()
@@ -1597,6 +1598,29 @@ impl Parser {
 
     fn starts_negation(&self) -> bool {
         matches!(self.peek(), Tok::Not)
+    }
+
+    /// In-formula optimization marker: `maximize <intexpr>` /
+    /// `minimize <intexpr>` (an optional `:` mirrors the command form).
+    /// Always-true formula; the target is collected at lowering and
+    /// becomes the enclosing command's objective.
+    fn parse_opt_marker(&mut self) -> PResult<Formula> {
+        let is_max = matches!(self.peek(), Tok::Maximize);
+        let kw = if is_max { "maximize" } else { "minimize" };
+        self.bump();
+        if matches!(self.peek(), Tok::Weights) {
+            return Err(self.err(&format!(
+                "'{kw} weights {{...}}' is a command form; in formula position \
+                 write '{kw} <intexpr>' (e.g. '{kw} #A')"
+            )));
+        }
+        self.eat(&Tok::Colon);
+        let ie = self.int_expr()?;
+        Ok(if is_max {
+            Formula::Maximize(ie)
+        } else {
+            Formula::Minimize(ie)
+        })
     }
 
     /// AlloyMax `maxsome e` / `minsome e`: soft set optimization.
@@ -1667,6 +1691,30 @@ impl Parser {
                     _ => QuantKind::One,
                 };
                 self.bump();
+                // `some Overflow { F }` / `no Overflow { F }` (also `| F`):
+                // search-mode markers. `Overflow` is reserved here; a sig
+                // actually named `Overflow` cannot use multiplicity syntax.
+                if matches!(qk, QuantKind::Some | QuantKind::No)
+                    && matches!(self.peek(), Tok::Ident(n) if n == "Overflow")
+                {
+                    self.bump(); // consume `Overflow`
+                    let body = if matches!(self.peek(), Tok::Bar) {
+                        self.bump(); // consume |
+                        self.formula()?
+                    } else if matches!(self.peek(), Tok::LBrace) {
+                        self.braced_formula()?
+                    } else {
+                        return Err(
+                            self.err("expected '|' or '{' after `some/no Overflow`")
+                        );
+                    };
+                    let mode = if qk == QuantKind::Some {
+                        crate::ast::OverflowMode::Some
+                    } else {
+                        crate::ast::OverflowMode::No
+                    };
+                    return Ok(Formula::OverflowCond(mode, Box::new(body)));
+                }
                 // multiplicity formula like `some b.f` has no decl colon;
                 // a decl starts with name ':' or a name group 'x, y:'
                 let is_decl = match self.peek() {

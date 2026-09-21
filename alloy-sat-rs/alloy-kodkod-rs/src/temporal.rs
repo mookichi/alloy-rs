@@ -1573,11 +1573,36 @@ type Env = Vec<(VarId, Vec<u32>)>;
 /// trace plus a full cycle (`horizon` positions).
 pub struct TemporalEval<'a> {
     pub ti: &'a TemporalInstance,
+    bitwidth: u32,
+    overflow: std::cell::Cell<bool>,
 }
 
 impl<'a> TemporalEval<'a> {
     pub fn new(ti: &'a TemporalInstance) -> TemporalEval<'a> {
-        TemporalEval { ti }
+        TemporalEval {
+            ti,
+            bitwidth: 64,
+            overflow: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Evaluate with E-bit wrapping (pass the problem `bitwidth`).
+    pub fn with_bitwidth(mut self, w: u32) -> TemporalEval<'a> {
+        self.bitwidth = w;
+        self
+    }
+
+    /// Whether any integer operation overflowed so far.
+    pub fn overflowed(&self) -> bool {
+        self.overflow.get()
+    }
+
+    fn wrap(&self, value: i128) -> i64 {
+        crate::eval::wrap_int(value, self.bitwidth, &self.overflow)
+    }
+
+    fn apply_binop(&self, op: IntBinOp, l: i64, r: i64) -> Result<i64, EvalError> {
+        crate::eval::apply_int_binop(op, l, r, self.bitwidth, &self.overflow)
     }
 
     fn horizon(&self) -> usize {
@@ -1952,37 +1977,20 @@ impl<'a> TemporalEval<'a> {
         // sees one state. Casts apply to the shifted set, mirroring
         // `Evaluator::int_value`/`int_of_set`.
         match arena.int(i).clone() {
-            crate::ast::IntNode::Constant(v) => Ok(v),
+            crate::ast::IntNode::Constant(v) => Ok(self.wrap(v as i128)),
             crate::ast::IntNode::OfExpr { op, expr } => {
                 let m = self.expr_at(arena, expr, env, pos)?;
-                let ev = Evaluator::new(self.ti.state_at(pos));
-                Ok(ev.int_of_set(op, &m))
+                let ev = Evaluator::new(self.ti.state_at(pos)).with_bitwidth(self.bitwidth);
+                let v = ev.int_of_set(op, &m);
+                if ev.overflowed() {
+                    self.overflow.set(true);
+                }
+                Ok(v)
             }
             crate::ast::IntNode::Binary { op, left, right } => {
                 let l = self.int_at(arena, left, env, pos)?;
                 let r = self.int_at(arena, right, env, pos)?;
-                Ok(match op {
-                    IntBinOp::Plus => l.wrapping_add(r),
-                    IntBinOp::Minus => l.wrapping_sub(r),
-                    IntBinOp::Times => l.wrapping_mul(r),
-                    IntBinOp::Divide => {
-                        if r == 0 {
-                            return Err(EvalError::DivideByZero);
-                        }
-                        l.wrapping_div(r)
-                    }
-                    IntBinOp::Modulo => {
-                        if r == 0 {
-                            return Err(EvalError::DivideByZero);
-                        }
-                        l.wrapping_rem(r)
-                    }
-                    IntBinOp::And => l & r,
-                    IntBinOp::Or => l | r,
-                    IntBinOp::Xor => l ^ r,
-                    IntBinOp::Shl => l << (r as u32 % 64),
-                    IntBinOp::Shr => ((l as u64) >> (r as u32 % 64)) as i64,
-                })
+                self.apply_binop(op, l, r)
             }
             crate::ast::IntNode::If { cond, then, els } => {
                 if self.formula_at(arena, cond, env, pos)? {
@@ -2002,7 +2010,8 @@ impl<'a> TemporalEval<'a> {
                 }
                 let mut total = 0i64;
                 for b in self.bindings(&domains, &vars, env) {
-                    total += self.int_at(arena, body, &b, pos)?;
+                    let v = self.int_at(arena, body, &b, pos)?;
+                    total = self.wrap(total as i128 + v as i128);
                 }
                 Ok(total)
             }

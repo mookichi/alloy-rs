@@ -111,7 +111,7 @@ fn query_reads_against_instance() {
     assert_eq!(arity, 1);
     let r = inst.find_relation_by_name("A").unwrap();
     assert_eq!(ts.len(), inst.tuples(r).unwrap().len());
-    assert!(ts.len() >= 1);
+    assert!(!ts.is_empty());
     // let-bound expression over the instance
     let (arity2, ts2) = query(&m, scope, &cnf, "let x = A | x", &inst).expect("query let");
     assert_eq!(arity2, 1);

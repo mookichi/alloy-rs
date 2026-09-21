@@ -3,6 +3,14 @@
 //! This is the Rust analogue of kodkod's `Solver`/`IncrementalSolver` entry
 //! point: give it an AST formula plus bounds and it runs the full pipeline
 //! (FOL -> bool circuit -> CNF -> SAT -> materialized `Instance`).
+//!
+//! Layer split: this facade (plus `ucore`/`opt`/decomposition) is the
+//! embeddable engine layer (Java bridge, batch CLI). User-facing search
+//! modes live one layer up, on the front `Cnf` path (`run`/`check` +
+//! `solve`): build warnings, `some`/`no Overflow` markers with CEGAR,
+//! and the `run` two-phase / `check` wrapping-first strategies are
+//! implemented there, not here. Shared translator setup
+//! (`FolTranslator::with_options`) keeps both layers' options in sync.
 
 use crate::ast::{AstArena, FormulaId};
 use crate::bounds::Bounds;
@@ -20,6 +28,10 @@ pub struct SolverOptions {
     /// Replace positive existentials with Skolem witness relations
     /// (equisatisfiability caveat: see `skolem` module docs).
     pub skolemize: bool,
+    /// Forbid integer overflow: comparisons over overflowing values
+    /// cannot hold (Java `noOverflow`; also excludes division by zero).
+    /// Defaults to true, matching the front `Cnf` path.
+    pub no_overflow: bool,
 }
 
 impl Default for SolverOptions {
@@ -28,6 +40,7 @@ impl Default for SolverOptions {
             bitwidth: 4,
             report_stats: false,
             skolemize: false,
+            no_overflow: true,
         }
     }
 }
@@ -86,8 +99,12 @@ impl Solver {
         bounds: &Bounds,
     ) -> Result<Solution, TranslateError> {
         let t0 = std::time::Instant::now();
-        let mut translator = FolTranslator::new(crate::BoolCtx::new(), bounds);
-        translator.set_bitwidth(self.options.bitwidth);
+        let mut translator = FolTranslator::with_options(
+            crate::BoolCtx::new(),
+            bounds,
+            self.options.bitwidth,
+            self.options.no_overflow,
+        );
         let root = translator.formula_ref(arena, formula, &[])?;
         let dt_fol = t0.elapsed();
         let max_primary = translator.ctx.num_slots();
@@ -144,7 +161,14 @@ impl Solver {
         formula: FormulaId,
         bounds: &Bounds,
     ) -> Result<crate::ucore::CoreSolution, TranslateError> {
-        crate::ucore::solve_core_with(solver, self.options.bitwidth, arena, formula, bounds)
+        crate::ucore::solve_core_with(
+            solver,
+            self.options.bitwidth,
+            self.options.no_overflow,
+            arena,
+            formula,
+            bounds,
+        )
     }
 
     /// Optimization solve (Iter 13) with a caller-provided SAT solver.
@@ -164,6 +188,7 @@ impl Solver {
         crate::opt::solve_opt_with(
             solver,
             self.options.bitwidth,
+            self.options.no_overflow,
             arena,
             formula,
             bounds,

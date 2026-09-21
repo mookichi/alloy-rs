@@ -115,7 +115,7 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
         let (name, kind) = command_label(cmd, i);
 
         if let Some(p) = pick {
-            if p != &name && p.parse::<usize>().map(|k| k != i).unwrap_or(true) {
+            if p != name && p.parse::<usize>().map(|k| k != i).unwrap_or(true) {
                 continue;
             }
         }
@@ -207,11 +207,10 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
             format!("run {{ {expr_src} }}")
         };
 
-        let eval_idx = parse_module(&eval_src)
-            .and_then(|m| {
-                let idx = m.commands.len() - 1;
-                Ok((m, idx))
-            });
+        let eval_idx = parse_module(&eval_src).map(|m| {
+            let idx = m.commands.len() - 1;
+            (m, idx)
+        });
 
         match eval_idx {
             Ok((_, idx)) => {

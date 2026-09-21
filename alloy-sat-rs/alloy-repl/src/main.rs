@@ -19,11 +19,14 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_front_rs::{
-    check, command_needs_opt, eval, fragment_keys, optimize, parse_int_expr, parse_module,
-    query_value, run, run_opt_command, solve, solve_temporal, validate, validate_temporal, Cnf,
-    CnfKind, CommandKind, Expr, IncrementalSession, Instance, KkOptSense, Module, OptSolution,
-    OptTarget, PartialInstance, QueryValue,
+    build_cnf_with, check, command_needs_opt, eval, fragment_keys, optimize, optimize_with,
+    parse_int_expr, parse_module, query_value, run, run_opt_command_with, solve,
+    solve_temporal, validate, validate_temporal, Cnf, CnfKind, CommandKind, Expr,
+    IncrementalSession, Instance, KkOptSense, Lowerer, Module, OptSolution, OptTarget,
+    OverflowMode, PartialInstance, QueryValue,
 };
+use alloy_kodkod_rs::eval::Evaluator;
+use alloy_kodkod_rs::temporal::TemporalEval;
 use alloy_kodkod_rs::TemporalInstance;
 
 mod fmt;
@@ -89,6 +92,18 @@ struct StoredSol {
     from_cnf: String,
 }
 
+/// Incremental enumeration state for one Cnf (`:next`).
+///
+/// The session owns a persistent CaDiCaL backend with the Cnf clauses
+/// loaded once; each `:next` permanently blocks all known solutions from
+/// that Cnf and re-solves. `blocked` tracks which stored solution names
+/// already have blocking clauses so repeated `:next` calls (and branched
+/// `:solve`s) never exclude the same model twice.
+struct EnumSession {
+    session: IncrementalSession,
+    blocked: HashSet<String>,
+}
+
 struct Session {
     base_src: String,
     fragments: Vec<(Vec<String>, String)>,
@@ -97,6 +112,7 @@ struct Session {
     source_desc: String,
     cnfs: HashMap<String, Cnf>,
     sols: HashMap<String, StoredSol>,
+    enum_sessions: HashMap<String, EnumSession>,
     cnf_order: Vec<String>,
     sol_order: Vec<String>,
     default_cnf: Option<String>,
@@ -115,6 +131,7 @@ impl Session {
             source_desc: String::new(),
             cnfs: HashMap::new(),
             sols: HashMap::new(),
+            enum_sessions: HashMap::new(),
             cnf_order: Vec::new(),
             sol_order: Vec::new(),
             default_cnf: None,
@@ -237,6 +254,7 @@ impl Session {
         let ns = self.sols.len();
         self.cnfs.clear();
         self.sols.clear();
+        self.enum_sessions.clear();
         self.cnf_order.clear();
         self.sol_order.clear();
         self.default_cnf = None;
@@ -565,6 +583,9 @@ impl Session {
         match built {
             Ok(cnf) => {
                 let summary = cnf.summary();
+                for w in &cnf.warnings {
+                    println!("{w}");
+                }
                 let name = self.store_cnf(cnf, as_name);
                 println!("saved cnf `{name}` ({summary}) *default");
                 println!("hint: :solve {name} to solve, :show {name} to view cnf");
@@ -682,7 +703,7 @@ impl Session {
                 return;
             }
         }
-        let cnf_name = match cnf_arg {
+        let mut cnf_name = match cnf_arg {
             Some(n) => n.to_string(),
             None => match self.default_cnf_name() {
                 Some(n) => n,
@@ -695,37 +716,395 @@ impl Session {
         let cnf = match self.resolve_cnf(&cnf_name) {
             Some(c) => c.clone(),
             None => {
-                // Migration hint: the old `:solve <command>` auto-build is gone.
-                if self.module.is_some() && self.resolve_index(Some(&cnf_name)).is_ok() {
-                    println!("no cnf named `{cnf_name}` (did you mean :run {cnf_name} first?)");
-                } else {
-                    println!("no cnf named `{cnf_name}` (:cnfs to list)");
+                // Auto-build: `:solve <command>` builds the Cnf on the fly
+                // so `:run` beforehand is optional. An explicit Cnf name
+                // still takes precedence when both exist.
+                let idx = match self.module.as_ref().and(self.resolve_index(Some(&cnf_name)).ok()) {
+                    Some(i) => i,
+                    None => {
+                        println!("no cnf named `{cnf_name}` (:cnfs to list)");
+                        return;
+                    }
+                };
+                let module = self.module.as_ref().expect("checked");
+                if let Some(CommandKind::Maximize { .. } | CommandKind::Minimize { .. }) =
+                    &module.commands.get(idx).map(|c| &c.kind)
+                {
+                    println!(
+                        "command `{cnf_name}` is maximize/minimize (use :optimize {cnf_name} instead of :solve)"
+                    );
+                    return;
                 }
-                return;
+                if command_needs_opt(module, idx) {
+                    println!(
+                        "command `{cnf_name}` carries an objective/soft constraints (use :optimize {cnf_name} instead of :solve)"
+                    );
+                    return;
+                }
+                let kind = match &module.commands.get(idx).map(|c| &c.kind) {
+                    Some(CommandKind::Check(_)) => CnfKind::Check,
+                    _ => CnfKind::Run,
+                };
+                let built = match kind {
+                    CnfKind::Run => run(module, idx),
+                    CnfKind::Check => check(module, idx),
+                };
+                match built {
+                    Ok(cnf) => {
+                        for w in &cnf.warnings {
+                            println!("{w}");
+                        }
+                        let auto = self.store_cnf(cnf, None);
+                        println!("auto-built cnf `{auto}` from command `{cnf_name}`");
+                        cnf_name = auto;
+                        self.cnfs.get(&cnf_name).cloned().expect("just stored")
+                    }
+                    Err(e) => {
+                        println!("build error: {e}");
+                        return;
+                    }
+                }
             }
         };
+        if cnf.is_check() {
+            self.do_solve_check(&cnf_name, &cnf, as_name);
+        } else {
+            self.do_solve_run(&cnf_name, &cnf, as_name);
+        }
+    }
+
+    /// Transient wrapping rebuild of a stored Cnf (overflow prohibition
+    /// OFF). Used for `run` fallback and `check` first phase. `None`
+    /// when the module is gone (caller falls back to the stored Cnf).
+    fn rebuild_wrapping(&self, cnf: &Cnf) -> Option<Cnf> {
+        let module = self.module.as_ref()?;
+        if cnf.command_index >= module.commands.len() {
+            return None;
+        }
+        build_cnf_with(module, cnf.command_index, cnf.kind, false).ok()
+    }
+
+    /// `run`: overflow-free model first (stored gated Cnf); only when
+    /// that is UNSAT, fall back to a wrapping model (transient rebuild).
+    /// An explicit `no Overflow` marker disables the fallback (it would
+    /// violate the marker); `some Overflow` Cnfs already solve wrapping
+    /// via a CEGAR loop, so they never reach the fallback either.
+    fn do_solve_run(&mut self, cnf_name: &str, cnf: &Cnf, as_name: Option<&str>) {
+        // `some Overflow` models use overflow by construction: note them
+        // as such instead of "overflow-free".
+        let some_mode = cnf.overflow == Some(OverflowMode::Some);
         if cnf.is_temporal {
-            match solve_temporal(&cnf) {
+            match solve_temporal(cnf) {
+                Ok(Some(trace)) => {
+                    self.print_temporal_solution(&Some(trace.clone()), false);
+                    if some_mode {
+                        println!("note: overflowing model (some Overflow)");
+                    } else {
+                        println!("note: overflow-free model");
+                    }
+                    let first = trace.states().first().cloned();
+                    let sol_name =
+                        self.store_sol(as_name, cnf_name, true, first, None, Some(trace));
+                    println!("saved solution `{sol_name}` <- `{cnf_name}` *default");
+                }
+                Ok(None) => {
+                    // Explicit markers fix the search mode: no fallback.
+                    if cnf.overflow.is_some() {
+                        self.print_temporal_solution(&None, false);
+                        return;
+                    }
+                    match self.rebuild_wrapping(cnf) {
+                    Some(wrap) => match solve_temporal(&wrap) {
+                        Ok(Some(trace)) => {
+                            self.print_temporal_solution(&Some(trace.clone()), false);
+                            println!(
+                                "note: wrapping model (no overflow-free model at bitwidth {}; try a larger 'for N Int')",
+                                cnf.bitwidth
+                            );
+                            let first = trace.states().first().cloned();
+                            let sol_name =
+                                self.store_sol(as_name, cnf_name, true, first, None, Some(trace));
+                            println!("saved solution `{sol_name}` <- `{cnf_name}` *default");
+                        }
+                        Ok(None) => self.print_temporal_solution(&None, false),
+                        Err(e) => println!("solve error: {e}"),
+                    },
+                    None => self.print_temporal_solution(&None, false),
+                    }
+                },
+                Err(e) => println!("solve error: {e}"),
+            }
+            return;
+        }
+        match solve(cnf) {
+            Ok(Some(inst)) => {
+                self.print_solution(&Some(inst.clone()), false);
+                if some_mode {
+                    println!("note: overflowing model (some Overflow)");
+                } else {
+                    println!("note: overflow-free model");
+                }
+                let sol_name = self.store_sol(as_name, cnf_name, true, Some(inst), None, None);
+                println!("saved solution `{sol_name}` <- `{cnf_name}` *default");
+            }
+            Ok(None) => {
+                // Explicit markers fix the search mode: no fallback.
+                if cnf.overflow.is_some() {
+                    self.print_solution(&None, false);
+                    return;
+                }
+                match self.rebuild_wrapping(cnf) {
+                Some(wrap) => match solve(&wrap) {
+                    Ok(Some(inst)) => {
+                        self.print_solution(&Some(inst.clone()), false);
+                        println!(
+                            "note: wrapping model (no overflow-free model at bitwidth {}; try a larger 'for N Int')",
+                            cnf.bitwidth
+                        );
+                        let sol_name =
+                            self.store_sol(as_name, cnf_name, true, Some(inst), None, None);
+                        println!("saved solution `{sol_name}` <- `{cnf_name}` *default");
+                    }
+                    Ok(None) => self.print_solution(&None, false),
+                    Err(e) => println!("solve error: {e}"),
+                },
+                None => self.print_solution(&None, false),
+                }
+            },
+            Err(e) => println!("solve error: {e}"),
+        }
+    }
+
+    /// `check`: wrapping model first (surprising counterexamples surface);
+    /// UNSAT here means the assertion holds, no second phase needed
+    /// (gates only remove models). Counterexamples using overflow get a note.
+    fn do_solve_check(&mut self, cnf_name: &str, cnf: &Cnf, as_name: Option<&str>) {
+        // Prefer the wrapping search; fall back to the stored (gated) Cnf
+        // only when the module is gone and no rebuild is possible.
+        let owned;
+        let target = match self.rebuild_wrapping(cnf) {
+            Some(w) => {
+                owned = w;
+                &owned
+            }
+            None => cnf,
+        };
+        if target.is_temporal {
+            match solve_temporal(target) {
                 Ok(trace) => {
                     let sat = trace.is_some();
-                    self.print_temporal_solution(&trace, cnf.is_check());
+                    self.print_temporal_solution(&trace, true);
+                    if let Some(t) = trace.as_ref() {
+                        self.print_overflow_note_temporal(target, t);
+                    }
                     let first = trace.as_ref().and_then(|t| t.states().first().cloned());
                     let sol_name =
-                        self.store_sol(as_name, &cnf_name, sat, first, None, trace);
+                        self.store_sol(as_name, cnf_name, sat, first, None, trace);
                     println!("saved solution `{sol_name}` <- `{cnf_name}` *default");
                 }
                 Err(e) => println!("solve error: {e}"),
             }
             return;
         }
-        match solve(&cnf) {
+        match solve(target) {
             Ok(inst) => {
                 let sat = inst.is_some();
-                self.print_solution(&inst, cnf.is_check());
-                let sol_name = self.store_sol(as_name, &cnf_name, sat, inst, None, None);
+                self.print_solution(&inst, true);
+                if let Some(i) = inst.as_ref() {
+                    self.print_overflow_note(target, i);
+                }
+                let sol_name = self.store_sol(as_name, cnf_name, sat, inst, None, None);
                 println!("saved solution `{sol_name}` <- `{cnf_name}` *default");
             }
             Err(e) => println!("solve error: {e}"),
+        }
+    }
+
+    /// Evaluator-based overflow note for a static model: set when any
+    /// integer operation overflows the problem bitwidth (div-by-zero
+    /// included, which also surfaces as [`EvalError::DivideByZero`]).
+    fn print_overflow_note(&self, cnf: &Cnf, inst: &Instance) {
+        let ev = Evaluator::new(inst).with_bitwidth(cnf.bitwidth);
+        let empty_env = Vec::new();
+        let _ = ev.formula_bool(&cnf.arena, cnf.formula, &empty_env);
+        if ev.overflowed() {
+            println!(
+                "note: counterexample uses integer overflow (re-check with a larger 'for N Int' to confirm)"
+            );
+        }
+    }
+
+    /// Temporal variant of [`Self::print_overflow_note`].
+    fn print_overflow_note_temporal(&self, cnf: &Cnf, trace: &TemporalInstance) {
+        let Some(orig) = cnf.orig_formula else {
+            return;
+        };
+        let ev = TemporalEval::new(trace).with_bitwidth(cnf.bitwidth);
+        let _ = ev.holds(&cnf.arena, orig);
+        if ev.overflowed() {
+            println!(
+                "note: counterexample uses integer overflow (re-check with a larger 'for N Int' to confirm)"
+            );
+        }
+    }
+
+    /// Enumerate the next model (`:next [sol] [as <sol>]`).
+    ///
+    /// Opens (or reuses) a persistent incremental session on the target
+    /// solution's origin Cnf, permanently blocks every known SAT solution
+    /// from that Cnf, and solves again. A fresh model is saved under
+    /// `as <sol>` (or an auto name) and becomes the default; exhaustion
+    /// prints UNSAT without storing anything.
+    fn do_next(&mut self, sol_arg: Option<&str>, as_name: Option<&str>) {
+        if let Some(n) = as_name {
+            if !is_valid_name(n) {
+                println!("bad name `{n}` (use [A-Za-z0-9_.#-]+)");
+                return;
+            }
+        }
+        let sol_name = match sol_arg {
+            Some(n) => n.to_string(),
+            None => match self.default_sol_name() {
+                Some(n) => n,
+                None => {
+                    println!("no solution saved yet (use :solve first)");
+                    return;
+                }
+            },
+        };
+        let stored = match self.sols.get(&sol_name) {
+            Some(s) => s,
+            None => {
+                println!("no solution named `{sol_name}` (:sols to list)");
+                return;
+            }
+        };
+        if !stored.sat || stored.instance.is_none() {
+            println!("solution `{sol_name}` is UNSAT (nothing to enumerate past)");
+            return;
+        }
+        if stored.from_cnf.is_empty() {
+            println!("solution `{sol_name}` is from :eval (no Cnf context for :next)");
+            return;
+        }
+        let cnf_name = stored.from_cnf.clone();
+        let cnf = match self.cnfs.get(&cnf_name) {
+            Some(c) => c.clone(),
+            None => {
+                println!("command for `{sol_name}` is gone (rebuild with :run|:check)");
+                return;
+            }
+        };
+        if !self.enum_sessions.contains_key(&cnf_name) {
+            match IncrementalSession::open(&cnf) {
+                Ok(session) => {
+                    self.enum_sessions.insert(
+                        cnf_name.clone(),
+                        EnumSession {
+                            session,
+                            blocked: HashSet::new(),
+                        },
+                    );
+                }
+                Err(e) => {
+                    println!("solve error: {e}");
+                    return;
+                }
+            }
+        }
+        // Block every known SAT solution from this Cnf that is not blocked
+        // yet (covers branched `:solve`s alongside the linear `:next` chain).
+        let already = self
+            .enum_sessions
+            .get(&cnf_name)
+            .map(|e| e.blocked.clone())
+            .unwrap_or_default();
+        let mut pending: Vec<(String, Instance)> = Vec::new();
+        for name in &self.sol_order {
+            if already.contains(name) {
+                continue;
+            }
+            if let Some(st) = self.sols.get(name) {
+                if st.from_cnf == cnf_name && st.sat {
+                    if let Some(inst) = st.instance.clone() {
+                        pending.push((name.clone(), inst));
+                    }
+                }
+            }
+        }
+        if pending.is_empty() {
+            println!("note: no stored solutions left to block (use :solve first)");
+            return;
+        }
+        let es = match self.enum_sessions.get_mut(&cnf_name) {
+            Some(e) => e,
+            None => {
+                println!("solve error: enumeration session lost");
+                return;
+            }
+        };
+        let mut excludable = 0;
+        for (name, inst) in pending.iter() {
+            match es.session.block_instance(inst) {
+                Ok(true) => {
+                    excludable += 1;
+                    es.blocked.insert(name.clone());
+                }
+                Ok(false) => {
+                    println!(
+                        "note: solution `{name}` covers no primary variables; cannot exclude it"
+                    );
+                    es.blocked.insert(name.clone());
+                }
+                Err(e) => {
+                    println!("solve error: {e}");
+                    return;
+                }
+            }
+        }
+        if excludable == 0 {
+            println!("cannot enumerate: no excludable model (formula has no primary variables)");
+            return;
+        }
+        let next = match es.session.solve(&[]) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("solve error: {e}");
+                return;
+            }
+        };
+        if cnf.is_temporal {
+            match next {
+                Some(flat) => {
+                    let exp = match cnf.temporal.as_ref() {
+                        Some(e) => e,
+                        None => {
+                            println!("solve error: temporal Cnf lacks expansion metadata");
+                            return;
+                        }
+                    };
+                    match alloy_kodkod_rs::temporal::extract_temporal_instance(&flat, exp) {
+                        Ok(ti) => {
+                            let first = ti.states().first().cloned();
+                            self.print_temporal_solution(&Some(ti.clone()), cnf.is_check());
+                            let name =
+                                self.store_sol(as_name, &cnf_name, true, first, None, Some(ti));
+                            println!("saved solution `{name}` <- `{cnf_name}` *default");
+                        }
+                        Err(e) => println!("solve error: {e}"),
+                    }
+                }
+                None => self.print_temporal_solution(&None, cnf.is_check()),
+            }
+            return;
+        }
+        match next {
+            Some(inst) => {
+                self.print_solution(&Some(inst.clone()), cnf.is_check());
+                let name = self.store_sol(as_name, &cnf_name, true, Some(inst), None, None);
+                println!("saved solution `{name}` <- `{cnf_name}` *default");
+            }
+            None => self.print_solution(&None, cnf.is_check()),
         }
     }
 
@@ -767,9 +1146,51 @@ impl Session {
             println!("temporal cnf `{cnf_name}` is not supported by :max/:min (objectives over traces are undefined; solve the trace with :solve instead)");
             return;
         }
+        // `some Overflow` Cnfs are built wrapping: a single wrapping
+        // search (the OLL loop has no CEGAR). `no Overflow` pins gated.
+        if cnf.overflow == Some(OverflowMode::Some) {
+            match optimize_with(module, &cnf, &target, false) {
+                Ok(sol) => {
+                    let mut note = String::from("note: wrapping optimum (some Overflow)");
+                    if sol.satisfiable && optimum_uses_overflow(&cnf, &sol) {
+                        note.push_str("; optimum uses integer overflow");
+                    }
+                    self.print_store_opt_solution(&sol, &cnf_name, as_name, Some(&note));
+                }
+                Err(e) => println!("optimize error: {e}"),
+            }
+            return;
+        }
         match optimize(module, &cnf, &target) {
             Ok(sol) => {
-                self.print_store_opt_solution(sol, &cnf_name, as_name);
+                if sol.satisfiable {
+                    self.print_store_opt_solution(&sol, &cnf_name, as_name, None);
+                    if cnf.overflow.is_none() {
+                        println!("note: overflow-free optimum");
+                    }
+                    return;
+                }
+                // Gated optimum UNSAT: fall back to wrapping unless an
+                // explicit marker pins the mode.
+                if cnf.overflow.is_some() {
+                    self.print_store_opt_solution(&sol, &cnf_name, as_name, None);
+                    return;
+                }
+                match self.rebuild_wrapping(&cnf) {
+                    Some(wrap) => match optimize_with(module, &wrap, &target, false) {
+                        Ok(sol2) => {
+                            let note = Self::wrapping_optimum_note(cnf.bitwidth, &sol2);
+                            self.print_store_opt_solution(
+                                &sol2,
+                                &cnf_name,
+                                as_name,
+                                note.as_deref(),
+                            );
+                        }
+                        Err(e) => println!("optimize error: {e}"),
+                    },
+                    None => self.print_store_opt_solution(&sol, &cnf_name, as_name, None),
+                }
             }
             Err(e) => println!("optimize error: {e}"),
         }
@@ -813,11 +1234,52 @@ impl Session {
             },
             None => format!("opt{idx}"),
         };
-        match run_opt_command(module, idx) {
+        // `some`/`no Overflow` marker mode of the command body, if any:
+        // `No` pins the gated search, `Some` the wrapping one, absent
+        // means two-phase (gated optimum first, wrapping fallback).
+        // The second tuple element is the problem bitwidth for notes.
+        let (mode, bitwidth) = self.command_overflow(idx);
+        match run_opt_command_with(module, idx, mode != Some(OverflowMode::Some)) {
             Ok(sol) => {
-                self.print_store_opt_solution(sol, &from_label, as_name);
+                if sol.satisfiable {
+                    let note: Option<String> = match mode {
+                        Some(OverflowMode::Some) => {
+                            Some("note: wrapping optimum (some Overflow)".to_string())
+                        }
+                        _ => Some("note: overflow-free optimum".to_string()),
+                    };
+                    self.print_store_opt_solution(&sol, &from_label, as_name, note.as_deref());
+                    return;
+                }
+                // Gated optimum UNSAT: fall back to wrapping unless an
+                // explicit marker pins the mode.
+                if mode.is_some() {
+                    self.print_store_opt_solution(&sol, &from_label, as_name, None);
+                    return;
+                }
+                match run_opt_command_with(module, idx, false) {
+                    Ok(sol2) => {
+                        let note = Self::wrapping_optimum_note(bitwidth, &sol2);
+                        self.print_store_opt_solution(&sol2, &from_label, as_name, note.as_deref());
+                    }
+                    Err(e) => println!("optimize error: {e}"),
+                }
             }
             Err(e) => println!("optimize error: {e}"),
+        }
+    }
+
+    /// `some`/`no Overflow` marker mode of a command body (`None` when
+    /// absent) plus the problem bitwidth (0 when the body does not
+    /// lower). Re-lowers the command; used only for mode/note decisions,
+    /// the actual searches lower again themselves.
+    fn command_overflow(&self, idx: usize) -> (Option<OverflowMode>, u32) {
+        let Some(module) = self.module.as_ref() else {
+            return (None, 0);
+        };
+        match Lowerer::new(module).prepare_command(idx) {
+            Ok(p) => (p.overflow, p.bitwidth),
+            Err(_) => (None, 0),
         }
     }
 
@@ -828,9 +1290,10 @@ impl Session {
     /// stored (with state 0 kept as the queryable instance).
     fn print_store_opt_solution(
         &mut self,
-        sol: OptSolution,
+        sol: &OptSolution,
         from_label: &str,
         as_name: Option<&str>,
+        note: Option<&str>,
     ) {
         if sol.satisfiable {
             match sol.cost {
@@ -847,17 +1310,36 @@ impl Session {
             } else if let Some(ref inst) = sol.instance {
                 println!("{}", fmt::instance_alloy_hinted(inst, &self.display_hints()));
             }
+            if let Some(n) = note {
+                println!("{n}");
+            }
         } else {
             println!("UNSAT -- no model (empty)");
         }
         let sat = sol.satisfiable;
-        let (instance, temporal) = match sol.temporal {
+        let (instance, temporal) = match sol.temporal.clone() {
             Some(ti) => (ti.states().first().cloned(), Some(ti)),
-            None => (sol.instance, None),
+            None => (sol.instance.clone(), None),
         };
         let sol_name = self.store_sol(as_name, from_label, sat, instance, sol.cost, temporal);
         println!("saved solution `{sol_name}` <- `{from_label}` *default");
     }
+
+/// Wrapping-optimum note for the two-phase fallback (Phase 2): the
+/// cost itself may be a wrapping artifact. `None` when unsatisfiable.
+fn wrapping_optimum_note(bitwidth: u32, sol: &OptSolution) -> Option<String> {
+    if !sol.satisfiable {
+        return None;
+    }
+    Some(match sol.cost {
+        Some(c) => format!(
+            "note: wrapping optimum cost={c} (no overflow-free optimum at bitwidth {bitwidth}; cost may reflect wrapping; try a larger 'for N Int')"
+        ),
+        None => format!(
+            "note: wrapping optimum (no overflow-free optimum at bitwidth {bitwidth}; try a larger 'for N Int')"
+        ),
+    })
+}
 
     fn do_eval_text(&mut self, expr: &str, save_as: Option<&str>) {
         if let Some(n) = save_as {
@@ -1563,10 +2045,17 @@ fn print_help() {
     println!("named stores (Cnf and solution namespaces are separate):");
     println!("  :run <i|name> [as <cnf>]    build Cnf, save it (auto: command name, else run0..)");
     println!("  :check <i|name> [as <cnf>]  build negated Cnf, save it");
-    println!("  :solve [<cnf>] [as <sol>]   solve named Cnf (no arg = *default), save solution");
+    println!("  :solve [<cnf>|<i|name>] [as <sol>]   solve named Cnf (no arg = *default), save solution");
+    println!("                              a command index/name auto-builds its Cnf first");
     println!("                              temporal Cnfs print the full trace (steps + loop)");
-    println!("  :optimize [<i|name>] [as <sol>]  run a stored maximize/minimize command, save optimum");
+    println!("  :next [<sol>] [as <sol>]    next model: block known solutions, re-solve");
+    println!("                              (no arg = *default solution's Cnf; exhaustion = UNSAT)");
+    println!("  :optimize [<i|name>] [as <sol>]  run a stored objective command, save optimum");
+    println!("                              (a maximize/minimize command, or a run/check whose body has");
+    println!("                              a `maximize`/`minimize` marker or soft constraints)");
     println!("  minimize ... / maximize ... (bare line: reference runs optimizer, else a model fragment)");
+    println!("  `pred p {{ goal (maximize X) }}` + `run {{p}}`: in-body markers register the objective;");
+    println!("    initially/goal/restore pick the trace state X is evaluated at");
     println!("  :query <expr> [in <sol>]    evaluate against named solution (no in = *default)");
     println!("                              sets print as tuples, int exprs (`#A`) as numbers");
     println!("    NOTE: `in` collides with Alloy `in`; the trailing `in <sol>` is used only");
@@ -1675,6 +2164,28 @@ fn is_valid_name(n: &str) -> bool {
     !n.is_empty()
         && n.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '#' | '-'))
+}
+
+/// Whether an optimization result uses integer overflow (E-bit
+/// evaluator flag on the optimum instance or trace).
+fn optimum_uses_overflow(cnf: &Cnf, sol: &OptSolution) -> bool {
+    if let Some(ti) = sol.temporal.as_ref() {
+        let Some(orig) = cnf.orig_formula else {
+            return false;
+        };
+        let ev = TemporalEval::new(ti).with_bitwidth(cnf.bitwidth);
+        let _ = ev.holds(&cnf.arena, orig);
+        return ev.overflowed();
+    }
+    match sol.instance.as_ref() {
+        Some(inst) => {
+            let ev = Evaluator::new(inst).with_bitwidth(cnf.bitwidth);
+            let empty_env = Vec::new();
+            let _ = ev.formula_bool(&cnf.arena, cnf.formula, &empty_env);
+            ev.overflowed()
+        }
+        None => false,
+    }
 }
 
 /// Split trailing `as <name>`: returns (head_tokens, as_name).
@@ -1934,6 +2445,8 @@ const BARE_COMMANDS: &[&str] = &[
     "pavoid",
     "solve",
     "s",
+    "next",
+    "n",
     "validate",
     "v",
     "show",
@@ -2084,6 +2597,14 @@ fn main() {
                         println!("usage: :solve [<cnf>] [as <sol>]");
                     } else {
                         sess.do_solve(head.first().copied(), as_name);
+                    }
+                }
+                "next" | "n" => {
+                    let (head, as_name) = split_as(&rest);
+                    if as_name == Some("__bad_as__") || head.len() > 1 {
+                        println!("usage: :next [<sol>] [as <sol>]");
+                    } else {
+                        sess.do_next(head.first().copied(), as_name);
                     }
                 }
                 "optimize" => {
@@ -2247,6 +2768,14 @@ fn main() {
                         println!("usage: solve [<cnf>] [as <sol>]");
                     } else {
                         sess.do_solve(head.first().copied(), as_name);
+                    }
+                }
+                "next" | "n" => {
+                    let (head, as_name) = split_as(&rest);
+                    if as_name == Some("__bad_as__") || head.len() > 1 {
+                        println!("usage: next [<sol>] [as <sol>]");
+                    } else {
+                        sess.do_next(head.first().copied(), as_name);
                     }
                 }
                 "validate" | "v" => {

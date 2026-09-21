@@ -219,6 +219,7 @@ fn query_formula(
     let fid = lower.lower_formula_in_scope(scope, &mut arena, &f)?;
     let empty_env = Vec::new();
     let v = alloy_kodkod_rs::eval::Evaluator::new(instance)
+        .with_bitwidth(cnf.bitwidth)
         .formula_bool(&arena, fid, &empty_env)
         .map_err(|e| FrontError::Resolve(e.to_string()))?;
     Ok(QueryValue::Bool(v))
@@ -242,57 +243,23 @@ fn query_int_parsed(
     // (mirrors the set-position literal path).
     {
         let mut needs = false;
-        crate::ast::scan_intexpr_int_set(&ie, &mut needs);
+        crate::ast::scan_intexpr_int_set(ie, &mut needs);
         if needs && cnf.bounds.int_bounds().count() == 0 {
             return Err(FrontError::Resolve(
                 "integer set is not in scope (this model materializes no Int atoms; mention Int in the model or add `for N Int` to the scope)".to_string(),
             ));
         }
     }
-    // Out-of-range literals wrap (two's complement truncation), matching
-    // both the solve path and Java's evaluator.
-    let ie = wrap_int_literals(&ie, cnf.bitwidth);
+    // Out-of-range literals wrap at evaluation (`Evaluator` truncates
+    // constants to the problem bitwidth, matching the solve path and
+    // Java's evaluator), so no literal rewriting is needed here.
     let mut arena = cnf.arena.clone();
     let mut lower = Lowerer::new(module);
-    let iid = lower.lower_int_in_scope(scope, &mut arena, &ie)?;
+    let iid = lower.lower_int_in_scope(scope, &mut arena, ie)?;
     let empty_env = Vec::new();
     let v = alloy_kodkod_rs::eval::Evaluator::new(instance)
+        .with_bitwidth(cnf.bitwidth)
         .int_value(&arena, iid, &empty_env)
         .map_err(|e| FrontError::Resolve(e.to_string()))?;
     Ok(QueryValue::Int(v))
-}
-
-/// Truncate `v` to `bitwidth`-bit two's complement, mirroring
-/// `IntCircuit::constant` (low bits kept, sign-extended).
-fn wrap_lit(v: i64, bitwidth: u32) -> i64 {
-    if bitwidth >= 64 {
-        return v;
-    }
-    if bitwidth == 0 {
-        return 0;
-    }
-    let shift = 64 - bitwidth;
-    (v << shift) >> shift
-}
-
-/// Rewrite every integer literal in `ie` to its bitwidth-wrapped value so
-/// query evaluation observes the same wrapping as the solve path (and as
-/// Java's evaluator).
-fn wrap_int_literals(ie: &IntExpr, bitwidth: u32) -> IntExpr {
-    match ie {
-        IntExpr::Lit(v, p) => IntExpr::Lit(wrap_lit(*v, bitwidth), *p),
-        IntExpr::Bin(op, a, b) => IntExpr::Bin(
-            *op,
-            Box::new(wrap_int_literals(a, bitwidth)),
-            Box::new(wrap_int_literals(b, bitwidth)),
-        ),
-        IntExpr::Sum(decls, body, p) => IntExpr::Sum(
-            decls.clone(),
-            Box::new(wrap_int_literals(body, bitwidth)),
-            *p,
-        ),
-        IntExpr::Card(..) | IntExpr::Val(..) | IntExpr::SumOf(..) | IntExpr::BitsVal(..) => {
-            ie.clone()
-        }
-    }
 }

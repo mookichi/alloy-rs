@@ -35,8 +35,8 @@ fn arrow_tighter_than_union() {
     assert_eq!(op, BinOp::Union);
     assert_eq!(as_bin(l).0, BinOp::Product);
     assert_eq!(as_bin(r).0, BinOp::Product);
-    assert!(is_name(&as_bin(l).1, "a"));
-    assert!(is_name(&as_bin(r).1, "c"));
+    assert!(is_name(as_bin(l).1, "a"));
+    assert!(is_name(as_bin(r).1, "c"));
 }
 
 // `a->b->c` == `(a->b)->c`: left associativity.

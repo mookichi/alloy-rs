@@ -54,7 +54,7 @@ pub fn tuple_alloy(universe: &Universe, arity: u32, flat: i64) -> String {
 /// Commas separate literal elements, so (unlike the old ` + ` style)
 /// n-ary `->` tuples need no parentheses to survive re-parsing.
 pub fn set_alloy(universe: &Universe, arity: u32, ts: &TupleSet) -> String {
-    if ts.len() == 0 {
+    if ts.is_empty() {
         return "{}".to_string();
     }
     let inner = ts
@@ -369,7 +369,6 @@ mod tests {
         std::sync::Arc<alloy_kodkod_rs::relation::RelationPool>,
         Instance,
     ) {
-        let u = u8();
         let mut full = vec!["X$0".to_string()];
         for i in 0..8 {
             full.push(i.to_string());

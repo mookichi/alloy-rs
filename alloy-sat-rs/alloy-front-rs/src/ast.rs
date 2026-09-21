@@ -107,6 +107,15 @@ pub enum QuantKind {
     One,
 }
 
+/// Search-mode marker for `some Overflow { F }` / `no Overflow { F }`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OverflowMode {
+    /// Seek a model of the body that uses integer overflow.
+    Some,
+    /// Seek an overflow-free model of the body.
+    No,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CmpKind {
     Eq,
@@ -259,10 +268,23 @@ pub enum Formula {
     /// commands in the same file still run) but rejected at lowering:
     /// free set-valued witnesses are not supported yet.
     MaxSomeDecl(Vec<Decl>, Box<Formula>),
+    /// In-formula optimization marker `maximize <intexpr>`. Hard
+    /// meaning is `true`; the target expression is registered as an
+    /// optimization objective of the enclosing command. The enclosing
+    /// state-pinning temporal operator (`initially` / `goal` /
+    /// `restore`) decides the trace state it is evaluated at.
+    Maximize(IntExpr),
+    /// In-formula optimization marker `minimize <intexpr>`.
+    Minimize(IntExpr),
     /// `pin P`: the partial instance `P` embeds (existentially) here.
     /// `avoid P` parses as `Not(Pin)`. Lowered by desugaring to an
     /// existential over gensym label variables; never temporal.
     Pin(String, usize),
+    /// `some Overflow { F }` / `no Overflow { F }`: search-mode marker.
+    /// Top level of `run`/`check` bodies only (nested occurrences are
+    /// rejected at lowering). `Some` seeks a model of `F` that uses
+    /// integer overflow; `No` seeks an overflow-free model of `F`.
+    OverflowCond(OverflowMode, Box<Formula>),
     // temporal operators (LTL)
     Always(Box<Formula>),
     Eventually(Box<Formula>),
@@ -311,8 +333,58 @@ impl Formula {
                 body.has_temporal() || ds.iter().any(|d| d.expr.has_temporal())
             }
             Formula::MaxSome(e) | Formula::MinSome(e) => e.has_temporal(),
+            Formula::Maximize(ie) | Formula::Minimize(ie) => ie.has_temporal(),
             Formula::Pin(..) => false,
             Formula::Const(_) => false,
+            Formula::OverflowCond(_, body) => body.has_temporal(),
+        }
+    }
+
+    /// Returns true if this formula or any subformula carries an
+    /// optimization marker (`maximize` / `minimize` in formula
+    /// position). Such commands must run through the optimizer, never
+    /// the plain SAT path (a marker is hard `true`, so dropping it would
+    /// silently ignore the objective).
+    pub fn has_opt_marker(&self) -> bool {
+        match self {
+            Formula::Maximize(_) | Formula::Minimize(_) => true,
+            Formula::Not(f) => f.has_opt_marker(),
+            Formula::And(a, b)
+            | Formula::Or(a, b)
+            | Formula::Implies(a, b)
+            | Formula::Iff(a, b)
+            | Formula::Until(a, b)
+            | Formula::Releases(a, b)
+            | Formula::Since(a, b)
+            | Formula::Triggered(a, b) => a.has_opt_marker() || b.has_opt_marker(),
+            Formula::Quant(_, decls, body) => {
+                body.has_opt_marker() || decls.iter().any(|d| d.expr.has_opt_marker())
+            }
+            Formula::LetBind(binds, body) => {
+                body.has_opt_marker() || binds.iter().any(|(_, e)| e.has_opt_marker())
+            }
+            Formula::Cmp(_, a, b, _) => a.has_opt_marker() || b.has_opt_marker(),
+            Formula::BadIn(a, _) => a.has_opt_marker(),
+            Formula::IntCmp(_, a, b, _) => a.has_opt_marker() || b.has_opt_marker(),
+            Formula::Multi(_, e, _) => e.has_opt_marker(),
+            Formula::Call(_, args, _) => args.iter().any(|a| a.has_opt_marker()),
+            Formula::MaxSomeDecl(ds, body) => {
+                body.has_opt_marker() || ds.iter().any(|d| d.expr.has_opt_marker())
+            }
+            Formula::MaxSome(e) | Formula::MinSome(e) => e.has_opt_marker(),
+            Formula::Always(f)
+            | Formula::Eventually(f)
+            | Formula::Before(f)
+            | Formula::Historically(f)
+            | Formula::Once(f)
+            | Formula::Keeping(f)
+            | Formula::Goal(f)
+            | Formula::Restore(f)
+            | Formula::Initially(f)
+            | Formula::Regularly(f)
+            | Formula::Consistently(f) => f.has_opt_marker(),
+            Formula::Pin(..) | Formula::Const(_) => false,
+            Formula::OverflowCond(_, body) => body.has_opt_marker(),
         }
     }
 
@@ -356,7 +428,9 @@ impl Formula {
             | Formula::Releases(a, b)
             | Formula::Since(a, b)
             | Formula::Triggered(a, b) => a.has_soft() || b.has_soft(),
+            Formula::Maximize(_) | Formula::Minimize(_) => false,
             Formula::Pin(..) | Formula::Const(_) => false,
+            Formula::OverflowCond(_, body) => body.has_soft(),
         }
     }
 }
@@ -418,6 +492,39 @@ impl Expr {
             | Expr::Bits(..) => false,
         }
     }
+
+    /// Expression-level optimization-marker scan (markers live in
+    /// formulas, but comprehensions and `if` conditions can nest them).
+    pub fn has_opt_marker(&self) -> bool {
+        match self {
+            Expr::Comprehension(decls, body) => {
+                body.has_opt_marker() || decls.iter().any(|d| d.expr.has_opt_marker())
+            }
+            Expr::If(c, t, e) => c.has_opt_marker() || t.has_opt_marker() || e.has_opt_marker(),
+            Expr::Bin(_, a, b) => a.has_opt_marker() || b.has_opt_marker(),
+            Expr::Transpose(x)
+            | Expr::TClosure(x)
+            | Expr::RClosure(x)
+            | Expr::ArrowMult(_, x)
+            | Expr::LeadMult(_, x)
+            | Expr::AtExpr(x)
+            | Expr::Prime(x) => x.has_opt_marker(),
+            Expr::Bracket(b, args) => {
+                b.has_opt_marker() || args.iter().any(|a| a.has_opt_marker())
+            }
+            Expr::Call(_, args, _) => args.iter().any(|a| a.has_opt_marker()),
+            Expr::LetBind(binds, body) => {
+                body.has_opt_marker() || binds.iter().any(|(_, e)| e.has_opt_marker())
+            }
+            Expr::Name(..)
+            | Expr::Univ
+            | Expr::None_
+            | Expr::Iden
+            | Expr::IntAtom
+            | Expr::StepAtom
+            | Expr::Bits(..) => false,
+        }
+    }
 }
 
 impl IntExpr {
@@ -443,6 +550,22 @@ impl IntExpr {
             }
             IntExpr::Bin(_, a, b) => a.has_soft() || b.has_soft(),
             IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => e.has_soft(),
+            IntExpr::Lit(..) => false,
+        }
+    }
+
+    /// Optimization-marker scan (markers are formula-level; `IntExpr`
+    /// can only nest them through comprehension bodies in decl domains).
+    pub fn has_opt_marker(&self) -> bool {
+        match self {
+            IntExpr::Card(e, _) => e.has_opt_marker(),
+            IntExpr::Sum(decls, body, _) => {
+                body.has_opt_marker() || decls.iter().any(|d| d.expr.has_opt_marker())
+            }
+            IntExpr::Bin(_, a, b) => a.has_opt_marker() || b.has_opt_marker(),
+            IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => {
+                e.has_opt_marker()
+            }
             IntExpr::Lit(..) => false,
         }
     }
@@ -832,12 +955,14 @@ pub(crate) fn scan_formula_int_set(f: &Formula, needs: &mut bool) {
             }
         }
         Formula::MaxSome(e) | Formula::MinSome(e) => scan_expr_int_set(e, needs),
+        Formula::OverflowCond(_, body) => scan_formula_int_set(body, needs),
         Formula::MaxSomeDecl(ds, body) => {
             for d in ds {
                 scan_expr_int_set(&d.expr, needs);
             }
             scan_formula_int_set(body, needs);
         }
+        Formula::Maximize(ie) | Formula::Minimize(ie) => scan_intexpr_int_set(ie, needs),
     }
 }
 

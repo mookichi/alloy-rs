@@ -20,10 +20,40 @@ pub struct LoweredProblem {
     pub bitwidth: u32,
     /// Some for `maximize`/`minimize` commands.
     pub objective: Option<LoweredOpt>,
+    /// In-body `maximize`/`minimize` markers (`Formula::Maximize` /
+    /// `Formula::Minimize`) in lowering order. Empty for the plain
+    /// `maximize:` / `minimize:` command forms, which set `objective`.
+    pub markers: Vec<OptMarker>,
     /// True when the lowered formula contains AlloyMax soft nodes
     /// (`maxsome` / `minsome` / `soft fact`). Such problems must run
     /// through the optimizer, never the plain SAT path.
     pub has_softs: bool,
+    /// `some`/`no Overflow` marker at the top level of the command body
+    /// (`None` when absent; the marker is consumed, `formula` is the
+    /// inner body). Nested markers are rejected during lowering.
+    pub overflow: Option<OverflowMode>,
+}
+
+/// Trace state an in-body optimization marker is evaluated at, taken
+/// from the innermost enclosing state-pinning temporal operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimePoint {
+    /// `initially` — the first state.
+    First,
+    /// `goal` — the last state.
+    Last,
+    /// `restore` — the loop state.
+    Loop,
+}
+
+/// One in-body `maximize`/`minimize` marker: lowered integer target,
+/// sense, and enclosing trace state (`None` outside temporal contexts —
+/// rejected for temporal commands, which need a state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptMarker {
+    pub target: IntId,
+    pub sense: OptSense,
+    pub time: Option<TimePoint>,
 }
 
 /// Lowered optimization target of a `maximize`/`minimize` command.
@@ -114,7 +144,7 @@ impl<'m> Lowerer<'m> {
                 .filter_map(|sd| sd.fact.as_ref())
                 .any(|f| f.has_soft())
             || body_soft;
-        let (arena, bounds, bitwidth, (formula, objective)) =
+        let (arena, bounds, bitwidth, markers, (formula, objective, overflow)) =
             self.with_setup(&scope, |ctx, arena, _bounds, mut parts| {
                 // global facts
                 for (_, f) in &ctx.module.facts {
@@ -174,6 +204,9 @@ impl<'m> Lowerer<'m> {
                         (name.clone(), false)
                     }
                 };
+                // `some/no Overflow` marker at the top level of the body
+                // (`None` when absent).
+                let mut overflow: Option<OverflowMode> = None;
                 match body_name {
                     None => parts.push(arena.bool_formula(true)),
                     Some(name) => {
@@ -190,7 +223,24 @@ impl<'m> Lowerer<'m> {
                                 "parametrized '{name}' in command"
                             )));
                         }
-                        let bf = ctx.lower_formula(arena, &para.body, &mut Vec::new())?;
+                        // Top-level `some/no Overflow` marker: consume it
+                        // here (the inner body is lowered normally);
+                        // nested markers are rejected in `lower_formula`.
+                        // `some Overflow` seeks an overflowing model, which
+                        // `check` (counterexample search) does not support.
+                        let (body, mode) = match &para.body {
+                            Formula::OverflowCond(mode, inner) => {
+                                if negate && *mode == OverflowMode::Some {
+                                    return Err(FrontError::Resolve(
+                                        "`some Overflow` is only allowed in `run` bodies, not `check`".to_string(),
+                                    ));
+                                }
+                                (inner.as_ref(), Some(*mode))
+                            }
+                            body => (body, None),
+                        };
+                        overflow = mode;
+                        let bf = ctx.lower_formula(arena, body, &mut Vec::new())?;
                         // `check F` searches for a counterexample to F
                         if negate {
                             parts.push(arena.not(bf));
@@ -204,13 +254,11 @@ impl<'m> Lowerer<'m> {
                 // top-level `in`/`=` facts before translation. Applies to
                 // run/check/opt alike (and hence REPL Cnfs built from them).
                 let mut formula = formula;
-                match alloy_kodkod_rs::simplify::simplify_bounds(&arena, _bounds, formula)
+                if alloy_kodkod_rs::simplify::simplify_bounds(arena, _bounds, formula)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?
+                    == alloy_kodkod_rs::simplify::SimplifyOutcome::Unsat
                 {
-                    alloy_kodkod_rs::simplify::SimplifyOutcome::Unsat => {
-                        formula = arena.false_formula();
-                    }
-                    _ => {}
+                    formula = arena.false_formula();
                 }
                 // Optimization target (maximize/minimize only).
                 let objective = match (opt_sense, opt_spec) {
@@ -237,15 +285,37 @@ impl<'m> Lowerer<'m> {
                     (None, None) => None,
                     _ => unreachable!("sense and spec move together"),
                 };
-                Ok((formula, objective))
+                Ok((formula, objective, overflow))
             })?;
+        // `check` negates its body while a marker is hard `true`: the
+        // negation would be unsatisfiable, so reject loudly.
+        if matches!(kind, CommandKind::Check(_)) && !markers.is_empty() {
+            return Err(FrontError::Resolve(
+                "`check` negates its body, so a `maximize`/`minimize` marker in it would be \
+                 unsatisfiable; write the objective on a `run` command instead"
+                    .into(),
+            ));
+        }
+        // A command-level objective (`maximize:` / `minimize:`) and
+        // in-body markers are two ways to write the same thing; mixing
+        // them would silently drop one of the two targets.
+        if objective.is_some() && !markers.is_empty() {
+            return Err(FrontError::Resolve(
+                "command has both a `maximize`/`minimize` command objective and an \
+                 in-body `maximize`/`minimize` marker (keep one; markers are \
+                 written as `maximize <intexpr>` inside the body)"
+                    .into(),
+            ));
+        }
         Ok(LoweredProblem {
             arena,
             bounds,
             formula,
             bitwidth,
             objective,
+            markers,
             has_softs,
+            overflow,
         })
     }
 
@@ -374,6 +444,8 @@ impl<'m> Lowerer<'m> {
             // universe (Java's solve-after `frame.a2k` equivalent).
             allow_atoms: true,
             pin_seq: std::cell::Cell::new(0),
+            markers: std::cell::RefCell::new(Vec::new()),
+            marker_time: std::cell::Cell::new(None),
         };
         f(&ctx, arena)
     }
@@ -384,7 +456,7 @@ impl<'m> Lowerer<'m> {
         &mut self,
         scope: &Scope,
         f: impl FnOnce(&Ctx<'_>, &mut kk::AstArena, &mut Bounds, Vec<FormulaId>) -> LResult<R>,
-    ) -> LResult<(kk::AstArena, Bounds, u32, R)> {
+    ) -> LResult<(kk::AstArena, Bounds, u32, Vec<OptMarker>, R)> {
         let res = bounds::resolve(self.module, scope).map_err(FrontError::Resolve)?;
         let pool = Arc::new(RelationPool::new());
         let mut arena = kk::AstArena::with_pool(Arc::clone(&pool));
@@ -603,6 +675,8 @@ impl<'m> Lowerer<'m> {
             // are solver outputs, not language terms).
             allow_atoms: false,
             pin_seq: std::cell::Cell::new(0),
+            markers: std::cell::RefCell::new(Vec::new()),
+            marker_time: std::cell::Cell::new(None),
         };
 
         // Field-level formulas, now that `ctx` exists: per-field typing
@@ -611,7 +685,8 @@ impl<'m> Lowerer<'m> {
         let field_formulas = self.field_constraints(&ctx, &mut arena, &mut b)?;
 
         let out = f(&ctx, &mut arena, &mut b, field_formulas)?;
-        Ok((arena, b, res.bitwidth, out))
+        let markers = ctx.markers.take();
+        Ok((arena, b, res.bitwidth, markers, out))
     }
 
     /// Per-field formulas for every declared field: typing (`f` stays inside
@@ -841,6 +916,11 @@ struct Ctx<'a> {
     /// A counter (not source positions): one `pin` inside a twice-called
     /// predicate expands twice and must not collide with itself.
     pin_seq: std::cell::Cell<u32>,
+    /// Collected in-body `maximize`/`minimize` markers.
+    markers: std::cell::RefCell<Vec<OptMarker>>,
+    /// Innermost enclosing state-pinning temporal operator for markers
+    /// (`initially`/`goal`/`restore`); `None` outside temporal contexts.
+    marker_time: std::cell::Cell<Option<TimePoint>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -2611,6 +2691,35 @@ impl<'a> Ctx<'a> {
                 let (ee, _) = self.lower_expr(arena, e, env)?;
                 arena.minsome(ee)
             }
+            // `some/no Overflow` markers only live at the top level of a
+            // `run`/`check` body (consumed by `prepare_command`); anywhere
+            // else they are rejected here.
+            Formula::OverflowCond(..) => {
+                return Err(FrontError::Resolve(
+                    "`some/no Overflow` is only allowed at the top level of a `run`/`check` body (nested uses are not yet supported)".to_string(),
+                ));
+            }
+            // In-body `maximize`/`minimize` markers: the target becomes
+            // the command's objective (collected here with the enclosing
+            // trace state, if any); hard meaning is true.
+            Formula::Maximize(ie) => {
+                let target = self.lower_int(arena, ie, env)?;
+                self.markers.borrow_mut().push(OptMarker {
+                    target,
+                    sense: OptSense::Maximize,
+                    time: self.marker_time.get(),
+                });
+                arena.bool_formula(true)
+            }
+            Formula::Minimize(ie) => {
+                let target = self.lower_int(arena, ie, env)?;
+                self.markers.borrow_mut().push(OptMarker {
+                    target,
+                    sense: OptSense::Minimize,
+                    time: self.marker_time.get(),
+                });
+                arena.bool_formula(true)
+            }
             Formula::Cmp(kind, l, r, _) => {
                 let (el, al) = self.lower_expr(arena, l, env)?;
                 let (er, ar) = self.lower_expr(arena, r, env)?;
@@ -2813,15 +2922,23 @@ impl<'a> Ctx<'a> {
                 arena.temporal_unary(kk::TemporalFormulaOp::Keeping, f)
             }
             Formula::Goal(inner) => {
+                // Markers inside take the goal (last) state; restore the
+                // outer context afterwards (innermost operator wins).
+                let prev = self.marker_time.replace(Some(TimePoint::Last));
                 let f = self.lower_formula(arena, inner, env)?;
+                self.marker_time.set(prev);
                 arena.temporal_unary(kk::TemporalFormulaOp::Goal, f)
             }
             Formula::Restore(inner) => {
+                let prev = self.marker_time.replace(Some(TimePoint::Loop));
                 let f = self.lower_formula(arena, inner, env)?;
+                self.marker_time.set(prev);
                 arena.temporal_unary(kk::TemporalFormulaOp::Restore, f)
             }
             Formula::Initially(inner) => {
+                let prev = self.marker_time.replace(Some(TimePoint::First));
                 let f = self.lower_formula(arena, inner, env)?;
+                self.marker_time.set(prev);
                 arena.temporal_unary(kk::TemporalFormulaOp::Initially, f)
             }
             Formula::Regularly(inner) => {
@@ -2903,6 +3020,11 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
         Formula::Pin(name, pos) => Formula::Pin(name.clone(), *pos),
         Formula::MaxSome(e) => Formula::MaxSome(Box::new(subst_expr(e, from, to))),
         Formula::MinSome(e) => Formula::MinSome(Box::new(subst_expr(e, from, to))),
+        Formula::OverflowCond(m, body) => {
+            Formula::OverflowCond(*m, Box::new(subst_formula(body, from, to)))
+        }
+        Formula::Maximize(ie) => Formula::Maximize(subst_int(ie, from, to)),
+        Formula::Minimize(ie) => Formula::Minimize(subst_int(ie, from, to)),
         Formula::MaxSomeDecl(ds, body) => {
             let nd = ds
                 .iter()
@@ -3126,7 +3248,7 @@ fn strip_mult(e: &Expr) -> Expr {
             args.iter().map(|a| Box::new(strip_mult(a))).collect(),
         ),
         Expr::Call(n, args, p) => {
-            Expr::Call(n.clone(), args.iter().map(|a| strip_mult(a)).collect(), *p)
+            Expr::Call(n.clone(), args.iter().map(strip_mult).collect(), *p)
         }
         Expr::Prime(x) => Expr::Prime(Box::new(strip_mult(x))),
         Expr::AtExpr(x) => Expr::AtExpr(Box::new(strip_mult(x))),
@@ -3176,6 +3298,9 @@ fn mentions_int_formula(f: &Formula) -> bool {
         Formula::MaxSomeDecl(ds, body) => {
             ds.iter().any(|d| mentions_int_expr(&d.expr)) || mentions_int_formula(body)
         }
+        Formula::OverflowCond(_, body) => mentions_int_formula(body),
+        // A marker target is an integer expression by construction.
+        Formula::Maximize(_) | Formula::Minimize(_) => true,
         Formula::Cmp(_, a, b, _) => mentions_int_expr(a) || mentions_int_expr(b),
         Formula::Quant(_, ds, body) => {
             ds.iter().any(|d| mentions_int_expr(&d.expr)) || mentions_int_formula(body)
@@ -3262,6 +3387,8 @@ fn scan_total_order_formula(f: &Formula, out: &mut Vec<(String, String)>) {
             scan_total_order_formula(body, out);
         }
         Formula::Multi(_, e, _) => scan_total_order_expr(e, out),
+        Formula::OverflowCond(_, body) => scan_total_order_formula(body, out),
+        Formula::Maximize(ie) | Formula::Minimize(ie) => scan_total_order_intexpr(ie, out),
         Formula::And(a, b)
         | Formula::Or(a, b)
         | Formula::Implies(a, b)
@@ -3753,6 +3880,11 @@ fn replace_var_formula(f: &Formula, from: &str, to: &Expr) -> Formula {
             Formula::MaxSomeDecl(nd, Box::new(replace_var_formula(body, from, to)))
         }
         Formula::Not(x) => Formula::Not(Box::new(replace_var_formula(x, from, to))),
+        Formula::OverflowCond(m, body) => {
+            Formula::OverflowCond(*m, Box::new(replace_var_formula(body, from, to)))
+        }
+        Formula::Maximize(ie) => Formula::Maximize(replace_var_int(ie, from, to)),
+        Formula::Minimize(ie) => Formula::Minimize(replace_var_int(ie, from, to)),
         Formula::And(a, b) => Formula::And(
             Box::new(replace_var_formula(a, from, to)),
             Box::new(replace_var_formula(b, from, to)),

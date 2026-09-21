@@ -66,6 +66,7 @@ pub struct CoreSolution {
 pub fn solve_core_with<S: SatSolver>(
     solver: &mut S,
     bitwidth: u32,
+    no_overflow: bool,
     arena: &AstArena,
     formula: FormulaId,
     bounds: &Bounds,
@@ -78,8 +79,12 @@ pub fn solve_core_with<S: SatSolver>(
         ));
     }
     let conjuncts = conjuncts_of(arena, formula);
-    let mut translator = FolTranslator::new(crate::BoolCtx::new(), bounds);
-    translator.set_bitwidth(bitwidth);
+    let mut translator = FolTranslator::with_options(
+        crate::BoolCtx::new(),
+        bounds,
+        bitwidth,
+        no_overflow,
+    );
 
     // Translate every conjunct into definitions; non-trivial roots become
     // selectors assumed during the solve. Selectors are *signed* literals

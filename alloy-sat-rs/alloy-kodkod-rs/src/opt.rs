@@ -8,6 +8,10 @@
 //!   bit `i` carries weight `2^i`, and maximizing the signed value is
 //!   reduced to maximizing `v + 2^(w-1)` (i.e. the sign bit is rewarded
 //!   negated).
+//! * [`Objective::Ints`] — pool the bit softs of several integer targets
+//!   (several `maximize`/`minimize` markers in one command), each with
+//!   its own sense. Weights are the targets' own bit weights; relative
+//!   influence comes from the target expressions themselves.
 //! * [`Objective::Weighted`] — maximize/minimize `sum(w_r * #r)` over
 //!   relations. Every variable cell of a weighted relation (see
 //!   [`FolTranslator::var_origins`](crate::fol::FolTranslator::var_origins))
@@ -80,6 +84,13 @@ pub enum Objective {
         pairs: Vec<(CellRef, CellRef, i64)>,
         sense: OptSense,
     },
+    /// Pool the bit softs of several integer targets (several
+    /// `maximize` / `minimize` markers in one command). Each target
+    /// contributes its own bit-weighted soft units with its own sense,
+    /// so mixed senses need no global flip. Relative influence comes
+    /// from the target expressions themselves; the weights are the
+    /// targets' own bit weights.
+    Ints { targets: Vec<(IntId, OptSense)> },
     /// Use only translation-collected softs (AlloyMax `maxsome` /
     /// `minsome` / `soft fact` nodes in the formula). Errors when the
     /// translation collects nothing.
@@ -113,6 +124,12 @@ impl Objective {
             weights,
             sense: OptSense::Minimize,
         }
+    }
+
+    /// Pools several integer targets (multiple `maximize`/`minimize`
+    /// markers), each with its own sense.
+    pub fn ints(targets: Vec<(IntId, OptSense)>) -> Objective {
+        Objective::Ints { targets }
     }
 
     pub fn max_and(pairs: Vec<(CellRef, CellRef, i64)>) -> Objective {
@@ -149,6 +166,9 @@ impl Objective {
             Objective::Int { sense, .. } => *sense,
             Objective::Weighted { sense, .. } => *sense,
             Objective::And { sense, .. } => *sense,
+            // Each target carries its own sense (flipped per target), so
+            // the loop uniformly maximizes the pooled softs.
+            Objective::Ints { .. } => OptSense::Maximize,
             // Collected entries carry their own sense (minsome is
             // negated at collection); the loop maximizes their sum.
             Objective::Collected => OptSense::Maximize,
@@ -180,6 +200,7 @@ pub struct OptSolution {
 pub fn solve_opt_with<S: SatSolver>(
     solver: &mut S,
     bitwidth: u32,
+    no_overflow: bool,
     arena: &AstArena,
     formula: FormulaId,
     bounds: &Bounds,
@@ -192,8 +213,12 @@ pub fn solve_opt_with<S: SatSolver>(
                 .into(),
         ));
     }
-    let mut translator = FolTranslator::new(crate::BoolCtx::new(), bounds);
-    translator.set_bitwidth(bitwidth);
+    let mut translator = FolTranslator::with_options(
+        crate::BoolCtx::new(),
+        bounds,
+        bitwidth,
+        no_overflow,
+    );
     let root = translator.formula_ref(arena, formula, &[])?;
 
     // Relations appearing in cell objectives need leaf circuits (and
@@ -214,7 +239,7 @@ pub fn solve_opt_with<S: SatSolver>(
                 }
             }
             // Collected softs resolve their own leaves during translation.
-            Objective::Int { .. } | Objective::Collected => {}
+            Objective::Int { .. } | Objective::Ints { .. } | Objective::Collected => {}
         }
         for r in rels {
             translator.ensure_relation(r)?;
@@ -223,12 +248,23 @@ pub fn solve_opt_with<S: SatSolver>(
 
     // Lower the objective circuit (shares the translator's BoolCtx so
     // gates — and primary slots — coincide with the formula's).
-    let int_bits: Option<Vec<BoolRef>> = match &objective {
-        Objective::Int { id, .. } => {
+    // Integer objectives lower to bit circuits (shared with the
+    // formula's circuit): `(bits, minimize)` per target. `Ints` pools
+    // several targets, each with its own sense.
+    let int_targets: Vec<(Vec<BoolRef>, bool)> = match &objective {
+        Objective::Int { id, sense } => {
             let circ = translator.int_expr(arena, *id, &[])?;
-            Some(circ.bits.clone())
+            vec![(circ.bits.clone(), *sense == OptSense::Minimize)]
         }
-        Objective::Weighted { .. } | Objective::And { .. } | Objective::Collected => None,
+        Objective::Ints { targets } => {
+            let mut out = Vec::with_capacity(targets.len());
+            for (id, sense) in targets {
+                let circ = translator.int_expr(arena, *id, &[])?;
+                out.push((circ.bits.clone(), *sense == OptSense::Minimize));
+            }
+            out
+        }
+        Objective::Weighted { .. } | Objective::And { .. } | Objective::Collected => Vec::new(),
     };
     let max_primary = translator.ctx.num_slots();
     let ctx = translator.ctx.clone();
@@ -279,21 +315,25 @@ pub fn solve_opt_with<S: SatSolver>(
                 softs.push((if minimize { -lit } else { lit }, weight));
             }
         }
-        Objective::Int { .. } => {
-            let bits = int_bits.expect("int objective lowers bits");
-            let w = bits.len();
-            if w > 0 {
+        // One bit-weighted soft per circuit bit. Maximizing the signed
+        // value = maximizing v + 2^(w-1), i.e. the top bit is rewarded
+        // negated; a minimize target flips every literal instead.
+        Objective::Int { .. } | Objective::Ints { .. } => {
+            for (bits, target_minimize) in &int_targets {
+                let w = bits.len();
+                if w == 0 {
+                    continue;
+                }
                 for (i, &b) in bits.iter().enumerate() {
                     if b.is_const() {
                         continue; // fixed offset: irrelevant to the argmax
                     }
                     let weight: i64 = 1i64 << (w - 1); // top bit weight
                     let weight = if i + 1 < w { 1i64 << i } else { weight };
-                    // Maximizing the signed value = maximizing v + 2^(w-1),
-                    // i.e. the sign bit is rewarded negated.
                     let lit = emit_lit(solver, &ctx, b, max_primary)?;
                     next_var = next_var.max(solver.num_variables() as i64);
                     let lit = if i + 1 == w { -lit } else { lit };
+                    let minimize = *target_minimize;
                     softs.push((if minimize { -lit } else { lit }, weight));
                 }
             }
@@ -653,6 +693,20 @@ fn eval_cost(
         Objective::Int { id, .. } => {
             let ev = Evaluator::new(instance);
             Ok(ev.int_value(arena, *id, &Vec::new())?)
+        }
+        // Sum of the targets' natural values (a single target reports
+        // its own value; with mixed senses the sum is informational —
+        // each target is optimized in its own direction).
+        Objective::Ints { targets } => {
+            let ev = Evaluator::new(instance);
+            let mut total = 0i64;
+            for (id, _) in targets {
+                let v = ev.int_value(arena, *id, &Vec::new())?;
+                total = total.checked_add(v).ok_or_else(|| {
+                    TranslateError::Solver("objective cost overflow i64".into())
+                })?;
+            }
+            Ok(total)
         }
         Objective::Weighted { weights, .. } => {
             let mut total = 0i64;

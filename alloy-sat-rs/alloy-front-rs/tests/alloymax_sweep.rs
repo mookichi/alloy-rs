@@ -149,12 +149,12 @@ fn alloymax_course_sweep() {
                 ..Default::default()
             },
         );
-        let mut arena = problem.arena;
+        let arena = problem.arena;
         let n_pairs = pairs.len();
         let t0 = Instant::now();
         let sol = solver
             .solve_opt(
-                &mut arena,
+                &arena,
                 problem.formula,
                 &problem.bounds,
                 Objective::max_and(pairs),

@@ -197,6 +197,35 @@ maximize weights { <rel> : <int>, ... } for <scope>
 maximize weights { <rel> : <int>, ... } { <formula> } for <scope>
 ```
 
+式内マーカー（同じ目的を `run` 側から書く形）:
+
+```alloy
+pred mp { maximize <intexpr> }                // hard 意味は true、目的を登録
+pred mp { minimize <intexpr> }
+run { mp } for 5 steps, 3 int                 // コマンド側は普通の run
+```
+
+- マーカーは `maxsome` と同じく hard `true`（充足判定に寄与しない）。
+  `maximize:` コマンドと違い、スコープ・facts を共有する既存の
+  `run`/`check` にそのまま挿せる（`:max`/`:min` のような Cnf 前提も不要）。
+- 目的式は `: <intexpr>` と同じ文法（`: <intexpr>` の `:` は任意）。
+  集合を整数位置に置くと **ビットマスク読み**（`maximize X` = X の
+  符号付き値、`maximize #X` = 基数）。
+- 時制コマンドでは、**マーカーを囲む状態固定演算子**が評価時点を決める：
+  `initially` → 初期状態、`goal` → 最終状態、`restore` → ループ状態。
+  間に `always`/`eventually`/`until` などの範囲演算子が挟まる場合と、
+  時制コマンドでどの固定演算子にも囲まれていない場合は「時点不定」と
+  してエラー（`fact {goal Aopt = A}` + 静的ミラー sig の手書き回避策が
+  不要になる）。可変関係は展開器の `r$t` と `$t_first`/`$t_last`/`$t_loop`
+  を使い `r$t . $t_*` に射影される（目的式は静的な関係だけで解かれる）。
+- 複数マーカーは 1 つの WCNF に合算される（ソフト単位は各目標の
+  ビット重み、sense は目標ごとにリテラル極性で表現）。相対的な重みは
+  目的式の中で付ける（例 `maximize (2*#A + #B)`）。重み係数を構文で
+  指定する仕組み（`maximize weight 8 ...` 等）と自動優先度計算は未対応。
+- `maximize:` コマンド目的とマーカーの併記はエラー。素の SAT 経路
+  （`run_command` / `Cnf::solve` / `:run`/`:check`）はマーカーを
+  黙って落とさずエラーで拒否する（soft と同じ規約）。
+
 - `maximize` / `minimize` / `weights` は予約語化 (既存83例題に
   識別子衝突なしを確認)。`run` / `check` と並列に `CommandKind` に
   追加 (`Maximize { name, objective }` / `Minimize { name, objective }`)。
@@ -254,3 +283,66 @@ soft fact { no lec: Alice.courses.lectures | ... }  // 最適化対象の制約
   `Cnf` 化せず `run_opt_command` で直接解く)。`Cnf` は high-level
   (arena/bounds/formula) を保持しているため、REPL目的式はその場で
   lowerして `solve_opt_with` に渡す。
+
+## 7. 整数オーバーフロー条件: `some Overflow` / `no Overflow` (Rust専用構文)
+
+Java Alloy・Pardinus いずれにも存在しない Rustフロント専用の純粋な拡張。
+`run`/`check` 本体のトップレベルでのみ使える探索モード指定である:
+
+```alloy
+run { some Overflow { X * X = -15 } } for 4 Int   // 溢れを使うモデルを求める
+run { no Overflow { X * X = -15 } } for 4 Int     // 溢れなしモデルを求める (UNSAT)
+```
+
+- `some Overflow { F }`: F が成り立ち、かつ整数オーバーフロー
+  (0除算を含む) を使うモデルを求める。wrapping 翻訳 + CEGAR ループ
+  (E-bit 評価器フラグが立つまで blocking 節で除外して再solve) で解く。
+  溢れモデルがなければ UNSAT。`|` 形 (`some Overflow | F`) も可。
+- `no Overflow { F }`: 溢れなしで F が成り立つモデルを求める。
+  通常の禁止ゲート付き翻訳と同一。`run` の二段階探索の Phase 1 と等価。
+- `Overflow` はこの位置では予約語 (`some Overflow` は多重度でなく
+  マーカーに読む)。入れ子・否定下での使用、時制コマンドでの
+  `some Overflow`、`check` 本体での `some Overflow` は明示エラー。
+- REPL `:solve` は `some Overflow` モデルに
+  `note: overflowing model (some Overflow)` を付ける。`no Overflow`
+  指定時は wrapping fallback を行わない。
+- 近似の明示: CEGAR の成否判定は評価器フラグに依存し、評価器は
+  量化子本体を全束縛で評価するため、無関係束縛の溢れでフラグが
+  立つことがある。量化子なしトップレベルでは厳密。
+
+### 7.1 最適化との統合: 一様モード表
+
+探索モード (マーカーの有無) は SAT (`:solve`)・最適化 (`:max`/`:min`/`:optimize`)
+で一様に扱う。`run_opt_command_with` / `optimize_with` が `no_overflow`
+フラグを受け、REPL が二段階化する:
+
+| マーカー | `:solve` | 最適化 |
+|---|---|---|
+| なし | 二段階 (禁止→wrapping fallback) | 二段階 (禁止OLL→wrapping OLL fallback) |
+| `no` | 禁止のみ (fallback抑止) | 禁止OLLのみ |
+| `some` | wrapping CEGAR | wrapping OLL単発 + 評価器note (ループなし) |
+
+- wrapping 最適値には `note: wrapping optimum cost=N (no overflow-free
+  optimum at bitwidth E; cost may reflect wrapping; ...)` を付ける。
+  cost 自体がラップ人工物の可能性があるため。
+- `some Overflow` + 時制最適化は明示拒否。`als` (`run_command`) の
+  `some Overflow` も明示拒否 (CEGARなしに黙殺しないため)。
+
+## 8. 求解の非対称選好と評価器の E-bit 化 (Rust専用動作)
+
+Java (既定 `NoOverflow=true`) との差異。意図的:
+
+- `run` は溢れなしモデル優先: 禁止ゲート付きで解き、UNSATのときのみ
+  wrapping で解き直す (`note: wrapping model ... at bitwidth E; try a
+  larger 'for N Int'`)。溢れはビット数不足の証拠と捉え、行動指示を出す。
+  自動拡大はしない。
+- `check` は wrapping 優先: 意外な反例 (溢れ依存を含む) を先に報告する。
+  溢れ依存の反例には `note: ... (re-check with a larger 'for N Int' to
+  confirm)` を付ける。W拡大で消える反例は偽陽性の疑いがあるため。
+- 評価器 (`Evaluator` / `TemporalEval` / `validate` / `:query`) は
+  問題bitwidthで E-bit ラップする (定数リテラル含む)。solver と一致させるため。
+  溢れ検出フラグ (`overflowed()`) を持ち、0除算も検出する。
+- 層分担: front `Cnf` 経路=ユーザ向け多機能経路 (warnings、
+  `some`/`no Overflow`、二段階探索)。kodkod `Solver` 系=組込み・
+  分解用経路。`SolverOptions.no_overflow` (既定true) で禁止の有無のみ
+  共有する (`FolTranslator::with_options` が一元設定)。

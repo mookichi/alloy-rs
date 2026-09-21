@@ -3,11 +3,11 @@
 //!
 //! - `run`  : satisfiability search. `solve` SAT => example instance.
 //! - `check`: negated assertion search (lowering already negates).
-//!            `solve` SAT => counterexample instance,
-//!            `solve` UNSAT => `None` (assertion holds, empty).
+//!   `solve` SAT => counterexample instance,
+//!   `solve` UNSAT => `None` (assertion holds, empty).
 //! - `validate(cnf, instance)`: builtin check. Returns the instance
-//!            as-is (`Some`) iff it is a model of the `Cnf`,
-//!            otherwise `None` (empty).
+//!   as-is (`Some`) iff it is a model of the `Cnf`,
+//!   otherwise `None` (empty).
 //!
 //! `Cnf` keeps both levels (as requested):
 //! high-level (`AstArena` + `Bounds` + `FormulaId`) for inspection,
@@ -23,7 +23,7 @@ use alloy_kodkod_rs::instance::Instance;
 use alloy_kodkod_rs::temporal::{TemporalExpansion, TemporalInstance};
 use alloy_kodkod_rs::{AstArena, BoolCtx};
 
-use crate::ast::{CommandKind, Module};
+use crate::ast::{CommandKind, Module, OverflowMode};
 use crate::lower::Lowerer;
 use crate::FrontError;
 
@@ -62,6 +62,13 @@ pub struct Cnf {
     pub num_vars: usize,
     pub clauses: Vec<Vec<i64>>,
     pub origins: Vec<VarOrigin>,
+    /// Compiler-style build warnings (e.g. unconstrained relations).
+    /// Populated from preprocessing, before translation.
+    pub warnings: Vec<String>,
+    /// `some`/`no Overflow` marker from the command body (`None` when
+    /// absent). `Some` forces a wrapping build whose `solve` runs a
+    /// CEGAR loop for an overflowing model; `No` forces the gated build.
+    pub overflow: Option<OverflowMode>,
     /// True when built from a temporal command (bounds/formula are the
     /// time-expanded ones; `solve` returns the first state, use
     /// `solve_temporal` for the full lasso trace).
@@ -114,6 +121,18 @@ impl Cnf {
     }
 }
 
+/// A `maximize`/`minimize` marker is hard `true`: solving the hard part
+/// as a plain Cnf would silently ignore the objective.
+fn reject_opt_markers(index: usize, problem: &crate::lower::LoweredProblem) -> Result<(), FrontError> {
+    if problem.markers.is_empty() {
+        return Ok(());
+    }
+    Err(FrontError::Resolve(format!(
+        "command #{index} carries an optimization target (`maximize`/`minimize` in its body); \
+         use run_opt_command or :optimize"
+    )))
+}
+
 fn command_name_of(module: &Module, index: usize) -> Option<String> {
     module.commands.get(index).and_then(|c| match &c.kind {
         CommandKind::Run(n) | CommandKind::Check(n) => n.clone(),
@@ -121,9 +140,191 @@ fn command_name_of(module: &Module, index: usize) -> Option<String> {
     })
 }
 
+/// Relations that are bounded but never referenced by the formula.
+///
+/// Detected purely in preprocessing (`arena` + `bounds` + `formula`,
+/// before translation): a relation with `upper != lower` that no
+/// expression in the formula mentions is free — any subset is a model.
+/// Returns `(relation name, free tuple count)` sorted by name.
+///
+/// Unlike an origins-based check this does not depend on lazy leaf
+/// creation, so it stays valid if translation ever materializes every
+/// relation up front (Kodkod parity).
+pub fn unconstrained_relations(
+    arena: &AstArena,
+    bounds: &Bounds,
+    formula: FormulaId,
+) -> Vec<(String, usize)> {
+    use alloy_kodkod_rs::ast::{DeclsId, ExprId, ExprNode, FormulaId as Fid, FormulaNode, IntId, IntNode};
+    use alloy_kodkod_rs::relation::RelationId;
+    use std::collections::HashSet;
+
+    struct Walk<'a> {
+        arena: &'a AstArena,
+        used: HashSet<u32>,
+        seen_e: HashSet<u32>,
+        seen_f: HashSet<u32>,
+        seen_i: HashSet<u32>,
+        seen_d: HashSet<u32>,
+    }
+
+    impl<'a> Walk<'a> {
+        fn expr(&mut self, id: ExprId) {
+            if !self.seen_e.insert(id.0) {
+                return;
+            }
+            match self.arena.expr(id) {
+                ExprNode::Relation(r) => {
+                    self.used.insert(r.0);
+                }
+                ExprNode::Variable(_) | ExprNode::Constant(_) | ExprNode::Atoms(_) => {}
+                ExprNode::Unary { child, .. } | ExprNode::Temporal { child, .. } => self.expr(*child),
+                ExprNode::Binary { left, right, .. } => {
+                    self.expr(*left);
+                    self.expr(*right);
+                }
+                ExprNode::Nary { children, .. } => {
+                    for c in children.clone() {
+                        self.expr(c);
+                    }
+                }
+                ExprNode::If { cond, then, els } => {
+                    let (c, t, e) = (*cond, *then, *els);
+                    self.formula(c);
+                    self.expr(t);
+                    self.expr(e);
+                }
+                ExprNode::Project { expr, columns } => {
+                    let (e, cols) = (*expr, columns.clone());
+                    self.expr(e);
+                    for c in cols {
+                        self.int(c);
+                    }
+                }
+                ExprNode::Comprehension { decls, body } => {
+                    let (d, b) = (*decls, *body);
+                    self.decls(d);
+                    self.formula(b);
+                }
+                ExprNode::FromInt(i) => self.int(*i),
+            }
+        }
+
+        fn int(&mut self, id: IntId) {
+            if !self.seen_i.insert(id.0) {
+                return;
+            }
+            match self.arena.int(id).clone() {
+                IntNode::Constant(_) => {}
+                IntNode::OfExpr { expr, .. } => self.expr(expr),
+                IntNode::Binary { left, right, .. } => {
+                    self.int(left);
+                    self.int(right);
+                }
+                IntNode::If { cond, then, els } => {
+                    self.formula(cond);
+                    self.int(then);
+                    self.int(els);
+                }
+                IntNode::Sum { decls, body } => {
+                    self.decls(decls);
+                    self.int(body);
+                }
+            }
+        }
+
+        fn decls(&mut self, id: DeclsId) {
+            if !self.seen_d.insert(id.0) {
+                return;
+            }
+            for d in self.arena.decls(id).to_vec() {
+                self.expr(d.expr);
+            }
+        }
+
+        fn formula(&mut self, id: Fid) {
+            if !self.seen_f.insert(id.0) {
+                return;
+            }
+            match self.arena.formula(id).clone() {
+                FormulaNode::Constant(_) => {}
+                FormulaNode::Not(c) => self.formula(c),
+                FormulaNode::Nary { children, .. } => {
+                    for c in children.clone() {
+                        self.formula(c);
+                    }
+                }
+                FormulaNode::Comparison { left, right, .. } => {
+                    self.expr(left);
+                    self.expr(right);
+                }
+                FormulaNode::IntComparison { left, right, .. } => {
+                    self.int(left);
+                    self.int(right);
+                }
+                FormulaNode::Quantified { decls, body, .. } => {
+                    self.decls(decls);
+                    self.formula(body);
+                }
+                FormulaNode::MaxSome(e) | FormulaNode::MinSome(e) => self.expr(e),
+                FormulaNode::SoftFact(inner) => self.formula(inner),
+                FormulaNode::Multiplicity { expr, .. } => self.expr(expr),
+                FormulaNode::TemporalUnary { child, .. } => self.formula(child),
+                FormulaNode::TemporalBinary { left, right, .. } => {
+                    self.formula(left);
+                    self.formula(right);
+                }
+            }
+        }
+    }
+
+    let mut w = Walk {
+        arena,
+        used: HashSet::new(),
+        seen_e: HashSet::new(),
+        seen_f: HashSet::new(),
+        seen_i: HashSet::new(),
+        seen_d: HashSet::new(),
+    };
+    w.formula(formula);
+
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for r in bounds.relations() {
+        if w.used.contains(&r.0) {
+            continue;
+        }
+        let upper_len = bounds.upper_bound(r).map(|t| t.len()).unwrap_or(0);
+        let lower_len = bounds.lower_bound(r).map(|t| t.len()).unwrap_or(0);
+        let free = upper_len.saturating_sub(lower_len);
+        if free == 0 {
+            continue;
+        }
+        let rel_id = RelationId(r.0);
+        out.push((bounds.pool().name(rel_id).to_string(), free));
+    }
+    out.sort();
+    out
+}
+
+/// Compiler-style warning text for one unconstrained relation:
+/// `warning: 'A' is unconstrained: 5 free tuples -> 32 models`.
+pub fn unconstrained_warning(name: &str, free_tuples: usize) -> String {
+    let models = if free_tuples >= 64 {
+        format!("2^{free_tuples}")
+    } else {
+        format!("{}", 1u128 << free_tuples)
+    };
+    format!("warning: '{name}' is unconstrained: {free_tuples} free tuples -> {models} models")
+}
+
 /// Shared builder: lower, optionally skolemize (Run only), then
 /// FOL -> bool circuit -> CNF, capturing origins for later materialize.
-fn build_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cnf, FrontError> {
+fn build_cnf(
+    module: &Module,
+    index: usize,
+    kind: CnfKind,
+    no_overflow: bool,
+) -> Result<Cnf, FrontError> {
     let cmd = module
         .commands
         .get(index)
@@ -156,7 +357,7 @@ fn build_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cnf, FrontE
         // `Solver::solve_temporal_with` up to the CNF). `check` searches
         // for a counterexample trace (lowering already negates); witnesses
         // apply to `run` only, mirroring `run_command`.
-        return build_temporal_cnf(module, index, kind);
+        return build_temporal_cnf(module, index, kind, no_overflow);
     }
 
     let mut lower = Lowerer::new(module);
@@ -168,27 +369,47 @@ fn build_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cnf, FrontE
             "command #{index} carries soft constraints (maxsome/minsome/soft fact); use run_opt_command or :max"
         )));
     }
+    reject_opt_markers(index, &problem)?;
     let mut arena = problem.arena;
     let mut bounds = problem.bounds;
     let mut formula = problem.formula;
     let skolemize = kind == CnfKind::Run;
+    // Explicit `some`/`no Overflow` markers take precedence over the
+    // caller's flag: `some` needs the wrapping build (CEGAR at solve),
+    // `no` needs the gated build.
+    let overflow = problem.overflow;
+    let no_overflow = match overflow {
+        Some(OverflowMode::Some) => false,
+        Some(OverflowMode::No) => true,
+        None => no_overflow,
+    };
+
+    // Compiler-style warnings from preprocessing (pre-skolem, so generated
+    // witness relations are naturally excluded).
+    let warnings: Vec<String> = unconstrained_relations(&arena, &bounds, formula)
+        .iter()
+        .map(|(n, f)| unconstrained_warning(n, *f))
+        .collect();
 
     // Mirror Solver::solve skolem handling: positive existentials become
     // witness relations on a cloned bounds set (Run only).
     if skolemize {
-        match alloy_kodkod_rs::skolem::skolemize_static(&mut arena, &mut bounds, formula)
+        if let Some(sk) = alloy_kodkod_rs::skolem::skolemize_static(&mut arena, &mut bounds, formula)
             .map_err(|e| FrontError::Solve(e.into()))?
         {
-            Some(sk) => formula = sk.formula,
-            None => {}
+            formula = sk.formula;
         }
     }
 
     let ctx = BoolCtx::new();
     // FolTranslator borrows bounds; collect owned data then drop it.
     let (root, origins) = {
-        let mut translator = alloy_kodkod_rs::fol::FolTranslator::new(ctx.clone(), &bounds);
-        translator.set_bitwidth(problem.bitwidth);
+        let mut translator = alloy_kodkod_rs::fol::FolTranslator::with_options(
+            ctx.clone(),
+            &bounds,
+            problem.bitwidth,
+            no_overflow,
+        );
         let root = translator
             .formula_ref(&arena, formula, &[])
             .map_err(FrontError::Solve)?;
@@ -213,6 +434,8 @@ fn build_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cnf, FrontE
         num_vars: cnf.num_vars,
         clauses: cnf.clauses,
         origins,
+        warnings,
+        overflow,
         is_temporal: false,
         steps: 0,
         orig_formula: None,
@@ -229,7 +452,12 @@ fn build_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cnf, FrontE
 /// the expanded ones; `orig_formula` keeps the pre-expansion id for
 /// `TemporalEval`-based validation. For `check` the formula is already the
 /// negated assertion search, so SAT yields a counterexample trace.
-fn build_temporal_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cnf, FrontError> {
+fn build_temporal_cnf(
+    module: &Module,
+    index: usize,
+    kind: CnfKind,
+    no_overflow: bool,
+) -> Result<Cnf, FrontError> {
     use alloy_kodkod_rs::temporal::{
         add_witness_relation, collect_witness_specs, expand_bounds, translate_temporal_formula,
     };
@@ -241,7 +469,25 @@ fn build_temporal_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cn
             "command #{index} carries soft constraints (maxsome/minsome/soft fact); use run_opt_command or :max"
         )));
     }
+    reject_opt_markers(index, &problem)?;
     let steps = module.temporal_steps(index);
+    // `some Overflow` seeks an overflowing trace via a CEGAR loop that
+    // only exists for static Cnfs; reject loudly for temporal commands.
+    if problem.overflow == Some(OverflowMode::Some) {
+        return Err(FrontError::Resolve(
+            "`some Overflow` is not supported for temporal commands yet (use a static `run`)".to_string(),
+        ));
+    }
+    let overflow = problem.overflow;
+    let no_overflow = match overflow {
+        Some(OverflowMode::No) => true,
+        _ => no_overflow,
+    };
+    // Pre-expansion warnings (generated r$t relations excluded).
+    let warnings: Vec<String> = unconstrained_relations(&problem.arena, &problem.bounds, problem.formula)
+        .iter()
+        .map(|(n, f)| unconstrained_warning(n, *f))
+        .collect();
     let mut arena = problem.arena;
     let bounds = problem.bounds;
     let orig_formula = problem.formula;
@@ -286,8 +532,12 @@ fn build_temporal_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cn
 
     let ctx = BoolCtx::new();
     let (root, origins) = {
-        let mut translator = alloy_kodkod_rs::fol::FolTranslator::new(ctx.clone(), &bounds);
-        translator.set_bitwidth(problem.bitwidth);
+        let mut translator = alloy_kodkod_rs::fol::FolTranslator::with_options(
+            ctx.clone(),
+            &bounds,
+            problem.bitwidth,
+            no_overflow,
+        );
         let root = translator
             .formula_ref(&arena, formula, &[])
             .map_err(FrontError::Solve)?;
@@ -313,6 +563,8 @@ fn build_temporal_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cn
         num_vars: cnf.num_vars,
         clauses: cnf.clauses,
         origins,
+        warnings,
+        overflow,
         is_temporal: true,
         steps,
         orig_formula: Some(orig_formula),
@@ -320,14 +572,32 @@ fn build_temporal_cnf(module: &Module, index: usize, kind: CnfKind) -> Result<Cn
     })
 }
 /// Build a `Cnf` from a `run` command (example search).
+///
+/// Overflow prohibition is ON (overflowing assignments cannot satisfy
+/// integer comparisons).
 pub fn run(module: &Module, index: usize) -> Result<Cnf, FrontError> {
-    build_cnf(module, index, CnfKind::Run)
+    build_cnf(module, index, CnfKind::Run, true)
 }
 
 /// Build a `Cnf` from a `check` command (counterexample search;
 /// the assertion is already negated by lowering).
+///
+/// Overflow prohibition is ON, like [`run`].
 pub fn check(module: &Module, index: usize) -> Result<Cnf, FrontError> {
-    build_cnf(module, index, CnfKind::Check)
+    build_cnf(module, index, CnfKind::Check, true)
+}
+
+/// Build a `Cnf` with explicit overflow handling: `no_overflow = true`
+/// is [`run`]/[`check`]; `false` is pure wrapping (overflowing models
+/// are kept). Used by the REPL two-phase search (`run`: overflow-free
+/// first, wrapping fallback; `check`: wrapping first).
+pub fn build_cnf_with(
+    module: &Module,
+    index: usize,
+    kind: CnfKind,
+    no_overflow: bool,
+) -> Result<Cnf, FrontError> {
+    build_cnf(module, index, kind, no_overflow)
 }
 
 /// Reconstruct an `Instance` from a SAT assignment over `cnf.origins`.
@@ -389,10 +659,7 @@ pub fn validate(cnf: &Cnf, instance: &Instance) -> Option<Instance> {
         return None;
     }
     for r in cnf.bounds.relations() {
-        let inst_ts = match instance.tuples(r) {
-            Some(t) => t,
-            None => return None,
-        };
+        let inst_ts = instance.tuples(r)?;
         if inst_ts.arity() != cnf.bounds.pool().arity(r) {
             return None;
         }
@@ -409,6 +676,7 @@ pub fn validate(cnf: &Cnf, instance: &Instance) -> Option<Instance> {
     }
     let empty_env = Vec::new();
     let holds = alloy_kodkod_rs::eval::Evaluator::new(instance)
+        .with_bitwidth(cnf.bitwidth)
         .formula_bool(&cnf.arena, cnf.formula, &empty_env)
         .unwrap_or(false);
     if holds {
@@ -423,9 +691,16 @@ pub fn validate(cnf: &Cnf, instance: &Instance) -> Option<Instance> {
 /// - SAT   => `Ok(Some(instance))` (example for `run`, counterexample for `check`)
 /// - UNSAT => `Ok(None)` (empty: no example / assertion holds)
 ///
+/// A `some Overflow` Cnf (wrapping build) runs a CEGAR loop instead:
+/// models are enumerated until one using integer overflow is found
+/// (see [`solve_some_overflow`]).
+///
 /// For temporal Cnfs this returns the first trace state (`states[0]`) for
 /// backwards compatibility; use [`solve_temporal`] for the full lasso trace.
 pub fn solve(cnf: &Cnf) -> Result<Option<Instance>, FrontError> {
+    if cnf.overflow == Some(OverflowMode::Some) {
+        return solve_some_overflow(cnf);
+    }
     use alloy_kodkod_rs::ipasir_bridge::IpasirSolver;
     use alloy_kodkod_rs::sat::SatSolver;
 
@@ -455,6 +730,29 @@ pub fn solve(cnf: &Cnf) -> Result<Option<Instance>, FrontError> {
     } else {
         Ok(None)
     }
+}
+
+/// Solve a `some Overflow` Cnf: enumerate wrapping models until one
+/// using integer overflow is found.
+///
+/// Each candidate is checked with the E-bit evaluator
+/// (`Evaluator::overflowed`); overflow-free models are excluded with a
+/// blocking clause and the search continues. Exhaustion (`None`) means
+/// no overflowing model exists. Static Cnfs only (temporal commands
+/// with `some Overflow` are rejected at build).
+pub fn solve_some_overflow(cnf: &Cnf) -> Result<Option<Instance>, FrontError> {
+    use crate::incremental::IncrementalSession;
+
+    let mut sess = IncrementalSession::open(cnf)?;
+    let bitwidth = cnf.bitwidth;
+    let arena = &cnf.arena;
+    let formula = cnf.formula;
+    sess.solve_until(|inst| {
+        let ev = alloy_kodkod_rs::eval::Evaluator::new(inst).with_bitwidth(bitwidth);
+        let empty_env = Vec::new();
+        let _ = ev.formula_bool(arena, formula, &empty_env);
+        ev.overflowed()
+    })
 }
 
 /// Inspect a temporal `Cnf`, returning the full lasso trace.
@@ -509,6 +807,7 @@ pub fn validate_temporal(cnf: &Cnf, trace: &TemporalInstance) -> Option<Temporal
         return None;
     }
     let holds = alloy_kodkod_rs::temporal::TemporalEval::new(trace)
+        .with_bitwidth(cnf.bitwidth)
         .holds(&cnf.arena, orig)
         .unwrap_or(false);
     if holds {

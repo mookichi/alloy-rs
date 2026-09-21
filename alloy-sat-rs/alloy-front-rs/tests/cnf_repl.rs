@@ -22,7 +22,7 @@ fn run_sat_yields_example() {
     // Example contains at least one A atom.
     let found = inst.find_relation_by_name("A").and_then(|r| inst.tuples(r));
     assert!(found.is_some(), "instance should contain A, got: {inst}");
-    assert!(found.unwrap().len() >= 1);
+    assert!(!found.unwrap().is_empty());
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn run_unsat_yields_none_empty() {
     "#;
     let m = parse_module(src).expect("parse");
     let cnf = run(&m, 0).expect("run builds Cnf");
-    assert_eq!(solve(&cnf).expect("solve").is_none(), true);
+    assert!(solve(&cnf).expect("solve").is_none());
 }
 
 #[test]

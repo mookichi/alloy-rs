@@ -383,6 +383,45 @@ impl<S: SatSolver> IncrementalSession<S> {
             Some(i) => i.clone(),
             None => return Ok(false),
         };
+        self.block_instance_filtered(&inst, relations)
+    }
+
+    /// Permanently exclude a given model (full-model blocking clause over
+    /// primary slots). Unlike [`Self::block_last_model`], the model need
+    /// not come from this session (e.g. a one-shot `:solve` result handed
+    /// to a fresh `:next` session). Returns false when the model
+    /// constrains no primary variable and cannot be excluded clause-wise.
+    pub fn block_instance(&mut self, inst: &Instance) -> Result<bool, FrontError> {
+        self.block_instance_filtered(inst, None)
+    }
+
+    /// Enumerate models until `accept` holds for one, permanently
+    /// excluding the rest. Each rejected model costs one blocking clause
+    /// and one re-solve; exhaustion (or an unblockable rejection) yields
+    /// `None`. Shared by `some Overflow` search and (via `block_instance`)
+    /// the REPL `:next` chain.
+    pub fn solve_until(
+        &mut self,
+        mut accept: impl FnMut(&Instance) -> bool,
+    ) -> Result<Option<Instance>, FrontError> {
+        loop {
+            let Some(inst) = self.solve(&[])? else {
+                return Ok(None);
+            };
+            if accept(&inst) {
+                return Ok(Some(inst));
+            }
+            if !self.block_instance(&inst)? {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn block_instance_filtered(
+        &mut self,
+        inst: &Instance,
+        relations: Option<&[RelationId]>,
+    ) -> Result<bool, FrontError> {
         let mut clause = Vec::new();
         for o in &self.origins {
             if let Some(rs) = relations {
@@ -542,6 +581,52 @@ mod tests {
         }
         assert_eq!(seen.len(), 2, "A over 1 atom has 2 models");
         assert_eq!(s.stats().unsat, 1);
+    }
+
+    #[test]
+    fn block_instance_excludes_foreign_model_then_exhausts() {
+        // `:solve` (one-shot) handed to a fresh `:next` session: block the
+        // foreign model, enumerate the rest, then UNSAT.
+        let cnf = tiny_cnf();
+        let first = crate::cnf::solve(&cnf)
+            .expect("fresh")
+            .expect("SAT");
+        let rel = find_relation(&cnf.bounds, "A").expect("A");
+        let mut s = open_rec(&cnf);
+        assert!(s.block_instance(&first).expect("block"));
+        let second = s.solve(&[]).expect("solve").expect("SAT");
+        assert_ne!(
+            format!("{}", second.tuples(rel).unwrap()),
+            format!("{}", first.tuples(rel).unwrap())
+        );
+        assert!(s.block_instance(&second).expect("block"));
+        assert!(s.solve(&[]).expect("exhausted").is_none());
+    }
+
+    #[test]
+    fn solve_until_rejects_to_exhaustion() {
+        // Never accept: both models of `tiny_cnf` are visited, then UNSAT.
+        let cnf = tiny_cnf();
+        let mut s = open_rec(&cnf);
+        let mut seen = 0;
+        let r = s
+            .solve_until(|_| {
+                seen += 1;
+                false
+            })
+            .expect("loop");
+        assert!(r.is_none());
+        assert_eq!(seen, 2);
+        assert_eq!(s.stats().unsat, 1);
+    }
+
+    #[test]
+    fn solve_until_accepts_first() {
+        let cnf = tiny_cnf();
+        let mut s = open_rec(&cnf);
+        let r = s.solve_until(|_| true).expect("loop");
+        assert!(r.is_some());
+        assert_eq!(s.stats().solves, 1);
     }
 
     #[test]

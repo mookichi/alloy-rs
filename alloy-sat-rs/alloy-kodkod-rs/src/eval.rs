@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use crate::ast::{
@@ -26,11 +27,105 @@ type Env = Vec<(VarId, Vec<u32>)>;
 
 pub struct Evaluator<'a> {
     pub instance: &'a Instance,
+    /// E-bit circuit width for integer wrapping (matches the SAT
+    /// translation's `bitwidth`). 64 (default) means unbounded i64.
+    bitwidth: u32,
+    /// Set when any integer operation overflows `bitwidth`
+    /// (two's-complement truncation), including division by zero.
+    overflow: Cell<bool>,
+}
+
+/// Shared integer binary-op evaluation with E-bit wrapping.
+///
+/// Both [`Evaluator::int_value`] and `TemporalEval::int_at` delegate
+/// here; the only difference between them is how operands are
+/// recruited (single state vs prime-shifted trace position).
+/// Division by zero is an error (and flags overflow, like any
+/// out-of-range result).
+pub fn apply_int_binop(
+    op: IntBinOp,
+    l: i64,
+    r: i64,
+    bitwidth: u32,
+    overflow: &Cell<bool>,
+) -> Result<i64, EvalError> {
+    let wrap = |v: i128| wrap_int(v, bitwidth, overflow);
+    Ok(match op {
+        IntBinOp::Plus => wrap(l as i128 + r as i128),
+        IntBinOp::Minus => wrap(l as i128 - r as i128),
+        IntBinOp::Times => wrap(l as i128 * r as i128),
+        IntBinOp::Divide => {
+            if r == 0 {
+                overflow.set(true);
+                return Err(EvalError::DivideByZero);
+            }
+            // INT_MIN / -1 overflows every E-bit width.
+            wrap(l as i128 / r as i128)
+        }
+        IntBinOp::Modulo => {
+            if r == 0 {
+                overflow.set(true);
+                return Err(EvalError::DivideByZero);
+            }
+            wrap(l as i128 % r as i128)
+        }
+        IntBinOp::And => wrap(l as i128 & r as i128),
+        IntBinOp::Or => wrap(l as i128 | r as i128),
+        IntBinOp::Xor => wrap(l as i128 ^ r as i128),
+        IntBinOp::Shl => wrap((l as i128) << (r as u32 % 64)),
+        IntBinOp::Shr => wrap(((l as u64) >> (r as u32 % 64)) as i128),
+    })
+}
+
+/// Wrap an exact integer value to `bitwidth` two's-complement,
+/// flagging `overflow` when truncation changes the value.
+pub fn wrap_int(value: i128, bitwidth: u32, overflow: &Cell<bool>) -> i64 {
+    if bitwidth >= 64 {
+        if value < i64::MIN as i128 || value > i64::MAX as i128 {
+            overflow.set(true);
+        }
+        return value as i64;
+    }
+    let mask = (1i128 << bitwidth) - 1;
+    let truncated = value & mask;
+    let signed = if (truncated >> (bitwidth - 1)) & 1 == 1 {
+        truncated - (1i128 << bitwidth)
+    } else {
+        truncated
+    };
+    if signed != value {
+        overflow.set(true);
+    }
+    signed as i64
 }
 
 impl<'a> Evaluator<'a> {
     pub fn new(instance: &'a Instance) -> Evaluator<'a> {
-        Evaluator { instance }
+        Evaluator {
+            instance,
+            bitwidth: 64,
+            overflow: Cell::new(false),
+        }
+    }
+
+    /// Evaluate with E-bit wrapping (pass the problem `bitwidth` so
+    /// results agree with the SAT translation instead of unbounded i64).
+    pub fn with_bitwidth(mut self, w: u32) -> Evaluator<'a> {
+        self.bitwidth = w;
+        self
+    }
+
+    /// Whether any integer operation overflowed so far.
+    pub fn overflowed(&self) -> bool {
+        self.overflow.get()
+    }
+
+    fn wrap(&self, value: i128) -> i64 {
+        wrap_int(value, self.bitwidth, &self.overflow)
+    }
+
+    fn apply_binop(&self, op: IntBinOp, l: i64, r: i64) -> Result<i64, EvalError> {
+        apply_int_binop(op, l, r, self.bitwidth, &self.overflow)
     }
 
     fn univ(&self) -> u32 {
@@ -269,13 +364,13 @@ impl<'a> Evaluator<'a> {
         match op {
             CastToIntOp::Cardinality => m.len() as i64,
             CastToIntOp::Sum => {
-                let mut total = 0i64;
+                let mut total = 0i128;
                 let mut layered = false;
                 for (val, ts) in self.instance.int_tuples() {
                     layered = true;
                     for idx in ts.index_view().iter() {
                         if m.contains_index(idx) {
-                            total += val;
+                            total += val as i128;
                         }
                     }
                 }
@@ -286,12 +381,12 @@ impl<'a> Evaluator<'a> {
                     for idx in m.index_view().iter() {
                         if let Ok(atom) = self.instance.universe().atom(idx as usize) {
                             if let Ok(v) = atom.parse::<i64>() {
-                                total += v;
+                                total += v as i128;
                             }
                         }
                     }
                 }
-                total
+                self.wrap(total)
             }
             CastToIntOp::Bits => {
                 // Bit-vector value with signed MSB weight:
@@ -311,14 +406,14 @@ impl<'a> Evaluator<'a> {
                 }
                 let top = max_val; // W - 1
                 let weight_of = |v: i64| -> Option<i64> { crate::int::bit_weight(v, top) };
-                let mut total = 0i64;
+                let mut total = 0i128;
                 let mut layered = false;
                 for (val, ts) in self.instance.int_tuples() {
                     layered = true;
                     for idx in ts.index_view().iter() {
                         if m.contains_index(idx) {
                             if let Some(wt) = weight_of(val) {
-                                total += wt;
+                                total += wt as i128;
                             }
                         }
                     }
@@ -328,13 +423,13 @@ impl<'a> Evaluator<'a> {
                         if let Ok(atom) = self.instance.universe().atom(idx as usize) {
                             if let Ok(v) = atom.parse::<i64>() {
                                 if let Some(wt) = weight_of(v) {
-                                    total += wt;
+                                    total += wt as i128;
                                 }
                             }
                         }
                     }
                 }
-                total
+                self.wrap(total)
             }
         }
     }
@@ -342,7 +437,9 @@ impl<'a> Evaluator<'a> {
     pub fn int_value(&self, arena: &AstArena, i: IntId, env: &Env) -> Result<i64, EvalError> {
         let node = arena.int(i).clone();
         match node {
-            IntNode::Constant(v) => Ok(v),
+            // Constants wrap like `IntCircuit::constant` (low bits kept),
+            // so evaluation agrees with the SAT translation at `bitwidth`.
+            IntNode::Constant(v) => Ok(self.wrap(v as i128)),
             IntNode::OfExpr { op, expr } => {
                 let m = self.expr_set(arena, expr, env)?;
                 Ok(self.int_of_set(op, &m))
@@ -350,28 +447,7 @@ impl<'a> Evaluator<'a> {
             IntNode::Binary { op, left, right } => {
                 let l = self.int_value(arena, left, env)?;
                 let r = self.int_value(arena, right, env)?;
-                Ok(match op {
-                    IntBinOp::Plus => l.wrapping_add(r),
-                    IntBinOp::Minus => l.wrapping_sub(r),
-                    IntBinOp::Times => l.wrapping_mul(r),
-                    IntBinOp::Divide => {
-                        if r == 0 {
-                            return Err(EvalError::DivideByZero);
-                        }
-                        l.wrapping_div(r)
-                    }
-                    IntBinOp::Modulo => {
-                        if r == 0 {
-                            return Err(EvalError::DivideByZero);
-                        }
-                        l.wrapping_rem(r)
-                    }
-                    IntBinOp::And => l & r,
-                    IntBinOp::Or => l | r,
-                    IntBinOp::Xor => l ^ r,
-                    IntBinOp::Shl => l << (r as u32 % 64),
-                    IntBinOp::Shr => ((l as u64) >> (r as u32 % 64)) as i64,
-                })
+                self.apply_binop(op, l, r)
             }
             IntNode::If { cond, then, els } => {
                 if self.formula_bool(arena, cond, env)? {
@@ -384,7 +460,8 @@ impl<'a> Evaluator<'a> {
                 let decl_list = arena.decls(decls).to_vec();
                 let mut total = 0i64;
                 self.iter_decls(arena, &decl_list, env, &mut |ev, binding| {
-                    total += ev.int_value(arena, body, &binding)?;
+                    let b = ev.int_value(arena, body, &binding)?;
+                    total = ev.wrap(total as i128 + b as i128);
                     Ok(())
                 })?;
                 Ok(total)

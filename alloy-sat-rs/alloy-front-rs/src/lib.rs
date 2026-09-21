@@ -29,11 +29,11 @@ pub mod types;
 pub use ast::Scope;
 pub use ast::{
     BinOp, CmpKind, Command, CommandKind, Decl, Expr, Formula, IntBinOp, IntCmpOp, IntExpr, Module,
-    Open, OpenParam, OptSpec, PartialDef, PartialEntry, PartialOp, QuantKind, SigDecl, SigMult,
-    DEFAULT_INT_BITWIDTH, effective_bitwidth, effective_int_count, module_needs_int_atoms,
+    Open, OpenParam, OptSpec, OverflowMode, PartialDef, PartialEntry, PartialOp, QuantKind, SigDecl,
+    SigMult, DEFAULT_INT_BITWIDTH, effective_bitwidth, effective_int_count, module_needs_int_atoms,
 };
-pub use lower::{LoweredOpt, LoweredTarget, Lowerer, LoweredProblem};
-pub use cnf::{check, run, solve, solve_temporal, validate, validate_temporal, Cnf, CnfKind};
+pub use lower::{LoweredOpt, LoweredProblem, LoweredTarget, Lowerer, OptMarker, TimePoint};
+pub use cnf::{build_cnf_with, check, run, solve, solve_temporal, validate, validate_temporal, Cnf, CnfKind};
 pub use incremental::{IncrementalSession, MultKind, SessionStats};
 pub use partial::{verifier_pin_from_partial, PartialInstance, PartialInt, PartialRel};
 pub use cegis::{run_cegis, CegisConfig, CegisOutcome, CegisReport};
@@ -44,6 +44,7 @@ pub use alloy_kodkod_rs::tupleset::TupleSet;
 pub use alloy_kodkod_rs::instance::Instance;
 pub use alloy_kodkod_rs::opt::{Objective as KkObjective, OptSense as KkOptSense, OptSolution};
 
+use alloy_kodkod_rs::ast::IntId;
 use alloy_kodkod_rs::solver::Solution;
 use std::time::{Duration, Instant};
 
@@ -87,8 +88,9 @@ pub fn parse_module(src: &str) -> Result<Module, FrontError> {
 }
 
 /// True when command `index` must run through the optimizer: a
-/// `maximize`/`minimize` command, or a `run`/`check` whose facts or body
-/// carry AlloyMax soft nodes. Runs a cheap prepare to read the flag;
+/// `maximize`/`minimize` command, a `run`/`check` whose facts or body
+/// carry AlloyMax soft nodes, or one carrying an in-body
+/// `maximize`/`minimize` marker. Runs a cheap prepare to read the flags;
 /// lowering errors report false (the real path surfaces them).
 pub fn command_needs_opt(module: &Module, index: usize) -> bool {
     let cmd = match module.commands.get(index) {
@@ -103,43 +105,86 @@ pub fn command_needs_opt(module: &Module, index: usize) -> bool {
     }
     Lowerer::new(module)
         .prepare_command(index)
-        .map(|p| p.has_softs)
-        .unwrap_or(false)
+        .map(|p| p.has_softs || !p.markers.is_empty())
+        // A lowering error reports the flag from a shallow module-wide
+        // AST scan, so a broken marker still routes to the optimizer
+        // (which surfaces the real error) instead of looking like a
+        // plain run/check. The scan does not expand calls, so it is an
+        // over-approximation; that is harmless because it only kicks in
+        // when the command fails to lower anyway.
+        .unwrap_or_else(|_| module_has_opt_marker(module))
+}
+
+/// Shallow module-wide `maximize`/`minimize` marker scan (bodies, facts,
+/// `soft fact`s, sig facts; no call expansion, no lowering). Only the
+/// fallback for [`command_needs_opt`] when lowering fails.
+fn module_has_opt_marker(module: &Module) -> bool {
+    module.paras.iter().any(|p| p.body.has_opt_marker())
+        || module.facts.iter().any(|(_, f)| f.has_opt_marker())
+        || module.soft_facts.iter().any(|(_, f)| f.has_opt_marker())
+        || module
+            .sigs
+            .iter()
+            .filter_map(|sd| sd.fact.as_ref())
+            .any(|f| f.has_opt_marker())
 }
 
 /// Runs a `maximize`/`minimize` command end-to-end (translate + optimize).
 /// Also serves `run`/`check` commands whose bodies carry AlloyMax soft
-/// nodes (`maxsome` / `minsome`) or modules with `soft fact`s, using
-/// [`KkObjective::collected`]. Returns the optimal model and its exact
-/// cost. Errors on plain `run`/`check` commands (use [`run_command`]).
+/// nodes (`maxsome` / `minsome`), modules with `soft fact`s, or bodies
+/// carrying `maximize`/`minimize` markers. Returns the optimal model and
+/// its exact cost. Errors on plain `run`/`check` commands (use
+/// [`run_command`]).
 ///
-/// Temporal commands optimize over the time-expanded problem: the
-/// objective (and softs) must reference static relations only (var
-/// relations are uniformly excluded; mirror trace state into a static
-/// sig, e.g. `fact {goal Aopt = A}`, and optimize over the mirror).
+/// Temporal commands optimize over the time-expanded problem. A marker
+/// objective is evaluated at the trace state pinned by the enclosing
+/// `initially` (first state) / `goal` (last state) / `restore` (loop
+/// state) operator, so its variable relations are projected to that
+/// state. Command-level objectives (`maximize:`) and soft constraints
+/// still reference static relations only (mirror trace state into a
+/// static sig, e.g. `fact {goal Aopt = A}`).
 /// On SAT the returned solution carries the projected lasso trace in
 /// `temporal` (with `instance` holding the flat expanded model).
 pub fn run_opt_command(module: &Module, index: usize) -> Result<OptSolution, FrontError> {
+    run_opt_command_with(module, index, true)
+}
+
+/// [`run_opt_command`] with explicit overflow handling (`false` is pure
+/// wrapping). Used by the REPL two-phase optimization (gated optimum
+/// first, wrapping fallback). A `some Overflow` marker forces wrapping;
+/// `some Overflow` on a temporal command is rejected (no CEGAR there).
+pub fn run_opt_command_with(
+    module: &Module,
+    index: usize,
+    no_overflow: bool,
+) -> Result<OptSolution, FrontError> {
+    if module.is_temporal_command(index) {
+        return run_opt_temporal_with(module, index, no_overflow);
+    }
     let mut lower = Lowerer::new(module);
     let problem = lower.prepare_command(index)?;
-    let kk_objective = match problem.objective.clone() {
-        Some(objective) => match (objective.sense, objective.target) {
-            (KkOptSense::Maximize, LoweredTarget::Int(id)) => KkObjective::max_int(id),
-            (KkOptSense::Minimize, LoweredTarget::Int(id)) => KkObjective::min_int(id),
-            (KkOptSense::Maximize, LoweredTarget::Weighted(w)) => KkObjective::max_weighted(w),
-            (KkOptSense::Minimize, LoweredTarget::Weighted(w)) => KkObjective::min_weighted(w),
-        },
-        None if problem.has_softs => KkObjective::collected(),
-        None => {
-            return Err(FrontError::Resolve(format!(
-                "command #{index} is not maximize/minimize and carries no soft constraints (use run_command)"
-            )));
-        }
-    };
+    run_opt_static_with(index, problem, no_overflow)
+}
 
-    if module.is_temporal_command(index) {
-        return run_opt_temporal(module, index, problem, kk_objective);
-    }
+/// Static half of [`run_opt_command_with`].
+fn run_opt_static_with(
+    index: usize,
+    problem: LoweredProblem,
+    no_overflow: bool,
+) -> Result<OptSolution, FrontError> {
+    // Explicit `some`/`no Overflow` markers take precedence over the
+    // caller's flag (mirrors `build_cnf`).
+    let no_overflow = match problem.overflow {
+        Some(OverflowMode::Some) => false,
+        Some(OverflowMode::No) => true,
+        None => no_overflow,
+    };
+    let marker_targets: Vec<(IntId, KkOptSense)> = problem
+        .markers
+        .iter()
+        .map(|m| (m.target, m.sense))
+        .collect();
+    let kk_objective = resolve_objective(index, &problem, &marker_targets)?;
 
     let mut arena = problem.arena;
     let mut bounds = problem.bounds;
@@ -157,6 +202,7 @@ pub fn run_opt_command(module: &Module, index: usize) -> Result<OptSolution, Fro
         alloy_kodkod_rs::solver::Solver::with_options(alloy_kodkod_rs::solver::SolverOptions {
             bitwidth: problem.bitwidth,
             skolemize: false, // already applied above
+            no_overflow,
             ..Default::default()
         });
     solver
@@ -164,18 +210,41 @@ pub fn run_opt_command(module: &Module, index: usize) -> Result<OptSolution, Fro
         .map_err(FrontError::Solve)
 }
 
-/// Temporal half of [`run_opt_command`]: expands the bounds, rewrites the
+/// Temporal half of [`run_opt_command_with`]: expands the bounds, rewrites the
 /// formula, and optimizes over the static expanded problem.
-fn run_opt_temporal(
+fn run_opt_temporal_with(
     module: &Module,
     index: usize,
-    problem: LoweredProblem,
-    kk_objective: KkObjective,
+    no_overflow: bool,
+) -> Result<OptSolution, FrontError> {
+    let mut lower = Lowerer::new(module);
+    let problem = lower.prepare_command(index)?;
+    // `some Overflow` seeks an overflowing trace via a CEGAR loop that
+    // only exists for static problems; reject loudly for temporal ones.
+    if problem.overflow == Some(OverflowMode::Some) {
+        return Err(FrontError::Resolve(
+            "`some Overflow` is not supported for temporal commands yet (use a static `run`)".to_string(),
+        ));
+    }
+    if problem.overflow == Some(OverflowMode::No) {
+        // Explicit marker pins the mode regardless of the caller's flag.
+        return run_opt_temporal_inner(module, index, problem, true);
+    }
+    run_opt_temporal_inner(module, index, problem, no_overflow)
+}
+
+fn run_opt_temporal_inner(
+    module: &Module,
+    index: usize,
+    mut problem: LoweredProblem,
+    no_overflow: bool,
 ) -> Result<OptSolution, FrontError> {
     use alloy_kodkod_rs::temporal::{
         add_witness_relation, collect_witness_specs, expand_bounds, extract_temporal_instance,
         translate_temporal_formula,
     };
+
+    let markers = std::mem::take(&mut problem.markers);
 
     // Soft objectives are collected implicitly across the whole formula,
     // so per-reference auditing is unreliable: uniformly out of scope.
@@ -184,24 +253,32 @@ fn run_opt_temporal(
             "temporal optimization with soft constraints (maxsome/minsome/soft fact) is not supported; use an explicit maximize:/minimize: over static relations".into(),
         ));
     }
-    // Variable relations are uniformly excluded from temporal objectives:
-    // the original relation id is unbound after expansion.
-    {
-        let mut refs = std::collections::HashSet::new();
-        collect_opt_relations(&problem.arena, &problem.objective, &mut refs);
-        let mut vars: Vec<String> = refs
-            .into_iter()
-            .filter(|r| problem.arena.is_variable(*r))
-            .map(|r| problem.bounds.pool().name(r).to_string())
-            .collect();
-        vars.sort();
-        if !vars.is_empty() {
-            return Err(FrontError::Unsupported(format!(
-                "temporal objective references variable relation(s) {}; optimize over static relations only (mirror var state via goal/initially into a static sig, e.g. fact {{goal Aopt = A}})",
-                vars.join(", ")
-            )));
+    // Objective for the temporal states.
+    //
+    // Markers carry the trace state they are evaluated at (pinned by the
+    // enclosing `initially`/`goal`/`restore`), so their variable
+    // relations are projected to that state below. A command-level
+    // objective has no state annotation: keep the static-only rule.
+    let static_objective = if markers.is_empty() {
+        reject_var_objective(&problem)?;
+        Some(resolve_objective(index, &problem, &[])?)
+    } else {
+        for m in &markers {
+            if m.time.is_none() {
+                let kw = if m.sense == KkOptSense::Maximize {
+                    "maximize"
+                } else {
+                    "minimize"
+                };
+                return Err(FrontError::Unsupported(format!(
+                    "`{kw}` in a temporal command needs a trace state; wrap the target in \
+                     `initially` (first state), `goal` (last state) or `restore` (loop state), \
+                     e.g. `goal ({kw} X)`"
+                )));
+            }
         }
-    }
+        None
+    };
 
     let steps = module.temporal_steps(index);
     let mut arena = problem.arena;
@@ -235,10 +312,22 @@ fn run_opt_temporal(
     .map_err(|e| FrontError::Solve(e.into()))?;
     let bounds = expansion.bounds.clone();
 
+    // Marker objectives: rewrite every variable relation to its value at
+    // the marker's trace state (`r$t . $t_first|$t_last|$t_loop`), which
+    // leaves the existing static objective path untouched.
+    let kk_objective = match static_objective {
+        Some(objective) => objective,
+        None => {
+            let targets = rewrite_marker_targets(&mut arena, &expansion, &markers)?;
+            marker_objective(&targets)
+        }
+    };
+
     let solver =
         alloy_kodkod_rs::solver::Solver::with_options(alloy_kodkod_rs::solver::SolverOptions {
             bitwidth: problem.bitwidth,
             skolemize: false, // witnesses already applied above
+            no_overflow,
             ..Default::default()
         });
     let mut sol = solver
@@ -251,6 +340,153 @@ fn run_opt_temporal(
         }
     }
     Ok(sol)
+}
+
+/// Objective of a command: the `maximize:`/`minimize:` command form,
+/// else the in-body markers, else translation-collected softs.
+fn resolve_objective(
+    index: usize,
+    problem: &LoweredProblem,
+    markers: &[(IntId, KkOptSense)],
+) -> Result<KkObjective, FrontError> {
+    if let Some(objective) = &problem.objective {
+        return Ok(match (&objective.sense, &objective.target) {
+            (KkOptSense::Maximize, LoweredTarget::Int(id)) => KkObjective::max_int(*id),
+            (KkOptSense::Minimize, LoweredTarget::Int(id)) => KkObjective::min_int(*id),
+            (KkOptSense::Maximize, LoweredTarget::Weighted(w)) => {
+                KkObjective::max_weighted(w.clone())
+            }
+            (KkOptSense::Minimize, LoweredTarget::Weighted(w)) => {
+                KkObjective::min_weighted(w.clone())
+            }
+        });
+    }
+    if !markers.is_empty() {
+        return Ok(marker_objective(markers));
+    }
+    if problem.has_softs {
+        return Ok(KkObjective::collected());
+    }
+    Err(FrontError::Resolve(format!(
+        "command #{index} is not maximize/minimize and carries no soft constraints (use run_command)"
+    )))
+}
+
+/// Objective pooled from in-body `maximize`/`minimize` markers. A single
+/// target keeps the exact single-objective path; several pool their
+/// bit-weight soft units with each marker's own sense.
+///
+/// Weights are the targets' own (bit weights for an `Int` target), so
+/// relative influence is expressed in the target expressions themselves
+/// (e.g. `maximize (2*#A + #B)`) rather than by a separate weight syntax.
+fn marker_objective(markers: &[(IntId, KkOptSense)]) -> KkObjective {
+    if let [(id, sense)] = markers {
+        return match sense {
+            KkOptSense::Maximize => KkObjective::max_int(*id),
+            KkOptSense::Minimize => KkObjective::min_int(*id),
+        };
+    }
+    KkObjective::ints(markers.to_vec())
+}
+
+/// Relation ids referenced by one integer target (reuses the objective
+/// walker for the temporal marker projection).
+fn collect_target_relations(
+    arena: &alloy_kodkod_rs::AstArena,
+    target: IntId,
+    out: &mut std::collections::HashSet<alloy_kodkod_rs::RelationId>,
+) {
+    let tmp = Some(LoweredOpt {
+        sense: KkOptSense::Maximize,
+        target: LoweredTarget::Int(target),
+    });
+    collect_opt_relations(arena, &tmp, out);
+}
+
+/// Rejects a temporal command-level objective (`maximize:`) that
+/// references variable relations: unlike markers, it has no trace state
+/// annotation, so the original relation id is unbound after expansion.
+fn reject_var_objective(problem: &LoweredProblem) -> Result<(), FrontError> {
+    let mut refs = std::collections::HashSet::new();
+    collect_opt_relations(&problem.arena, &problem.objective, &mut refs);
+    let mut vars: Vec<String> = refs
+        .into_iter()
+        .filter(|r| problem.arena.is_variable(*r))
+        .map(|r| problem.bounds.pool().name(r).to_string())
+        .collect();
+    vars.sort();
+    if vars.is_empty() {
+        return Ok(());
+    }
+    Err(FrontError::Unsupported(format!(
+        "temporal objective references variable relation(s) {}; optimize over static relations \
+         only (mirror var state via goal/initially into a static sig, e.g. fact {{goal Aopt = A}}), \
+         or write the target as an in-body marker (`goal (maximize X)`)",
+        vars.join(", ")
+    )))
+}
+
+/// Rewrites every variable relation of each marker target to its value at
+/// the marker's trace state: `r` becomes `r$t . $t_first|$t_last|$t_loop`
+/// (the same projection the temporal translator uses for `T::At(t)`).
+/// Static relations are left untouched, so the result can go through the
+/// existing static objective path.
+fn rewrite_marker_targets(
+    arena: &mut alloy_kodkod_rs::AstArena,
+    expansion: &alloy_kodkod_rs::temporal::TemporalExpansion,
+    markers: &[OptMarker],
+) -> Result<Vec<(IntId, KkOptSense)>, FrontError> {
+    use alloy_kodkod_rs::ast::BinaryOp;
+    let mut out = Vec::with_capacity(markers.len());
+    let mut cache: std::collections::HashMap<
+        (u32, TimePoint),
+        std::collections::HashMap<alloy_kodkod_rs::RelationId, alloy_kodkod_rs::ast::ExprId>,
+    > = std::collections::HashMap::new();
+    for m in markers {
+        // Checked by the caller: a temporal command needs a trace state.
+        let tp = m.time.ok_or_else(|| {
+            FrontError::Unsupported(
+                "`maximize`/`minimize` in a temporal command needs a trace state \
+                 (`initially` / `goal` / `restore`)"
+                    .into(),
+            )
+        })?;
+        let map = match cache.get(&(m.target.0, tp)) {
+            Some(m) => m.clone(),
+            None => {
+                let state = match tp {
+                    TimePoint::First => expansion.ids.first,
+                    TimePoint::Last => expansion.ids.last,
+                    TimePoint::Loop => expansion.ids.loop_,
+                };
+                let mut refs = std::collections::HashSet::new();
+                collect_target_relations(arena, m.target, &mut refs);
+                let mut map = std::collections::HashMap::new();
+                for r in refs {
+                    if !arena.is_variable(r) {
+                        continue;
+                    }
+                    let exp = expansion.mapping.get(&r).copied().ok_or_else(|| {
+                        FrontError::Unsupported(format!(
+                            "internal: variable relation `{}` has no temporal expansion",
+                            arena.relation_name(r)
+                        ))
+                    })?;
+                    let left = arena.expr_relation(exp);
+                    let right = arena.expr_relation(state);
+                    let joined = arena
+                        .binary_expr(BinaryOp::Join, left, right)
+                        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                    map.insert(r, joined);
+                }
+                cache.insert((m.target.0, tp), map.clone());
+                map
+            }
+        };
+        let target = alloy_kodkod_rs::ast::subst_relation_int(arena, m.target, &map);
+        out.push((target, m.sense));
+    }
+    Ok(out)
 }
 
 /// Collects every relation id referenced by an optimization target
@@ -394,6 +630,20 @@ pub enum OptTarget {
 /// Cnf bounds' pool. The stored (possibly skolemized) formula is used
 /// as-is, so no extra skolem step is needed here.
 pub fn optimize(module: &Module, cnf: &Cnf, target: &OptTarget) -> Result<OptSolution, FrontError> {
+    optimize_with(module, cnf, target, true)
+}
+
+/// [`optimize`] with explicit overflow handling (`false` is pure
+/// wrapping). A `some Overflow` Cnf is already built wrapping; callers
+/// pass `false` for it (the OLL loop itself has no CEGAR, so the
+/// optimum is a wrapping optimum with an evaluator note, not a
+/// guaranteed-overflowing one).
+pub fn optimize_with(
+    module: &Module,
+    cnf: &Cnf,
+    target: &OptTarget,
+    no_overflow: bool,
+) -> Result<OptSolution, FrontError> {
     if cnf.is_temporal {
         return Err(FrontError::Unsupported(
             "temporal Cnfs cannot be optimized (objectives over traces are undefined)".into(),
@@ -462,6 +712,7 @@ pub fn optimize(module: &Module, cnf: &Cnf, target: &OptTarget) -> Result<OptSol
     let solver =
         alloy_kodkod_rs::solver::Solver::with_options(alloy_kodkod_rs::solver::SolverOptions {
             bitwidth: cnf.bitwidth,
+            no_overflow,
             ..Default::default()
         });
     solver
@@ -479,10 +730,23 @@ pub fn run_command(module: &Module, index: usize) -> Result<Solution, FrontError
     let problem = lower.prepare_command(index)?;
 
     // AlloyMax softs need the optimizer (plain SAT would silently drop
-    // them, and the temporal path cannot see them at all).
+    // them, and the temporal path cannot see them at all). Same for an
+    // in-body `maximize`/`minimize` marker, whose hard meaning is true.
     if problem.has_softs {
         return Err(FrontError::Resolve(format!(
             "command #{index} carries soft constraints (maxsome/minsome/soft fact); use run_opt_command"
+        )));
+    }
+    if !problem.markers.is_empty() {
+        return Err(FrontError::Resolve(format!(
+            "command #{index} carries an optimization target (`maximize`/`minimize` in its body); use run_opt_command"
+        )));
+    }
+    // `some Overflow` needs the CEGAR search on the `Cnf` path; solving
+    // the bare body here would silently degrade to a prohibited search.
+    if problem.overflow == Some(OverflowMode::Some) {
+        return Err(FrontError::Resolve(format!(
+            "command #{index} uses `some Overflow`; solve it via `:solve` on a `:run`-built Cnf instead of `als`"
         )));
     }
 

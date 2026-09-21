@@ -5,6 +5,15 @@ use crate::bool::{const_false, const_true, BoolRef};
 pub struct IntCircuit {
     pub bits: Vec<BoolRef>,
     ctx: BoolCtx,
+    /// True when a `Signed` value contributed to this circuit.
+    /// Only tainted circuits produce arithmetic overflow signals;
+    /// pure-`Int` circuits stay wrapping with `FALSE` overflow.
+    tainted: bool,
+    /// Overflow of this operation alone (FALSE when untainted,
+    /// except division-by-zero which is always active).
+    overflow: BoolRef,
+    /// Transitive OR of all upstream overflows (incl. division-by-zero).
+    accum_overflow: BoolRef,
 }
 
 fn xor2(ctx: &BoolCtx, a: BoolRef, b: BoolRef) -> BoolRef {
@@ -40,6 +49,9 @@ impl IntCircuit {
         IntCircuit {
             bits,
             ctx: ctx.clone(),
+            tainted: false,
+            overflow: const_false(),
+            accum_overflow: const_false(),
         }
     }
 
@@ -47,7 +59,36 @@ impl IntCircuit {
         IntCircuit {
             bits,
             ctx: ctx.clone(),
+            tainted: false,
+            overflow: const_false(),
+            accum_overflow: const_false(),
         }
+    }
+
+    /// Mark this circuit as `Signed`-derived. Chained by `fol` translation.
+    pub fn with_taint(mut self, tainted: bool) -> IntCircuit {
+        self.tainted = tainted;
+        self
+    }
+
+    pub fn is_tainted(&self) -> bool {
+        self.tainted
+    }
+
+    pub fn overflow(&self) -> BoolRef {
+        self.overflow
+    }
+
+    pub fn accum_overflow(&self) -> BoolRef {
+        self.accum_overflow
+    }
+
+    fn merged_accum(&self, other: &IntCircuit, fresh: BoolRef) -> BoolRef {
+        self.ctx.or(&[
+            self.accum_overflow,
+            other.accum_overflow,
+            fresh,
+        ])
     }
 
     pub fn zero(ctx: &BoolCtx) -> IntCircuit {
@@ -87,12 +128,31 @@ impl IntCircuit {
         );
         let mut out = Vec::with_capacity(width);
         let mut carry = const_false();
+        let mut c1 = const_false();
+        let mut c2 = const_false();
         for i in 0..width {
             let (v0, v1) = (self.bit(i), other.bit(i));
             out.push(sum3(&self.ctx, v0, v1, carry));
             carry = carry3(&self.ctx, v0, v1, carry);
+            if i + 2 == width {
+                c2 = carry;
+            } else if i + 1 == width {
+                c1 = carry;
+            }
         }
-        IntCircuit::from_bits(out, &self.ctx)
+        let tainted = self.tainted || other.tainted;
+        // Java TwosComplementInt.plus: c1 XOR c2, only when width == bitwidth.
+        let fresh = if tainted && width == bitwidth as usize {
+            xor2(&self.ctx, c1, c2)
+        } else {
+            const_false()
+        };
+        let accum = self.merged_accum(other, fresh);
+        let mut ret = IntCircuit::from_bits(out, &self.ctx);
+        ret.tainted = tainted;
+        ret.overflow = fresh;
+        ret.accum_overflow = accum;
+        ret
     }
 
     pub fn sub(&self, other: &IntCircuit, bitwidth: u32) -> IntCircuit {
@@ -102,12 +162,30 @@ impl IntCircuit {
         );
         let mut out = Vec::with_capacity(width);
         let mut carry = const_true();
+        let mut c1 = const_false();
+        let mut c2 = const_false();
         for i in 0..width {
             let (v0, v1) = (self.bit(i), self.ctx.not(other.bit(i)));
             out.push(sum3(&self.ctx, v0, v1, carry));
             carry = carry3(&self.ctx, v0, v1, carry);
+            if i + 2 == width {
+                c2 = carry;
+            } else if i + 1 == width {
+                c1 = carry;
+            }
         }
-        IntCircuit::from_bits(out, &self.ctx)
+        let tainted = self.tainted || other.tainted;
+        let fresh = if tainted && width == bitwidth as usize {
+            xor2(&self.ctx, c1, c2)
+        } else {
+            const_false()
+        };
+        let accum = self.merged_accum(other, fresh);
+        let mut ret = IntCircuit::from_bits(out, &self.ctx);
+        ret.tainted = tainted;
+        ret.overflow = fresh;
+        ret.accum_overflow = accum;
+        ret
     }
 
     pub fn mul(&self, other: &IntCircuit, bitwidth: u32) -> IntCircuit {
@@ -142,8 +220,25 @@ impl IntCircuit {
         }
 
         let width = std::cmp::min(ret_width, bitwidth as usize);
+        // Java TwosComplementInt.multiply: XOR chain over truncated high bits.
+        // Skipped entirely for untainted (pure-Int) circuits: zero extra gates.
+        let tainted = self.tainted || other.tainted;
+        let fresh = if tainted && width < ret_width {
+            let mut acc = const_false();
+            for i in width..ret_width {
+                acc = self.ctx.or(&[acc, xor2(&self.ctx, mult[i - 1], mult[i])]);
+            }
+            acc
+        } else {
+            const_false()
+        };
+        let accum = self.merged_accum(other, fresh);
         mult.truncate(width);
-        IntCircuit::from_bits(mult, &self.ctx)
+        let mut ret = IntCircuit::from_bits(mult, &self.ctx);
+        ret.tainted = tainted;
+        ret.overflow = fresh;
+        ret.accum_overflow = accum;
+        ret
     }
 
     fn non_restoring_division(
@@ -219,12 +314,62 @@ impl IntCircuit {
 
     pub fn div(&self, other: &IntCircuit, bitwidth: u32) -> IntCircuit {
         let bits = self.non_restoring_division(other, true, bitwidth);
-        IntCircuit::from_bits(bits, &self.ctx)
+        let mut ret = IntCircuit::from_bits(bits, &self.ctx);
+        let (fresh, accum) = self.div_overflow(other, bitwidth);
+        ret.tainted = self.tainted || other.tainted;
+        ret.overflow = fresh;
+        ret.accum_overflow = accum;
+        ret
     }
 
     pub fn rem(&self, other: &IntCircuit, bitwidth: u32) -> IntCircuit {
         let bits = self.non_restoring_division(other, false, bitwidth);
-        IntCircuit::from_bits(bits, &self.ctx)
+        let mut ret = IntCircuit::from_bits(bits, &self.ctx);
+        let (fresh, accum) = self.div_overflow(other, bitwidth);
+        ret.tainted = self.tainted || other.tainted;
+        ret.overflow = fresh;
+        ret.accum_overflow = accum;
+        ret
+    }
+
+    /// `overflow = divByZero OR (tainted AND INT_MIN/-1)`.
+    /// Division-by-zero is UNSAT regardless of `Signed` taint (agreed spec);
+    /// the `INT_MIN / -1` case only fires for tainted circuits.
+    fn div_overflow(&self, other: &IntCircuit, bitwidth: u32) -> (BoolRef, BoolRef) {
+        let w = bitwidth as usize;
+        let mut or_inputs = Vec::with_capacity(w);
+        for i in 0..w {
+            or_inputs.push(other.bit(i));
+        }
+        let any_nonzero = self.ctx.or(&or_inputs);
+        let div_by_zero = self.ctx.not(any_nonzero);
+        let tainted = self.tainted || other.tainted;
+        let fresh = if tainted {
+            let min = IntCircuit::constant(i64::MIN >> (64 - w as u32), w as u32, &self.ctx);
+            let neg_one = IntCircuit::constant(-1, w as u32, &self.ctx);
+            // self == INT_MIN AND other == -1; constants are untainted so
+            // `eq` here is a pure comparison (no gating recursion).
+            let is_min = self.raw_eq(&min);
+            let is_neg_one = other.raw_eq(&neg_one);
+            let single = self.ctx.and(&[is_min, is_neg_one]);
+            self.ctx.or(&[div_by_zero, single])
+        } else {
+            div_by_zero
+        };
+        let accum = self.merged_accum(other, fresh);
+        (fresh, accum)
+    }
+
+    /// Pure bitwise equality without overflow gating (helper for div_overflow).
+    fn raw_eq(&self, other: &IntCircuit) -> BoolRef {
+        let width = std::cmp::max(self.width(), other.width());
+        let mut acc = const_true();
+        for i in 0..width {
+            acc = self
+                .ctx
+                .and(&[acc, iff(&self.ctx, self.bit(i), other.bit(i))]);
+        }
+        acc
     }
 
     pub fn neg(&self, bitwidth: u32) -> IntCircuit {
@@ -233,31 +378,38 @@ impl IntCircuit {
 
     pub fn bit_not(&self) -> IntCircuit {
         let bits = self.bits.iter().map(|&b| self.ctx.not(b)).collect();
-        IntCircuit::from_bits(bits, &self.ctx)
+        let mut ret = IntCircuit::from_bits(bits, &self.ctx);
+        ret.tainted = self.tainted;
+        ret.overflow = const_false();
+        ret.accum_overflow = self.accum_overflow;
+        ret
+    }
+
+    fn bitwise(&self, other: &IntCircuit, f: impl Fn(BoolRef, BoolRef) -> BoolRef) -> IntCircuit {
+        let width = std::cmp::max(self.width(), other.width());
+        let mut ret = IntCircuit::from_bits(
+            (0..width).map(|i| f(self.bit(i), other.bit(i))).collect(),
+            &self.ctx,
+        );
+        ret.tainted = self.tainted || other.tainted;
+        ret.overflow = const_false();
+        ret.accum_overflow = self.ctx.or(&[self.accum_overflow, other.accum_overflow]);
+        ret
     }
 
     pub fn bit_and(&self, other: &IntCircuit) -> IntCircuit {
-        let width = std::cmp::max(self.width(), other.width());
-        let bits = (0..width)
-            .map(|i| self.ctx.and(&[self.bit(i), other.bit(i)]))
-            .collect();
-        IntCircuit::from_bits(bits, &self.ctx)
+        let ctx = self.ctx.clone();
+        self.bitwise(other, |a, b| ctx.and(&[a, b]))
     }
 
     pub fn bit_or(&self, other: &IntCircuit) -> IntCircuit {
-        let width = std::cmp::max(self.width(), other.width());
-        let bits = (0..width)
-            .map(|i| self.ctx.or(&[self.bit(i), other.bit(i)]))
-            .collect();
-        IntCircuit::from_bits(bits, &self.ctx)
+        let ctx = self.ctx.clone();
+        self.bitwise(other, |a, b| ctx.or(&[a, b]))
     }
 
     pub fn bit_xor(&self, other: &IntCircuit) -> IntCircuit {
-        let width = std::cmp::max(self.width(), other.width());
-        let bits = (0..width)
-            .map(|i| xor2(&self.ctx, self.bit(i), other.bit(i)))
-            .collect();
-        IntCircuit::from_bits(bits, &self.ctx)
+        let ctx = self.ctx.clone();
+        self.bitwise(other, |a, b| xor2(&ctx, a, b))
     }
 
     pub fn shl(&self, other: &IntCircuit, bitwidth: u32) -> IntCircuit {
@@ -277,7 +429,11 @@ impl IntCircuit {
                 }
             }
         }
-        IntCircuit::from_bits(shifted, &self.ctx)
+        // TODO(Iter2): shift-out overflow detection (Java accumulate port).
+        let mut ret = IntCircuit::from_bits(shifted, &self.ctx);
+        ret.tainted = self.tainted || other.tainted;
+        ret.accum_overflow = self.ctx.or(&[self.accum_overflow, other.accum_overflow]);
+        ret
     }
 
     fn shr_with_fill(&self, other: &IntCircuit, fill_bit: BoolRef, bitwidth: u32) -> IntCircuit {
@@ -297,7 +453,10 @@ impl IntCircuit {
                 shifted[j] = self.ctx.ite(bit, moved, shifted[j]);
             }
         }
-        IntCircuit::from_bits(shifted, &self.ctx)
+        let mut ret = IntCircuit::from_bits(shifted, &self.ctx);
+        ret.tainted = self.tainted || other.tainted;
+        ret.accum_overflow = self.ctx.or(&[self.accum_overflow, other.accum_overflow]);
+        ret
     }
 
     pub fn shr(&self, other: &IntCircuit, bitwidth: u32) -> IntCircuit {
@@ -314,18 +473,15 @@ impl IntCircuit {
         let bits = (0..width)
             .map(|i| self.ctx.ite(condition, self.bit(i), other.bit(i)))
             .collect();
-        IntCircuit::from_bits(bits, &self.ctx)
+        let mut ret = IntCircuit::from_bits(bits, &self.ctx);
+        ret.tainted = self.tainted || other.tainted;
+        ret.overflow = const_false();
+        ret.accum_overflow = self.ctx.or(&[self.accum_overflow, other.accum_overflow]);
+        ret
     }
 
     pub fn eq(&self, other: &IntCircuit) -> BoolRef {
-        let width = std::cmp::max(self.width(), other.width());
-        let mut acc = const_true();
-        for i in 0..width {
-            acc = self
-                .ctx
-                .and(&[acc, iff(&self.ctx, self.bit(i), other.bit(i))]);
-        }
-        acc
+        self.raw_eq(other)
     }
 
     pub fn lte(&self, other: &IntCircuit) -> BoolRef {
