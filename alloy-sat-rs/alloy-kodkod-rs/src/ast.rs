@@ -93,6 +93,11 @@ pub enum CastToIntOp {
     /// (non-negative `v` below the circuit width; anything else is
     /// ignored). Inverse-ish of the frontend's bitset reading.
     Bits,
+    /// Bit-vector value over a dedicated bit-lane group (see
+    /// `Bounds::bound_exactly_int_in`): same bitmask reading as [`CastToIntOp::Bits`]
+    /// but with the group's own value namespace and MSB top, so lanes
+    /// never pollute each other's readings. Group 0 == [`CastToIntOp::Bits`].
+    BitsIn(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -388,50 +388,78 @@ impl<'a> Evaluator<'a> {
                 }
                 self.wrap(total)
             }
-            CastToIntOp::Bits => {
-                // Bit-vector value with signed MSB weight:
-                // Σ weight(v), weight(v) = -2^(W-1) for the top
-                // atom (W-1), +2^v otherwise. Resolve int atoms by
-                // the integer layer, or by universe name.
-                let mut max_val: i64 = -1;
-                for (val, _) in self.instance.int_tuples() {
-                    max_val = max_val.max(val);
-                }
-                for idx in 0..self.instance.universe().size() {
-                    if let Ok(atom) = self.instance.universe().atom(idx) {
-                        if let Ok(v) = atom.parse::<i64>() {
-                            max_val = max_val.max(v);
-                        }
-                    }
-                }
-                let top = max_val; // W - 1
-                let weight_of = |v: i64| -> Option<i64> { crate::int::bit_weight(v, top) };
-                let mut total = 0i128;
-                let mut layered = false;
-                for (val, ts) in self.instance.int_tuples() {
-                    layered = true;
-                    for idx in ts.index_view().iter() {
-                        if m.contains_index(idx) {
-                            if let Some(wt) = weight_of(val) {
-                                total += wt as i128;
-                            }
-                        }
-                    }
-                }
-                if !layered {
-                    for idx in m.index_view().iter() {
-                        if let Ok(atom) = self.instance.universe().atom(idx as usize) {
-                            if let Ok(v) = atom.parse::<i64>() {
-                                if let Some(wt) = weight_of(v) {
-                                    total += wt as i128;
-                                }
-                            }
-                        }
-                    }
-                }
-                self.wrap(total)
+            CastToIntOp::Bits => self.bits_of_set(crate::bounds::INT_BITS_GROUP, m),
+            CastToIntOp::BitsIn(group) => self.bits_of_set(group, m),
+        }
+    }
+
+    /// Bit-vector value with signed MSB weight over one int-bound group:
+    /// Σ weight(v), weight(v) = -2^(W-1) for the top atom (W-1),
+    /// +2^v otherwise. Lane groups resolve through the instance lane
+    /// layer; the builtin group additionally falls back to universe-name
+    /// parsing (solve-derived instances leave the integer layer empty).
+    pub(crate) fn bits_of_set(&self, group: u32, m: &TupleSet) -> i64 {
+        use crate::bounds::INT_BITS_GROUP;
+        // (values, layered): the group's (value -> atoms) pairs plus
+        // whether they came from the integer layer at all.
+        let mut pairs: Vec<(i64, Vec<i64>)> = Vec::new();
+        let mut layered = false;
+        if group == INT_BITS_GROUP {
+            for (val, ts) in self.instance.int_tuples() {
+                layered = true;
+                pairs.push((val, ts.index_view().iter().collect()));
+            }
+        } else {
+            let mut any = false;
+            for (val, ts) in self.instance.lane_int_tuples(group) {
+                any = true;
+                pairs.push((val, ts.index_view().iter().collect()));
+            }
+            layered = any;
+            // No name-parsing fallback for lanes: lane atoms (`M$0`, ...)
+            // are not numeric, and folding them into the global top would
+            // corrupt builtin readings. Absent layer reads as empty (0).
+            if !layered {
+                return self.wrap(0);
             }
         }
+        let mut max_val: i64 = -1;
+        for (val, _) in &pairs {
+            max_val = max_val.max(*val);
+        }
+        if group == INT_BITS_GROUP {
+            for idx in 0..self.instance.universe().size() {
+                if let Ok(atom) = self.instance.universe().atom(idx) {
+                    if let Ok(v) = atom.parse::<i64>() {
+                        max_val = max_val.max(v);
+                    }
+                }
+            }
+        }
+        let top = max_val; // W - 1
+        let weight_of = |v: i64| -> Option<i64> { crate::int::bit_weight(v, top) };
+        let mut total = 0i128;
+        for (val, idxs) in &pairs {
+            for idx in idxs {
+                if m.contains_index(*idx) {
+                    if let Some(wt) = weight_of(*val) {
+                        total += wt as i128;
+                    }
+                }
+            }
+        }
+        if group == INT_BITS_GROUP && !layered {
+            for idx in m.index_view().iter() {
+                if let Ok(atom) = self.instance.universe().atom(idx as usize) {
+                    if let Ok(v) = atom.parse::<i64>() {
+                        if let Some(wt) = weight_of(v) {
+                            total += wt as i128;
+                        }
+                    }
+                }
+            }
+        }
+        self.wrap(total)
     }
 
     pub fn int_value(&self, arena: &AstArena, i: IntId, env: &Env) -> Result<i64, EvalError> {

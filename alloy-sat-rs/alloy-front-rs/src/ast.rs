@@ -68,6 +68,9 @@ pub enum Expr {
     /// the E-bit wrap of n is set}`, so `Bits(7)` is `{0, 1, 2}`. Built by
     /// the parser for `=`/`!=` with a numeric-literal side.
     Bits(i64, usize),
+    /// Decimal real literal: exact source text (e.g. `3.14`), only valid
+    /// inside `setEReal` (rejected at lowering elsewhere). Never rounded.
+    RealLit(String, usize),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Transpose(Box<Expr>),
     TClosure(Box<Expr>),
@@ -455,7 +458,7 @@ impl Expr {
             | Expr::Iden
             | Expr::IntAtom
             | Expr::StepAtom
-            | Expr::Bits(..) => false,
+            | Expr::Bits(..) | Expr::RealLit(..) => false,
             Expr::LetBind(binds, body) => {
                 body.has_temporal() || binds.iter().any(|(_, e)| e.has_temporal())
             }
@@ -489,7 +492,7 @@ impl Expr {
             | Expr::Iden
             | Expr::IntAtom
             | Expr::StepAtom
-            | Expr::Bits(..) => false,
+            | Expr::Bits(..) | Expr::RealLit(..) => false,
         }
     }
 
@@ -522,7 +525,7 @@ impl Expr {
             | Expr::Iden
             | Expr::IntAtom
             | Expr::StepAtom
-            | Expr::Bits(..) => false,
+            | Expr::Bits(..) | Expr::RealLit(..) => false,
         }
     }
 }
@@ -852,7 +855,7 @@ pub(crate) fn scan_expr_int_set(e: &Expr, needs: &mut bool) {
         {
             *needs = true;
         }
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::StepAtom => {}
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::StepAtom | Expr::RealLit(..) => {}
         Expr::Bin(_, a, b) => {
             scan_expr_int_set(a, needs);
             scan_expr_int_set(b, needs);

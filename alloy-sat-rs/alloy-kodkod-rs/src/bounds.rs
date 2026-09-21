@@ -26,6 +26,12 @@ pub enum BoundsError {
     IntBoundNotSingleton(usize),
 }
 
+/// Group id of the builtin `Int` bit atoms in the int-bound registry.
+/// Other groups host dedicated bit lanes (e.g. EReal `m/e/p/k` atoms);
+/// each group has its own value namespace and MSB top, so lanes never
+/// pollute each other's bitmask readings.
+pub const INT_BITS_GROUP: u32 = 0;
+
 #[derive(Debug)]
 pub struct Bounds {
     universe: Arc<Universe>,
@@ -33,6 +39,9 @@ pub struct Bounds {
     order: Vec<RelationId>,
     entries: HashMap<RelationId, RelBound>,
     intbounds: BTreeMap<i64, TupleSet>,
+    /// Named bit-lane registries: `group -> (bit value -> singleton atoms)`.
+    /// Group 0 is always the legacy `intbounds` above.
+    lane_intbounds: BTreeMap<u32, BTreeMap<i64, TupleSet>>,
 }
 
 impl Bounds {
@@ -43,6 +52,7 @@ impl Bounds {
             order: Vec::new(),
             entries: HashMap::new(),
             intbounds: BTreeMap::new(),
+            lane_intbounds: BTreeMap::new(),
         }
     }
 
@@ -70,6 +80,24 @@ impl Bounds {
         self.intbounds.keys().copied().collect()
     }
 
+    /// Integer bounds of a bit-lane group (group 0 = builtin `Int`).
+    pub fn int_bounds_in(
+        &self,
+        group: u32,
+    ) -> Box<dyn Iterator<Item = (i64, &TupleSet)> + '_> {
+        if group == INT_BITS_GROUP {
+            Box::new(self.intbounds.iter().map(|(k, v)| (*k, v)))
+        } else {
+            Box::new(
+                self.lane_intbounds
+                    .get(&group)
+                    .into_iter()
+                    .flat_map(|m| m.iter())
+                    .map(|(k, v)| (*k, v)),
+            )
+        }
+    }
+
     pub fn lower_bound(&self, r: RelationId) -> Option<&TupleSet> {
         self.entries.get(&r).map(|b| &b.lower)
     }
@@ -88,6 +116,11 @@ impl Bounds {
 
     pub fn int_bounds(&self) -> impl Iterator<Item = (i64, &TupleSet)> {
         self.intbounds.iter().map(|(k, v)| (*k, v))
+    }
+
+    /// Registered lane group ids (non-zero groups only).
+    pub fn lane_groups(&self) -> impl Iterator<Item = u32> + '_ {
+        self.lane_intbounds.keys().copied()
     }
 
     fn check_bound(&self, r: RelationId, bound: &TupleSet) -> Result<(), BoundsError> {
@@ -149,6 +182,17 @@ impl Bounds {
     }
 
     pub fn bound_exactly_int(&mut self, i: i64, tuples: &TupleSet) -> Result<(), BoundsError> {
+        self.bound_exactly_int_in(INT_BITS_GROUP, i, tuples)
+    }
+
+    /// Register a singleton bit atom under value `i` in lane group `group`.
+    /// Group 0 is the builtin `Int` registry (`bound_exactly_int`).
+    pub fn bound_exactly_int_in(
+        &mut self,
+        group: u32,
+        i: i64,
+        tuples: &TupleSet,
+    ) -> Result<(), BoundsError> {
         if tuples.arity() != 1 {
             return Err(BoundsError::IntBoundNotUnary(tuples.arity()));
         }
@@ -158,7 +202,14 @@ impl Bounds {
         if !tuples.universe().same(&self.universe) {
             return Err(BoundsError::WrongUniverse);
         }
-        self.intbounds.insert(i, tuples.clone());
+        if group == INT_BITS_GROUP {
+            self.intbounds.insert(i, tuples.clone());
+        } else {
+            self.lane_intbounds
+                .entry(group)
+                .or_default()
+                .insert(i, tuples.clone());
+        }
         Ok(())
     }
 
@@ -183,6 +234,7 @@ impl Clone for Bounds {
             order: self.order.clone(),
             entries: self.entries.clone(),
             intbounds: self.intbounds.clone(),
+            lane_intbounds: self.lane_intbounds.clone(),
         }
     }
 }
@@ -199,6 +251,11 @@ impl std::fmt::Display for Bounds {
         write!(f, "\nint bounds:")?;
         for (i, ts) in &self.intbounds {
             write!(f, "\n {}->{}", i, ts)?;
+        }
+        for (g, m) in &self.lane_intbounds {
+            for (i, ts) in m {
+                write!(f, "\n lane{g}:{i}->{ts}")?;
+            }
         }
         Ok(())
     }

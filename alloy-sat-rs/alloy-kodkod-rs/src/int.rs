@@ -536,6 +536,359 @@ impl IntCircuit {
     }
 }
 
+/// Unsigned constant bit-vector (zero-extended), for magnitudes.
+fn const_u_bits(value: u128, width: usize) -> Vec<BoolRef> {
+    (0..width)
+        .map(|i| {
+            if ((value >> i) & 1) == 1 {
+                const_true()
+            } else {
+                const_false()
+            }
+        })
+        .collect()
+}
+
+/// Zero-extending bit accessor for unsigned (magnitude) vectors.
+fn zbit(bits: &[BoolRef], i: usize) -> BoolRef {
+    if i < bits.len() {
+        bits[i]
+    } else {
+        const_false()
+    }
+}
+
+/// Two's-complement negation of a little-endian bit-vector.
+/// Returns `(negated, carry_out)`; `carry_out` is discarded by most callers.
+fn twos_neg(ctx: &BoolCtx, bits: &[BoolRef]) -> (Vec<BoolRef>, BoolRef) {
+    let inv: Vec<BoolRef> = bits.iter().map(|&b| ctx.not(b)).collect();
+    increment_if(ctx, &inv, const_true())
+}
+
+/// Ripple increment: `out = bits + (flag ? 1 : 0)`. Returns `(out, carry_out)`.
+fn increment_if(ctx: &BoolCtx, bits: &[BoolRef], flag: BoolRef) -> (Vec<BoolRef>, BoolRef) {
+    // Half-adder chain: `sum = b XOR 0 XOR c`, `carry = (b AND 0) OR (c AND (b OR 0))`.
+    let mut out = Vec::with_capacity(bits.len());
+    let mut carry = flag;
+    for &b in bits {
+        out.push(sum3(ctx, b, const_false(), carry));
+        carry = carry3(ctx, b, const_false(), carry);
+    }
+    (out, carry)
+}
+
+/// Unsigned equality over zero-extended vectors.
+fn eq_u(ctx: &BoolCtx, a: &[BoolRef], b: &[BoolRef]) -> BoolRef {
+    let w = std::cmp::max(a.len(), b.len());
+    let mut acc = const_true();
+    for i in 0..w {
+        acc = ctx.and(&[acc, iff(ctx, zbit(a, i), zbit(b, i))]);
+    }
+    acc
+}
+
+/// Unsigned strict less-than over zero-extended vectors.
+fn ult_u(ctx: &BoolCtx, a: &[BoolRef], b: &[BoolRef]) -> BoolRef {
+    let w = std::cmp::max(a.len(), b.len()).max(1);
+    // MSB-first lexicographic compare: `lt = OR_i (a_i < b_i AND higher equal)`.
+    let mut lt = const_false();
+    let mut eq_so_far = const_true();
+    for i in (0..w).rev() {
+        let (ai, bi) = (zbit(a, i), zbit(b, i));
+        // `ai < bi` iff `!ai AND bi`.
+        let less_here = ctx.and(&[ctx.not(ai), bi]);
+        lt = ctx.or(&[lt, ctx.and(&[eq_so_far, less_here])]);
+        eq_so_far = ctx.and(&[eq_so_far, iff(ctx, ai, bi)]);
+    }
+    lt
+}
+
+/// Unsigned `<=` over zero-extended vectors.
+fn ule_u(ctx: &BoolCtx, a: &[BoolRef], b: &[BoolRef]) -> BoolRef {
+    ctx.not(ult_u(ctx, b, a))
+}
+
+/// Bit-length (priority) encoder: `0 -> 0`, else index of the highest set
+/// bit plus one. Returned as an unsigned value in the minimum number of
+/// bits that can represent `bits.len()`.
+fn priority_len_bits(ctx: &BoolCtx, bits: &[BoolRef]) -> Vec<BoolRef> {
+    let w = bits.len();
+    let out_w = (usize::BITS - (w as u32).leading_zeros()).max(1) as usize;
+    let mut len = const_u_bits(0, out_w);
+    for (i, &bit) in bits.iter().enumerate() {
+        let cand = const_u_bits((i + 1) as u128, out_w);
+        for j in 0..out_w {
+            len[j] = ctx.ite(bit, cand[j], len[j]);
+        }
+    }
+    len
+}
+
+/// Round-to-nearest (ties-to-even) of an unsigned magnitude with a constant
+/// drop: the `p`-bit field `mag[drop .. drop+p)` is incremented iff
+/// `rest > half` / (`rest == half` and field odd), where `rest = mag[..drop]`
+/// and `half = 2^(drop-1)`. Structurally: `above = top AND any_low`,
+/// `tie = top AND NOT any_low`.
+///
+/// Returns `(field_rounded, carry_out)`; `carry_out` set means the field was
+/// all ones and wrapped to zero (caller renormalizes to `1 << (p-1)` with
+/// `e + 1`). Requires `drop >= 1` and `drop + p <= mag.len()`.
+fn round_mag_const_drop(
+    ctx: &BoolCtx,
+    mag: &[BoolRef],
+    drop: u32,
+    p: u32,
+) -> (Vec<BoolRef>, BoolRef) {
+    let (d, p) = (drop as usize, p as usize);
+    assert!(d >= 1 && d + p <= mag.len());
+    let rest = &mag[..d];
+    let field: Vec<BoolRef> = (0..p).map(|i| zbit(mag, d + i)).collect();
+    let top = rest[d - 1];
+    let low_any = if d > 1 { ctx.or(&rest[..d - 1]) } else { const_false() };
+    let above = ctx.and(&[top, low_any]);
+    let tie = ctx.and(&[top, ctx.not(low_any)]);
+    let field_odd = field[0];
+    let round_up = ctx.or(&[above, ctx.and(&[tie, field_odd])]);
+    increment_if(ctx, &field, round_up)
+}
+
+impl IntCircuit {
+    /// Exact (widening) addition: full `max(w1, w2) + 1` bits, no truncation,
+    /// no fresh overflow. For §3 `T = m1<<d1 ± m2<<d2`.
+    pub fn widen_add(&self, other: &IntCircuit) -> IntCircuit {
+        let width = std::cmp::max(self.width(), other.width()) + 1;
+        let mut out = Vec::with_capacity(width);
+        let mut carry = const_false();
+        for i in 0..width {
+            let (v0, v1) = (self.bit(i), other.bit(i));
+            out.push(sum3(&self.ctx, v0, v1, carry));
+            carry = carry3(&self.ctx, v0, v1, carry);
+        }
+        let mut ret = IntCircuit::from_bits(out, &self.ctx);
+        ret.tainted = self.tainted || other.tainted;
+        ret.accum_overflow = self.ctx.or(&[self.accum_overflow, other.accum_overflow]);
+        ret
+    }
+
+    /// Exact (widening) subtraction. See [`IntCircuit::widen_add`].
+    pub fn widen_sub(&self, other: &IntCircuit) -> IntCircuit {
+        let width = std::cmp::max(self.width(), other.width()) + 1;
+        let mut out = Vec::with_capacity(width);
+        let mut carry = const_true();
+        for i in 0..width {
+            let (v0, v1) = (self.bit(i), self.ctx.not(other.bit(i)));
+            out.push(sum3(&self.ctx, v0, v1, carry));
+            carry = carry3(&self.ctx, v0, v1, carry);
+        }
+        let mut ret = IntCircuit::from_bits(out, &self.ctx);
+        ret.tainted = self.tainted || other.tainted;
+        ret.accum_overflow = self.ctx.or(&[self.accum_overflow, other.accum_overflow]);
+        ret
+    }
+
+    /// Exact (widening) multiplication: full `w1 + w2` bits, no truncation.
+    /// For §4 `prod = m1 * m2`.
+    pub fn widen_mul(&self, other: &IntCircuit) -> IntCircuit {
+        let ret_width = self.width() + other.width();
+        let mut mult = vec![const_false(); ret_width];
+
+        let i_bit_0 = self.bit(0);
+        for (j, slot) in mult.iter_mut().enumerate() {
+            *slot = self.ctx.and(&[i_bit_0, other.bit(j)]);
+        }
+
+        let last = ret_width - 1;
+        for i in 1..last {
+            let i_bit = self.bit(i);
+            let mut carry = const_false();
+            for j in 0..ret_width - i {
+                let prod = self.ctx.and(&[i_bit, other.bit(j)]);
+                let old = mult[i + j];
+                mult[i + j] = sum3(&self.ctx, old, prod, carry);
+                carry = carry3(&self.ctx, old, prod, carry);
+            }
+        }
+
+        let i_bit = self.bit(last);
+        let mut carry = const_true();
+        for j in 0..ret_width - last {
+            let prod = self.ctx.and(&[i_bit, other.bit(j)]);
+            let negated = self.ctx.not(prod);
+            let old = mult[last + j];
+            mult[last + j] = sum3(&self.ctx, old, negated, carry);
+            carry = carry3(&self.ctx, old, negated, carry);
+        }
+
+        let mut ret = IntCircuit::from_bits(mult, &self.ctx);
+        ret.tainted = self.tainted || other.tainted;
+        ret.accum_overflow = self.ctx.or(&[self.accum_overflow, other.accum_overflow]);
+        ret
+    }
+
+    /// Widening shift-left by a constant: `width + amount` bits, zero-filled.
+    /// For `m << d` alignment (§3) and `m1 << guard` (§5). The widened value
+    /// keeps two's-complement semantics (old sign bit moves up; the product
+    /// `value * 2^amount` always fits in `width + amount` bits).
+    pub fn shl_const(&self, amount: u32) -> IntCircuit {
+        let amount = amount as usize;
+        let mut out = vec![const_false(); self.width() + amount];
+        for (i, &b) in self.bits.iter().enumerate() {
+            out[i + amount] = b;
+        }
+        let mut ret = IntCircuit::from_bits(out, &self.ctx);
+        ret.tainted = self.tainted;
+        ret.accum_overflow = self.accum_overflow;
+        ret
+    }
+
+    /// Fixed-width logical shift-right by a constant (zero fill).
+    pub fn srl_const(&self, amount: u32, width: u32) -> IntCircuit {
+        let (amount, width) = (amount as usize, width as usize);
+        let ext = self.extend_bits(width);
+        let mut out = Vec::with_capacity(width);
+        for j in 0..width {
+            out.push(if j + amount < width {
+                ext[j + amount]
+            } else {
+                const_false()
+            });
+        }
+        let mut ret = IntCircuit::from_bits(out, &self.ctx);
+        ret.tainted = self.tainted;
+        ret.accum_overflow = self.accum_overflow;
+        ret
+    }
+
+    /// Split into `(magnitude_bits, negative)` where `magnitude_bits` is the
+    /// unsigned `|self|` (zero-extended semantics, same width) and
+    /// `negative` is the sign bit. `INT_MIN` wraps (documented; mepk
+    /// mantissae are `p`-bit normalized with headroom, so unreachable).
+    pub fn abs_to_mag(&self) -> (Vec<BoolRef>, BoolRef) {
+        let neg = *self.bits.last().unwrap_or(&const_false());
+        let (negated, _) = twos_neg(&self.ctx, &self.bits);
+        let mag: Vec<BoolRef> = self
+            .bits
+            .iter()
+            .zip(negated.iter())
+            .map(|(&b, &n)| self.ctx.ite(neg, n, b))
+            .collect();
+        (mag, neg)
+    }
+
+    /// Reapply a sign: `neg ? -mag : mag` over unsigned magnitude bits of
+    /// width `w`, returned as a `w`-bit two's-complement circuit.
+    pub fn apply_sign(mag: &[BoolRef], neg: BoolRef, ctx: &BoolCtx) -> IntCircuit {
+        let (negated, _) = twos_neg(ctx, mag);
+        let bits: Vec<BoolRef> = mag
+            .iter()
+            .zip(negated.iter())
+            .map(|(&b, &n)| ctx.ite(neg, n, b))
+            .collect();
+        IntCircuit::from_bits(bits, ctx)
+    }
+
+    /// Unsigned strict less-than (`self`, `other` read zero-extended).
+    pub fn ult(&self, other: &IntCircuit) -> BoolRef {
+        ult_u(&self.ctx, &self.bits, &other.bits)
+    }
+
+    /// Unsigned `<=` (zero-extended).
+    pub fn ule(&self, other: &IntCircuit) -> BoolRef {
+        ule_u(&self.ctx, &self.bits, &other.bits)
+    }
+
+    /// Signed maximum via `lte` + `choice`. See [`IntCircuit::choice`].
+    pub fn max_c(&self, other: &IntCircuit) -> IntCircuit {
+        let cond = other.lte(self);
+        self.choice(cond, other)
+    }
+
+    /// Signed minimum via `lte` + `choice`.
+    pub fn min_c(&self, other: &IntCircuit) -> IntCircuit {
+        let cond = self.lte(other);
+        self.choice(cond, other)
+    }
+
+    /// Bit-length of `|self|` as an unsigned circuit (priority encoder over
+    /// the magnitude). `0 -> 0`.
+    pub fn bit_len_c(&self) -> IntCircuit {
+        let (mag, _) = self.abs_to_mag();
+        let bits = priority_len_bits(&self.ctx, &mag);
+        let mut ret = IntCircuit::from_bits(bits, &self.ctx);
+        ret.tainted = self.tainted;
+        ret.accum_overflow = self.accum_overflow;
+        ret
+    }
+
+    /// Round-to-nearest (ties-to-even) of `|self|` with a constant drop to
+    /// `p` bits. Returns `(field, carry_out)` per [`round_mag_const_drop`].
+    /// Requires `drop >= 1` and `drop + p <= width`.
+    pub fn round_mag_const_drop_c(&self, drop: u32, p: u32) -> (Vec<BoolRef>, BoolRef) {
+        let (mag, _) = self.abs_to_mag();
+        round_mag_const_drop(&self.ctx, &mag, drop, p)
+    }
+
+    /// Guard-bit scaled division with round-to-nearest:
+    /// `q0 = (|m1| << guard) / |m2|` (truncated, widened) plus the
+    /// ties-to-even rounding decision `round_up = (2*rem > den) OR
+    /// (2*rem == den AND q0 odd)`. Signs are returned separately as
+    /// `neg = sign(m1) XOR sign(m2)` for the caller to reapply.
+    ///
+    /// Returns `(q_wide, round_up, neg, div_by_zero)`. `q_wide` has
+    /// `max(w1 + guard, w2) + 2` bits; the caller rounds it to `p` bits.
+    /// `div_by_zero` is always active (UNSAT), mirroring [`IntCircuit::div`].
+    pub fn div_nearest_wide(
+        &self,
+        other: &IntCircuit,
+        guard: u32,
+    ) -> (IntCircuit, BoolRef, BoolRef, BoolRef) {
+        let (mag1, neg1) = self.abs_to_mag();
+        let (mag2, neg2) = other.abs_to_mag();
+        let neg = xor2(&self.ctx, neg1, neg2);
+        // Zero-extend magnitudes with an extra 0 bit so they stay
+        // non-negative under sign-extending accessors.
+        let mut a_bits = mag1;
+        a_bits.push(const_false());
+        let mut b_bits = mag2;
+        b_bits.push(const_false());
+        let a = IntCircuit::from_bits(a_bits, &self.ctx);
+        let b = IntCircuit::from_bits(b_bits, &self.ctx);
+        let num = a.shl_const(guard);
+        let w = (std::cmp::max(num.width(), b.width()) + 1) as u32;
+        let q_bits = num.non_restoring_division(&b, true, w);
+        let r_bits = num.non_restoring_division(&b, false, w);
+        // `2*rem ? den` unsigned over zero-extended vectors.
+        let mut twice_bits = vec![const_false(); r_bits.len() + 1];
+        for (i, &bit) in r_bits.iter().enumerate() {
+            twice_bits[i + 1] = bit;
+        }
+        let mut den_bits = b.bits.clone();
+        while den_bits.len() < twice_bits.len() {
+            den_bits.push(const_false());
+        }
+        let gt = ult_u(&self.ctx, &den_bits, &twice_bits);
+        let eq = eq_u(&self.ctx, &twice_bits, &den_bits);
+        let q_odd = q_bits[0];
+        let round_up = self
+            .ctx
+            .or(&[gt, self.ctx.and(&[eq, q_odd])]);
+        // Division-by-zero is UNSAT regardless of taint.
+        let mut or_inputs = Vec::with_capacity(b.width());
+        for i in 0..b.width() {
+            or_inputs.push(b.bit(i));
+        }
+        let div_by_zero = self.ctx.not(self.ctx.or(&or_inputs));
+        let mut ret = IntCircuit::from_bits(q_bits, &self.ctx);
+        ret.tainted = self.tainted || other.tainted;
+        ret.accum_overflow = self.ctx.or(&[
+            self.accum_overflow,
+            other.accum_overflow,
+            div_by_zero,
+        ]);
+        (ret, round_up, neg, div_by_zero)
+    }
+}
+
 /// Signed-MSB weight of an int atom for the BITS cast: the top atom
 /// (`top = W - 1`) weighs `-2^top`, every other non-negative atom below
 /// 63 weighs `+2^v`. Out-of-range values contribute nothing.

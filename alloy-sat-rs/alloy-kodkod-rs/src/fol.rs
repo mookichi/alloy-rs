@@ -638,6 +638,41 @@ impl<'a> FolTranslator<'a> {
         rec(self, arena, decls, &mut env2, &mut lits, visit, 0)
     }
 
+    /// Bit-vector value with signed MSB weight over one int-bound group:
+    /// Σ weight(v) where weight(v) = -2^(W-1) for the top atom (v = W-1,
+    /// the MSB) and +2^v otherwise. W = the top atom + 1 is derived from
+    /// the group's bound set itself.
+    fn bits_cast(
+        &mut self,
+        m: &BooleanMatrix,
+        group: u32,
+    ) -> Result<IntCircuit, TranslateError> {
+        let bw = self.bitwidth;
+        let mut positions: Vec<(i64, usize)> = Vec::new();
+        let mut max_val: i64 = -1;
+        for (val, ts) in self.bounds.int_bounds_in(group) {
+            max_val = max_val.max(val);
+            for idx in ts.index_view().iter() {
+                positions.push((val, idx as usize));
+            }
+        }
+        positions.sort_by_key(|p| p.1);
+        let top = max_val; // W - 1
+        let mut acc = IntCircuit::constant(0, bw, &self.ctx);
+        for &(val, pos) in &positions {
+            let Some(weight) = crate::int::bit_weight(val, top) else {
+                continue;
+            };
+            if let Some(cell) = m.get(pos) {
+                let c = IntCircuit::constant(weight, bw, &self.ctx);
+                let term = c.choice(cell, &IntCircuit::zero(&self.ctx)).with_taint(true);
+                acc = acc.add(&term, bw);
+            }
+        }
+        // Relation-derived: tainted (overflow-prohibited).
+        Ok(acc.with_taint(true))
+    }
+
     pub fn int_expr(
         &mut self,
         arena: &AstArena,
@@ -691,36 +726,11 @@ impl<'a> FolTranslator<'a> {
                         acc.with_taint(true)
                     }
                     CastToIntOp::Bits => {
-                        // Bit-vector value with signed MSB weight:
-                        // Σ weight(v) where weight(v) = -2^(W-1) for the
-                        // top atom (v = W-1, the MSB) and +2^v otherwise.
-                        // W = the top atom + 1 is derived from the bound
-                        // set itself; atoms are named by value.
-                        let mut positions: Vec<(i64, usize)> = Vec::new();
-                        let mut max_val: i64 = -1;
-                        for (val, ts) in self.bounds.int_bounds() {
-                            max_val = max_val.max(val);
-                            for idx in ts.index_view().iter() {
-                                positions.push((val, idx as usize));
-                            }
-                        }
-                        positions.sort_by_key(|p| p.1);
-                        let top = max_val; // W - 1
-                        let mut acc = IntCircuit::constant(0, bw, &self.ctx);
-                        for &(val, pos) in &positions {
-                            let Some(weight) = crate::int::bit_weight(val, top) else {
-                                continue;
-                            };
-                            if let Some(cell) = m.get(pos) {
-                                let c = IntCircuit::constant(weight, bw, &self.ctx);
-                                let term =
-                                    c.choice(cell, &IntCircuit::zero(&self.ctx)).with_taint(true);
-                                acc = acc.add(&term, bw);
-                            }
-                        }
-                        // Relation-derived: tainted (overflow-prohibited).
-                        acc.with_taint(true)
+                        // Bit-vector value with signed MSB weight over the
+                        // builtin `Int` group (see `bits_cast`).
+                        self.bits_cast(&m, crate::bounds::INT_BITS_GROUP)?
                     }
+                    CastToIntOp::BitsIn(group) => self.bits_cast(&m, group)?,
                 }
             }
             IntNode::Binary { op, left, right } => {

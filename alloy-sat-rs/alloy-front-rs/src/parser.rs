@@ -1291,11 +1291,25 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Name(v.to_string(), pos))
             }
+            Tok::RealLit(s) => {
+                // Decimal real literal: exact source text, only valid
+                // inside `setEReal` (rejected at lowering elsewhere).
+                self.bump();
+                Ok(Expr::RealLit(s, pos))
+            }
             Tok::Minus if matches!(self.peek_at(1), Tok::Int(_)) => {
                 // Negative literal in set position (`-5` = `{-5}`).
                 self.bump();
                 match self.bump().tok {
                     Tok::Int(v) => Ok(Expr::Name(v.wrapping_neg().to_string(), pos)),
+                    _ => unreachable!(),
+                }
+            }
+            Tok::Minus if matches!(self.peek_at(1), Tok::RealLit(_)) => {
+                // Negative decimal literal (`-3.14` keeps its text).
+                self.bump();
+                match self.bump().tok {
+                    Tok::RealLit(s) => Ok(Expr::RealLit(format!("-{s}"), pos)),
                     _ => unreachable!(),
                 }
             }

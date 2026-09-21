@@ -30,6 +30,7 @@ use alloy_kodkod_rs::temporal::TemporalEval;
 use alloy_kodkod_rs::TemporalInstance;
 
 mod fmt;
+mod mepk_cmd;
 use clap::Parser as ClapParser;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -2063,7 +2064,12 @@ fn print_help() {
     println!("    Use `@ <sol>` as an unambiguous alternative: `:query A @ someA`.");
     println!("  :validate <sol> [in <cnf>]  validate solution vs Cnf (no in = its origin Cnf)");
     println!("  :show [name] [N]            show Cnf clauses and/or solution (no arg = defaults)");
-    println!("  :eval <expr> [as <sol>]     satisfiability check (bare expr lifts with some)");
+    println!("  :eval <expr> [as <sol>]     satisfiability check (bare expr lifts with some)
+  :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <n>]
+                            result as c ± R (tau); -v adds tuples and detail
+  :mepk lit <decimal> [p <maxp>] [n <intcount>]
+                            decimal literal to (m,e,p,k), optimal precision
+  :mepk widths [n]          show lane widths from for-n-Int rule (+MEPK_* env)");
     println!("  :max <intexpr> [in <cnf>] [as <sol>]   maximize int expr, save optimum+cost");
     println!("  :min <intexpr> [in <cnf>] [as <sol>]   minimize int expr, save optimum+cost");
     println!("  :maxw <r>:<w>[, ...] [in <cnf>] [as <sol>]  maximize Σ w·#r");
@@ -2100,6 +2106,11 @@ fn print_help() {
     println!("  are allocated lazily: models that never use Int as a set carry");
     println!("  none (queries like `Int` then read empty; add `for N Int` to");
     println!("  materialize the range).");
+    println!("notes: builtin `EReal` (m,e,p,k) error-tracking pseudo-reals:");
+    println!("  `sig A {{ x: EReal }}` then `x.m`, `x.e`, `x.p`, `x.k` read lanes;");
+    println!("  `erealAdd/Sub/Mul/Div[a,b,c]`, `erealWellformed[x]`, `erealDivGuard[x]`;");
+    println!("  `setEReal[x, 3.14]` binds lanes to a decimal literal (same as `:mepk lit`);");
+    println!("  lane widths come from `for N Int` (+MEPK_*_WIDTH); `for N EReal` scopes atoms.");
 }
 
 /// Resolve an explicit `:psave` relation argument: exact pool name first,
@@ -2660,6 +2671,11 @@ fn main() {
                     }
                 }
                 "show" => sess.do_show(&rest),
+                "mepk" => {
+                    for line in mepk_cmd::run_mepk(&rest) {
+                        println!("{line}");
+                    }
+                }
                 "eval" => {
                     let raw = body["eval".len()..].trim();
                     if raw.is_empty() {

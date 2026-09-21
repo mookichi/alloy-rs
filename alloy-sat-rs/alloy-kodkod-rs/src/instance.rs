@@ -25,6 +25,10 @@ pub struct Instance {
     order: Vec<RelationId>,
     tuples: HashMap<RelationId, TupleSet>,
     ints: BTreeMap<i64, TupleSet>,
+    /// Bit-lane registries mirroring `Bounds::bound_exactly_int_in`:
+    /// `group -> (bit value -> singleton atoms)`. Populated by
+    /// `materialize` whenever the bounds carry lane groups.
+    lane_ints: BTreeMap<u32, BTreeMap<i64, TupleSet>>,
 }
 
 impl Instance {
@@ -35,6 +39,7 @@ impl Instance {
             order: Vec::new(),
             tuples: HashMap::new(),
             ints: BTreeMap::new(),
+            lane_ints: BTreeMap::new(),
         }
     }
 
@@ -120,6 +125,36 @@ impl Instance {
         self.ints.iter().map(|(k, v)| (*k, v))
     }
 
+    /// Singleton bit atoms of lane group `group` (`value -> atoms`).
+    /// Empty when the instance carries no lane layer (hand-built
+    /// instances; `materialize` populates it from the bounds).
+    pub fn lane_int_tuples(&self, group: u32) -> impl Iterator<Item = (i64, &TupleSet)> {
+        self.lane_ints
+            .get(&group)
+            .into_iter()
+            .flat_map(|m| m.iter())
+            .map(|(k, v)| (*k, v))
+    }
+
+    pub fn add_int_in(
+        &mut self,
+        group: u32,
+        i: i64,
+        s: &TupleSet,
+    ) -> Result<(), InstanceError> {
+        if !s.universe().same(&self.universe) {
+            return Err(InstanceError::WrongUniverse);
+        }
+        if s.arity() != 1 {
+            return Err(InstanceError::IntBoundNotUnary(s.arity()));
+        }
+        if s.len() != 1 {
+            return Err(InstanceError::IntBoundNotSingleton(s.len()));
+        }
+        self.lane_ints.entry(group).or_default().insert(i, s.clone());
+        Ok(())
+    }
+
     pub fn find_relation_by_name(&self, name: &str) -> Option<RelationId> {
         self.order
             .iter()
@@ -136,6 +171,7 @@ impl Clone for Instance {
             order: self.order.clone(),
             tuples: self.tuples.clone(),
             ints: self.ints.clone(),
+            lane_ints: self.lane_ints.clone(),
         }
     }
 }

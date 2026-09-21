@@ -8,6 +8,7 @@ use alloy_kodkod_rs::ast::{
     self as kk, CastToIntOp, ExprCompOp, ExprId, FormulaId, IntId, Multiplicity, Quantifier,
 };
 use alloy_kodkod_rs::bounds::Bounds;
+use alloy_kodkod_rs::mepk::decimal_to_mepk;
 use alloy_kodkod_rs::opt::OptSense;
 use alloy_kodkod_rs::relation::{RelationId, RelationPool};
 use std::collections::HashMap;
@@ -381,6 +382,13 @@ impl<'m> Lowerer<'m> {
             rels.insert(name.clone(), r);
         }
         let mut field_arity: HashMap<String, u32> = HashMap::new();
+        // Builtin `EReal` field lanes (binary `EReal -> lane-atoms`).
+        for (fname, _) in crate::bounds::EREAL_LANES {
+            let key = format!("EReal.{fname}");
+            let fa = arena.relation(&key, 2);
+            field_arity.insert(key.clone(), 2);
+            rels.insert(key, fa);
+        }
         for sd in &self.module.sigs {
             for owner in &sd.names {
                 for d in &sd.fields {
@@ -428,6 +436,10 @@ impl<'m> Lowerer<'m> {
                     }
                 }
             }
+        }
+        // Builtin `EReal` lanes are always Int-flavored (bitmask-readable).
+        for (fname, _) in crate::bounds::EREAL_LANES {
+            field_int.insert(format!("EReal.{fname}"), SetKind::Int);
         }
         let ctx = Ctx {
             module: self.module,
@@ -517,6 +529,30 @@ impl<'m> Lowerer<'m> {
             }
         }
         // ------------------------------------------------------------------
+        // Builtin `EReal` lane relations (`EReal.m` etc., binary over the
+        // dedicated lane atoms). Allocated lazily with the lane atoms.
+        for (fname, group) in crate::bounds::EREAL_LANES {
+            let key = format!("EReal.{fname}");
+            let fa = arena.relation(&key, 2);
+            field_arity.insert(key.clone(), 2);
+            let lane = res.lane_atoms.get(&group).cloned().unwrap_or_default();
+            let mut ts =
+                alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            for o in &res.ereal_atoms {
+                for t in &lane {
+                    let tup = bounds::tuple_of(&res, &[o.clone(), t.clone()])
+                        .map_err(FrontError::Resolve)?;
+                    ts.insert(&tup)
+                        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                }
+            }
+            let lo = alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            b.bound(fa, &lo, &ts)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            rels.insert(key, fa);
+        }
         // `totalOrder[S, S.next]`: pin the binary field relation
         // (i.e. `S<:next`) to the canonical chain
         // over the sig's atoms (Java `pred/totalOrder` symmetry breaking,
@@ -626,6 +662,23 @@ impl<'m> Lowerer<'m> {
             }
         }
 
+        // EReal bit-lane exact bounds (lazy like Int): value `v` is the
+        // bit position, read with signed-MSB weight via `BitsIn(group)`.
+        for (fname, group) in crate::bounds::EREAL_LANES {
+            let lane = res.lane_atoms.get(&group).cloned().unwrap_or_default();
+            for (v, name) in lane.iter().enumerate() {
+                let idx = res
+                    .universe
+                    .index(name)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                let mut ts = alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 1)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                ts.insert_index(idx as i64);
+                b.bound_exactly_int_in(group, v as i64, &ts)
+                    .map_err(|e| FrontError::Resolve(format!("EReal.{fname}: {e}")))?;
+            }
+        }
+
         // Insert ordering relations into rels so name resolution can find them
         for (alias, &(first_rel, next_rel)) in &ordering_info {
             rels.insert(format!("{alias}/first"), first_rel);
@@ -659,6 +712,10 @@ impl<'m> Lowerer<'m> {
                     }
                 }
             }
+        }
+        // Builtin `EReal` lanes are always Int-flavored (bitmask-readable).
+        for (fname, _) in crate::bounds::EREAL_LANES {
+            field_int.insert(format!("EReal.{fname}"), SetKind::Int);
         }
         let ctx = Ctx {
             module: self.module,
@@ -1140,6 +1197,69 @@ impl<'a> Ctx<'a> {
 
     /// Try to resolve an ordering builtin predicate call.
     /// Returns Some(formula) if the name matches an ordering builtin predicate.
+    /// Builtin `EReal` predicates (`erealAdd` etc.): desugar to comparator
+    /// formulas over lane joins and lower recursively. Lane reads lower
+    /// through the lane-scoped `BitsIn` cast; `m`/`e` centres stay free
+    /// (mirrors `util/mepk.als`: the error exponents are pinned, exact
+    /// centres are delegated to the oracle).
+    fn try_ereal_pred(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        args: &[Expr],
+        env: &mut Env,
+    ) -> LResult<Option<FormulaId>> {
+        let body = match name {
+            "erealAdd" | "erealSub" => {
+                if args.len() != 3 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 3 args")));
+                }
+                ereal_add_sub(&args[0], &args[1], &args[2])
+            }
+            "erealMul" => {
+                if args.len() != 3 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 3 args")));
+                }
+                ereal_mul(&args[0], &args[1], &args[2])
+            }
+            "erealDiv" => {
+                if args.len() != 3 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 3 args")));
+                }
+                ereal_div(&args[0], &args[1], &args[2])
+            }
+            "erealWellformed" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
+                }
+                ereal_wellformed(&args[0])
+            }
+            "erealDivGuard" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
+                }
+                ereal_div_guard(&args[0])
+            }
+            "erealNeedsRefine" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
+                }
+                ereal_needs_refine(&args[0], &args[1])
+            }
+            "setEReal" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
+                }
+                // Precision cap from the active widths (same default as
+                // `:mepk lit`: usable mantissa precision).
+                let max_p = self.res.mepk_widths.m_width.saturating_sub(1).max(1);
+                ereal_set(&args[0], &args[1], max_p)?
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(self.lower_formula(arena, &body, env)?))
+    }
+
     fn try_ordering_pred(
         &self,
         arena: &mut kk::AstArena,
@@ -1698,6 +1818,113 @@ impl<'a> Ctx<'a> {
 
     /// Abstract flavor of the LAST field of a dotted chain (`a.x` -> `x`):
     /// Some(kind) when the label resolves to declared fields.
+    /// Bit-lane group of the LAST field of a dotted chain (`a.m` -> `m`):
+    /// Some(group) when the label uniquely resolves to a builtin `EReal`
+    /// lane (`EReal.m` etc.). Labels shared with user fields decline to
+    /// None unless `EReal` is allocated (then the use is genuinely
+    /// ambiguous and the caller must error loudly, never read 0).
+    fn lane_group_of(&self, e: &Expr) -> Option<u32> {
+        let field = trailing_field_name(e)?;
+        let mut found: Option<u32> = None;
+        let mut count = 0;
+        for key in self.field_int.keys() {
+            if key.rsplit('.').next() == Some(field.as_str()) {
+                count += 1;
+                if let Some((_, group)) = crate::bounds::EREAL_LANES
+                    .iter()
+                    .find(|(fname, _)| key == &format!("EReal.{fname}"))
+                {
+                    // Ignore the builtin lane while `EReal` is unallocated:
+                    // a lone user field keeps its legacy reading.
+                    let allocated = self
+                        .res
+                        .lane_atoms
+                        .get(group)
+                        .is_some_and(|v| !v.is_empty());
+                    if !allocated {
+                        count -= 1;
+                        continue;
+                    }
+                    found = Some(*group);
+                }
+            }
+        }
+        if count == 1 { found } else { None }
+    }
+
+    /// True when `e`'s trailing label names both an allocated `EReal`
+    /// lane and a user (non-`EReal`) field: genuinely ambiguous.
+    fn lane_label_ambiguous(&self, e: &Expr) -> bool {
+        let Some(field) = trailing_field_name(e) else {
+            return false;
+        };
+        let lane_allocated = crate::bounds::EREAL_LANES.iter().any(|(fname, g)| {
+            *fname == field && self.res.lane_atoms.get(g).is_some_and(|v| !v.is_empty())
+        });
+        lane_allocated
+            && self.field_int.keys().any(|key| {
+                key.rsplit('.').next() == Some(field.as_str()) && !key.starts_with("EReal.")
+            })
+    }
+
+    /// True when the trailing field label also matches a builtin `EReal`
+    /// lane (allocated) alongside user fields: the lane reading is
+    /// genuinely ambiguous and must error, never silently read 0.
+    fn lane_group_ambiguous(&self, e: &Expr) -> bool {
+        self.lane_label_ambiguous(e)
+    }
+
+    /// Lane equality rewritten as integer comparisons: `x.m = 3` means
+    /// the lane's bitmask value is 3, and `x.m = y.m` compares values
+    /// (relational set equality could never hold across disjoint lane
+    /// namespaces). Returns None for non-lane shapes (legacy reading).
+    /// A label shared with a user field while `EReal` is allocated is a
+    /// hard error (never a silent empty read).
+    fn rewrite_lane_lit_cmp(
+        &self,
+        kind: &CmpKind,
+        l: &Expr,
+        r: &Expr,
+    ) -> LResult<Option<Formula>> {
+        let op = match kind {
+            CmpKind::Eq => IntCmpOp::Eq,
+            CmpKind::Neq => IntCmpOp::Neq,
+            _ => return Ok(None),
+        };
+        for side in [l, r] {
+            if self.lane_label_ambiguous(side) {
+                return Err(FrontError::Resolve(
+                    "ambiguous EReal lane: a user field shares this label; qualify explicitly"
+                        .to_string(),
+                ));
+            }
+        }
+        let lane_int = |e: &Expr| -> Option<IntExpr> {
+            self.lane_group_of(e)?;
+            Some(IntExpr::BitsVal(Box::new(e.clone()), 0))
+        };
+        // Lane-vs-lane first (values may differ per lane namespace).
+        if let (Some(li), Some(ri)) = (lane_int(l), lane_int(r)) {
+            return Ok(Some(Formula::IntCmp(op, li, ri, 0)));
+        }
+        // Lane-vs-literal in either order. Literals arrive as `Bits(v)`
+        // bitsets or bare numeric names, depending on position.
+        let lit_val = |e: &Expr| -> Option<i64> {
+            match e {
+                Expr::Bits(v, _) => Some(*v),
+                Expr::Name(n, _) => n.parse::<i64>().ok(),
+                _ => None,
+            }
+        };
+        if let (Some(li), Some(v)) = (lane_int(l), lit_val(r)) {
+            return Ok(Some(Formula::IntCmp(op, li, IntExpr::Lit(v, 0), 0)));
+        }
+        if let (Some(v), Some(ri)) = (lit_val(l), lane_int(r)) {
+            return Ok(Some(Formula::IntCmp(op, IntExpr::Lit(v, 0), ri, 0)));
+        }
+        Ok(None)
+    }
+
     fn field_int_flavored(&self, e: &Expr) -> Option<SetKind> {
         let field = trailing_field_name(e)?;
         if field == "int" || field == "Int" || field == "Signed" || field == "MSB" {
@@ -1804,7 +2031,8 @@ impl<'a> Ctx<'a> {
     }
 
     /// Single gate for set-typed operands in integer position: checks the
-    /// abstract flavor, then lowers and applies the BITS bitmask cast.
+    /// abstract flavor, then lowers and applies the BITS bitmask cast
+    /// (lane-scoped `BitsIn` for builtin `EReal` lanes).
     /// `SumOf` (explicit `sum e`) intentionally bypasses this and uses SUM.
     fn lower_int_cast(
         &self,
@@ -1815,9 +2043,18 @@ impl<'a> Ctx<'a> {
         if !self.set_int_flavored(e, env).is_int() {
             return Err(FrontError::Resolve(INT_MISMATCH_MSG.to_string()));
         }
+        if self.lane_group_ambiguous(e) {
+            return Err(FrontError::Resolve(
+                "ambiguous EReal lane: a user field shares this label; qualify explicitly".to_string(),
+            ));
+        }
         let (ee, _) = self.lower_expr(arena, e, env)?;
+        let op = match self.lane_group_of(e) {
+            Some(group) => CastToIntOp::BitsIn(group),
+            None => CastToIntOp::Bits,
+        };
         arena
-            .cast_to_int(CastToIntOp::Bits, ee)
+            .cast_to_int(op, ee)
             .map_err(|e| FrontError::Resolve(e.to_string()))
     }
 
@@ -1904,6 +2141,11 @@ impl<'a> Ctx<'a> {
                     Some(a) => (a, 1),
                     None => (arena.constant(kk::ConstantExpr::Empty), 1),
                 }
+            }
+            Expr::RealLit(..) => {
+                return Err(FrontError::Resolve(
+                    "decimal literals are only valid inside `setEReal`".to_string(),
+                ));
             }
             Expr::Name(n, pos) => {
                 // Check let-binding scopes (innermost first)
@@ -2327,6 +2569,14 @@ impl<'a> Ctx<'a> {
             IntExpr::SumOf(e, _) => {
                 // Explicit `sum e`: Σ of the int-atom VALUES via the SUM
                 // cast (`sum {0, 1}` is 1 — distinct from the bitmask 3).
+                // Lane sets (`x.m`) have no meaningful atom-value sum
+                // (positions, not values); reject loudly instead of
+                // silently reading 0.
+                if self.lane_group_of(e).is_some() {
+                    return Err(FrontError::Resolve(
+                        "sum over EReal lanes is unsupported (positions are not values)".to_string(),
+                    ));
+                }
                 let (ee, _) = self.lower_expr(arena, e, env)?;
                 arena
                     .cast_to_int(CastToIntOp::Sum, ee)
@@ -2604,6 +2854,10 @@ impl<'a> Ctx<'a> {
                 if let Some(f) = self.try_ordering_pred(arena, name, args, env)? {
                     return Ok(f);
                 }
+                // Builtin `EReal` predicates (desugared to lane constraints).
+                if let Some(f) = self.try_ereal_pred(arena, name, args, env)? {
+                    return Ok(f);
+                }
                 // Check stdlib builtins (graph, relation)
                 if let Some(f) = self.try_stdlib_pred(arena, name, args, env)? {
                     return Ok(f);
@@ -2721,6 +2975,16 @@ impl<'a> Ctx<'a> {
                 arena.bool_formula(true)
             }
             Formula::Cmp(kind, l, r, _) => {
+                // Lane-vs-literal equality (`x.m = 3`): the parser reads
+                // this relationally (literal as an Int-atom bitset, whose
+                // domain never meets the lane atoms), so rewrite to the
+                // integer reading (`BitsIn` vs literal). Other shapes keep
+                // the legacy relational reading.
+                if matches!(kind, CmpKind::Eq | CmpKind::Neq) {
+                    if let Some(rw) = self.rewrite_lane_lit_cmp(kind, l, r)? {
+                        return self.lower_formula(arena, &rw, env);
+                    }
+                }
                 let (el, al) = self.lower_expr(arena, l, env)?;
                 let (er, ar) = self.lower_expr(arena, r, env)?;
                 // Auto-promote lower arity side for comparisons
@@ -3136,7 +3400,7 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
 fn subst_expr(e: &Expr, from: &str, to: &str) -> Expr {
     match e {
         Expr::Name(n, p) if n == from => Expr::Name(to.to_string(), *p),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) => {
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) => {
             e.clone()
         }
         Expr::Bin(op, a, b) => Expr::Bin(
@@ -3253,7 +3517,7 @@ fn strip_mult(e: &Expr) -> Expr {
         Expr::Prime(x) => Expr::Prime(Box::new(strip_mult(x))),
         Expr::AtExpr(x) => Expr::AtExpr(Box::new(strip_mult(x))),
         Expr::LetBind(binds, body) => Expr::LetBind(binds.clone(), Box::new(strip_mult(body))),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) => {
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) => {
             e.clone()
         }
     }
@@ -3265,6 +3529,7 @@ fn strip_mult(e: &Expr) -> Expr {
 fn mentions_int_expr(e: &Expr) -> bool {
     match e {
         Expr::IntAtom | Expr::Bits(..) => true,
+        Expr::RealLit(..) => false,
         Expr::Name(n, _) => n == "int" || n == "Int" || n == "Signed",
         Expr::ArrowMult(_, inner) | Expr::LeadMult(_, inner) => mentions_int_expr(inner),
         Expr::Bin(_, a, b) => mentions_int_expr(a) || mentions_int_expr(b),
@@ -3506,6 +3771,311 @@ fn scan_total_order_intexpr(e: &IntExpr, out: &mut Vec<(String, String)>) {
 /// `S<:f` (domain restriction), `S.f` (a join of the sig and field
 /// names), or a bare field name (resolved against the first argument's
 /// sig).
+// ---- builtin `EReal` desugar (mirrors `util/mepk.als`) --------------------
+// Lane reads lower through the lane-scoped `BitsIn` cast; `m`/`e`
+// centres stay free (only `p`/`k` error exponents are pinned).
+/// Lane read `base.lane` in integer position.
+fn ereal_lane(base: &Expr, lane: &str) -> IntExpr {
+    IntExpr::BitsVal(
+        Box::new(Expr::Bin(
+            BinOp::Join,
+            Box::new(base.clone()),
+            Box::new(Expr::Name(lane.to_string(), 0)),
+        )),
+        0,
+    )
+}
+
+fn ereal_lit(v: i64) -> IntExpr {
+    IntExpr::Lit(v, 0)
+}
+
+fn ereal_add(a: IntExpr, b: IntExpr) -> IntExpr {
+    IntExpr::Bin(IntBinOp::Add, Box::new(a), Box::new(b))
+}
+
+fn ereal_sub(a: IntExpr, b: IntExpr) -> IntExpr {
+    IntExpr::Bin(IntBinOp::Sub, Box::new(a), Box::new(b))
+}
+
+fn ereal_icmp(op: IntCmpOp, a: IntExpr, b: IntExpr) -> Formula {
+    Formula::IntCmp(op, a, b, 0)
+}
+
+fn ereal_and_all(fs: Vec<Formula>) -> Formula {
+    fs.into_iter()
+        .reduce(|a, b| Formula::And(Box::new(a), Box::new(b)))
+        .unwrap_or(Formula::Const(true))
+}
+
+fn ereal_or_all(fs: Vec<Formula>) -> Formula {
+    fs.into_iter()
+        .reduce(|a, b| Formula::Or(Box::new(a), Box::new(b)))
+        .unwrap_or(Formula::Const(false))
+}
+
+/// `r = min(x, y)` over integer expressions (no Int min operator).
+fn ereal_min_eq(r: &IntExpr, x: &IntExpr, y: &IntExpr) -> Formula {
+    ereal_and_all(vec![
+        ereal_icmp(IntCmpOp::Lte, r.clone(), x.clone()),
+        ereal_icmp(IntCmpOp::Lte, r.clone(), y.clone()),
+        ereal_or_all(vec![
+            ereal_icmp(IntCmpOp::Eq, r.clone(), x.clone()),
+            ereal_icmp(IntCmpOp::Eq, r.clone(), y.clone()),
+        ]),
+    ])
+}
+
+/// `k = combine_k(a, b) = max(a-b, 0) + 1` (theory §2).
+fn ereal_combine_eq(k: &IntExpr, a: &IntExpr, b: &IntExpr) -> Formula {
+    let d = ereal_sub(a.clone(), b.clone());
+    ereal_or_all(vec![
+        ereal_and_all(vec![
+            ereal_icmp(IntCmpOp::Lte, d.clone(), ereal_lit(0)),
+            ereal_icmp(IntCmpOp::Eq, k.clone(), ereal_lit(1)),
+        ]),
+        ereal_and_all(vec![
+            ereal_icmp(IntCmpOp::Gt, d.clone(), ereal_lit(0)),
+            ereal_icmp(
+                IntCmpOp::Eq,
+                k.clone(),
+                ereal_add(d, ereal_lit(1)),
+            ),
+        ]),
+    ])
+}
+
+/// `k = combine_k(ell + max(t1, t2), bExp)`: the shared add/sub tail.
+/// Case-splits the max (no Int max operator).
+fn ereal_max_combine_eq(
+    k: &IntExpr,
+    ell: &IntExpr,
+    t1: &IntExpr,
+    t2: &IntExpr,
+    b_exp: &IntExpr,
+) -> Formula {
+    ereal_or_all(vec![
+        ereal_and_all(vec![
+            ereal_icmp(IntCmpOp::Gte, t1.clone(), t2.clone()),
+            ereal_combine_eq(k, &ereal_add(ell.clone(), t1.clone()), b_exp),
+        ]),
+        ereal_and_all(vec![
+            ereal_icmp(IntCmpOp::Gt, t2.clone(), t1.clone()),
+            ereal_combine_eq(k, &ereal_add(ell.clone(), t2.clone()), b_exp),
+        ]),
+    ])
+}
+
+/// `lsb(x) = e - p + 1`.
+fn ereal_lsb(x: &Expr) -> IntExpr {
+    ereal_add(
+        ereal_sub(ereal_lane(x, "e"), ereal_lane(x, "p")),
+        ereal_lit(1),
+    )
+}
+
+fn ereal_wellformed(x: &Expr) -> Formula {
+    ereal_and_all(vec![
+        ereal_icmp(IntCmpOp::Gt, ereal_lane(x, "p"), ereal_lit(0)),
+        ereal_icmp(IntCmpOp::Gte, ereal_lane(x, "k"), ereal_lit(0)),
+    ])
+}
+
+fn ereal_div_guard(d: &Expr) -> Formula {
+    ereal_icmp(IntCmpOp::Lt, ereal_lane(d, "k"), ereal_lane(d, "p"))
+}
+
+fn ereal_needs_refine(x: &Expr, g: &Expr) -> Formula {
+    // precisionLost (k >= p or tau = p-k-g <= 0) or a violated div guard.
+    // The goal `g` must be an integer literal (Call args are `Expr`s;
+    // threading a general IntExpr is out of scope for v1).
+    let glit = match g {
+        Expr::Name(n, _) => n.parse::<i64>().unwrap_or(0),
+        _ => 0,
+    };
+    let tau = ereal_sub(
+        ereal_sub(ereal_lane(x, "p"), ereal_lane(x, "k")),
+        ereal_lit(glit),
+    );
+    ereal_or_all(vec![
+        ereal_icmp(
+            IntCmpOp::Gte,
+            ereal_lane(x, "k"),
+            ereal_lane(x, "p"),
+        ),
+        ereal_icmp(IntCmpOp::Lte, tau, ereal_lit(0)),
+        Formula::Not(Box::new(ereal_div_guard(x))),
+    ])
+}
+
+/// Addition / subtraction (§3): same error propagation for ±.
+fn ereal_add_sub(a: &Expr, b: &Expr, r: &Expr) -> Formula {
+    let (pa, ka) = (ereal_lane(a, "p"), ereal_lane(a, "k"));
+    let (pb, kb) = (ereal_lane(b, "p"), ereal_lane(b, "k"));
+    let (er, pr, kr) = (ereal_lane(r, "e"), ereal_lane(r, "p"), ereal_lane(r, "k"));
+    let la1 = ereal_lsb(a);
+    let la2 = ereal_lsb(b);
+    let b_exp = ereal_sub(er, pr.clone());
+    // ell = min(lsb1, lsb2): case-split (no Int min operator).
+    // Case 1 (lsb1 <= lsb2): ell = lsb1, d1 = 0, d2 = lsb2 - lsb1.
+    let case1 = ereal_and_all(vec![
+        ereal_icmp(IntCmpOp::Lte, la1.clone(), la2.clone()),
+        ereal_max_combine_eq(
+            &kr,
+            &la1,
+            &ka,
+            &ereal_add(kb.clone(), ereal_sub(la2.clone(), la1.clone())),
+            &b_exp,
+        ),
+    ]);
+    // Case 2 (lsb2 < lsb1).
+    let case2 = ereal_and_all(vec![
+        ereal_icmp(IntCmpOp::Lt, la2.clone(), la1.clone()),
+        ereal_max_combine_eq(
+            &kr,
+            &la2,
+            &ereal_add(ka.clone(), ereal_sub(la1.clone(), la2.clone())),
+            &kb,
+            &b_exp,
+        ),
+    ]);
+    ereal_and_all(vec![
+        ereal_wellformed(a),
+        ereal_wellformed(b),
+        ereal_wellformed(r),
+        ereal_min_eq(&pr, &pa, &pb),
+        ereal_or_all(vec![case1, case2]),
+    ])
+}
+
+/// Multiplication (§4): `C = e1+e2 + max(t1,t2,t3) + 2`, 3-way max split.
+fn ereal_mul(a: &Expr, b: &Expr, r: &Expr) -> Formula {
+    let (ea, pa, ka) = (ereal_lane(a, "e"), ereal_lane(a, "p"), ereal_lane(a, "k"));
+    let (eb, pb, kb) = (ereal_lane(b, "e"), ereal_lane(b, "p"), ereal_lane(b, "k"));
+    let (er, pr, kr) = (ereal_lane(r, "e"), ereal_lane(r, "p"), ereal_lane(r, "k"));
+    let t1 = ereal_add(ereal_sub(ka.clone(), pa.clone()), ereal_lit(1));
+    let t2 = ereal_add(ereal_sub(kb.clone(), pb.clone()), ereal_lit(1));
+    let t3 = ereal_sub(
+        ereal_add(ka.clone(), kb.clone()),
+        ereal_add(pa.clone(), pb.clone()),
+    );
+    let base = ereal_add(ea.clone(), eb.clone());
+    let b_exp = ereal_sub(er, pr.clone());
+    let case = |dom: &IntExpr, lo1: Formula, lo2: Formula| {
+        ereal_and_all(vec![
+            lo1,
+            lo2,
+            ereal_combine_eq(
+                &kr,
+                &ereal_add(ereal_add(base.clone(), dom.clone()), ereal_lit(2)),
+                &b_exp,
+            ),
+        ])
+    };
+    ereal_and_all(vec![
+        ereal_wellformed(a),
+        ereal_wellformed(b),
+        ereal_wellformed(r),
+        ereal_min_eq(&pr, &pa, &pb),
+        ereal_or_all(vec![
+            case(
+                &t1,
+                ereal_icmp(IntCmpOp::Gte, t1.clone(), t2.clone()),
+                ereal_icmp(IntCmpOp::Gte, t1.clone(), t3.clone()),
+            ),
+            case(
+                &t2,
+                ereal_icmp(IntCmpOp::Gt, t2.clone(), t1.clone()),
+                ereal_icmp(IntCmpOp::Gte, t2.clone(), t3.clone()),
+            ),
+            case(
+                &t3,
+                ereal_icmp(IntCmpOp::Gt, t3.clone(), t1.clone()),
+                ereal_icmp(IntCmpOp::Gt, t3.clone(), t2.clone()),
+            ),
+        ]),
+    ])
+}
+
+/// Division (§5): `D = e1-e2 + max(u1,u2) + 3` with the `divGuard`
+/// conjunct (violations are UNSAT: no finite bound absorbs a
+/// denominator interval spanning zero).
+fn ereal_div(a: &Expr, b: &Expr, r: &Expr) -> Formula {
+    let (ea, pa, ka) = (ereal_lane(a, "e"), ereal_lane(a, "p"), ereal_lane(a, "k"));
+    let (eb, pb, kb) = (ereal_lane(b, "e"), ereal_lane(b, "p"), ereal_lane(b, "k"));
+    let (er, pr, kr) = (ereal_lane(r, "e"), ereal_lane(r, "p"), ereal_lane(r, "k"));
+    let u1 = ereal_sub(ka.clone(), pa.clone());
+    let u2 = ereal_sub(kb.clone(), pb.clone());
+    let base = ereal_sub(ea.clone(), eb.clone());
+    let b_exp = ereal_sub(er, pr.clone());
+    let case = |dom: &IntExpr, lo: Formula| {
+        ereal_and_all(vec![
+            lo,
+            ereal_combine_eq(
+                &kr,
+                &ereal_add(ereal_add(base.clone(), dom.clone()), ereal_lit(3)),
+                &b_exp,
+            ),
+        ])
+    };
+    ereal_and_all(vec![
+        ereal_wellformed(a),
+        ereal_wellformed(b),
+        ereal_wellformed(r),
+        ereal_div_guard(b),
+        ereal_min_eq(&pr, &pa, &pb),
+        ereal_or_all(vec![
+            case(
+                &u1,
+                ereal_icmp(IntCmpOp::Gte, u1.clone(), u2.clone()),
+            ),
+            case(
+                &u2,
+                ereal_icmp(IntCmpOp::Gt, u2.clone(), u1.clone()),
+            ),
+        ]),
+    ])
+}
+
+
+/// `setEReal[x, lit]`: bind `x`'s lanes to the optimal conversion of
+/// the decimal literal (same conversion as `:mepk lit` at `max_p`).
+/// Desugars to four lane equalities; the literal text is never rounded
+/// through `f64`. Out-of-range literals fail loudly at lowering.
+fn ereal_set(x: &Expr, lit: &Expr, max_p: u32) -> LResult<Formula> {
+    let s = match lit {
+        Expr::RealLit(s, _) => s.clone(),
+        _ => {
+            return Err(FrontError::Resolve(
+                "setEReal expects a decimal literal (e.g. 3.14) as its second argument".to_string(),
+            ))
+        }
+    };
+    let conv = decimal_to_mepk(&s, max_p).ok_or_else(|| {
+        FrontError::Resolve(format!(
+            "setEReal: cannot convert {s:?} (malformed or outside the i128 oracle range)"
+        ))
+    })?;
+    // Lane widths are ≤ 30 bits, so all lanes fit in i64.
+    let lanes = [
+        ("m", conv.v.m as i64),
+        ("e", conv.v.e as i64),
+        ("p", conv.v.p as i64),
+        ("k", conv.v.k as i64),
+    ];
+    let mut parts = Vec::with_capacity(4);
+    for (lane, v) in lanes {
+        parts.push(Formula::IntCmp(
+            IntCmpOp::Eq,
+            ereal_lane(x, lane),
+            IntExpr::Lit(v, 0),
+            0,
+        ));
+    }
+    Ok(ereal_and_all(parts))
+}
+
+
 fn total_order_target(sig_arg: &Expr, rel_arg: &Expr) -> Option<(String, String)> {
     let Expr::Name(sig, _) = sig_arg else {
         return None;
@@ -3798,7 +4368,7 @@ fn field_mult_constraint(
 fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
     match e {
         Expr::Name(n, _) if n == from => to.clone(),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) => {
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) => {
             e.clone()
         }
         Expr::Bin(op, a, b) => Expr::Bin(

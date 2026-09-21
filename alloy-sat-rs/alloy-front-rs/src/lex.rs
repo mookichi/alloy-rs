@@ -4,6 +4,9 @@
 pub enum Tok {
     Ident(String),
     Int(i64),
+    /// Decimal real literal, exact source text (e.g. `3.14`, `.5`, `1e-3`).
+    /// Only valid inside `setEReal`; never f64-rounded.
+    RealLit(String),
     // keywords
     Module,
     Sig,
@@ -117,6 +120,7 @@ impl Tok {
         match self {
             Tok::Ident(_) => "identifier",
             Tok::Int(_) => "integer",
+            Tok::RealLit(_) => "decimal",
             Tok::Module => "'module'",
             Tok::Sig => "'sig'",
             Tok::Abstract => "'abstract'",
@@ -247,6 +251,29 @@ fn is_ident_char(c: char) -> bool {
         || c == '\u{201D}'  // right double quotation mark
 }
 
+/// Scan a fraction + optional exponent at `*i` (caller consumed the
+/// introducer: digits-then-dot, or a bare dot). Used for `RealLit`.
+fn scan_frac_exp(b: &[u8], i: &mut usize) {
+    while *i < b.len() && (b[*i] as char).is_ascii_digit() {
+        *i += 1;
+    }
+    // Optional exponent: `e`/`E` + optional sign + ≥1 digit. The `e`
+    // without trailing digits is left for later tokens.
+    if *i < b.len() && (b[*i] == b'e' || b[*i] == b'E') {
+        let mut j = *i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        let k = j;
+        while j < b.len() && (b[j] as char).is_ascii_digit() {
+            j += 1;
+        }
+        if j > k {
+            *i = j;
+        }
+    }
+}
+
 /// Tokenizes `src`. Comments (`//`, `--`, `/* */`) and whitespace are
 /// skipped. Positions are byte offsets into the original source.
 pub fn lex(src: &str) -> Result<Vec<Token>, crate::FrontError> {
@@ -347,7 +374,21 @@ pub fn lex(src: &str) -> Result<Vec<Token>, crate::FrontError> {
             ')' => push(&mut out, Tok::RParen, start, &mut i),
             ':' => push(&mut out, Tok::Colon, start, &mut i),
             ',' => push(&mut out, Tok::Comma, start, &mut i),
-            '.' => push(&mut out, Tok::Dot, start, &mut i),
+            '.' => {
+                // `.5` form: a dot directly followed by a digit starts a
+                // decimal literal; otherwise a plain Dot (join).
+                if i + 1 < b.len() && (b[i + 1] as char).is_ascii_digit() {
+                    i += 1; // consume '.'
+                    scan_frac_exp(b, &mut i);
+                    let txt = src[start..i].to_string();
+                    out.push(Token {
+                        tok: Tok::RealLit(txt),
+                        pos: start,
+                    });
+                } else {
+                    push(&mut out, Tok::Dot, start, &mut i);
+                }
+            }
             '|' => push(&mut out, Tok::Bar, start, &mut i),
             ';' => push(&mut out, Tok::Semi, start, &mut i),
             '+' => push(&mut out, Tok::Plus, start, &mut i),
@@ -374,10 +415,49 @@ pub fn lex(src: &str) -> Result<Vec<Token>, crate::FrontError> {
                         .saturating_add((b[i] - b'0') as i64);
                     i += 1;
                 }
-                out.push(Token {
-                    tok: Tok::Int(v),
-                    pos: start,
-                });
+                // Decimal literal: int digits + `.` + ≥1 fraction digit
+                // (e.g. `3.14`), or a trailing exponent (`1e3`). A `.`
+                // or `e` without following digits keeps the legacy
+                // `Int`-then-`Dot`/`Ident` lexing. Exact text is kept.
+                let is_frac = i < b.len()
+                    && b[i] == b'.'
+                    && i + 1 < b.len()
+                    && (b[i + 1] as char).is_ascii_digit();
+                // Exponent lookahead without consuming: `e`/`E` +
+                // optional sign + ≥1 digit.
+                let mut j = i;
+                let is_exp = (j < b.len() && (b[j] == b'e' || b[j] == b'E')) && {
+                    j += 1;
+                    if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+                        j += 1;
+                    }
+                    let k = j;
+                    while j < b.len() && (b[j] as char).is_ascii_digit() {
+                        j += 1;
+                    }
+                    j > k
+                };
+                if is_frac {
+                    i += 1; // consume '.'
+                    scan_frac_exp(b, &mut i);
+                    let txt = src[start..i].to_string();
+                    out.push(Token {
+                        tok: Tok::RealLit(txt),
+                        pos: start,
+                    });
+                } else if is_exp {
+                    i = j;
+                    let txt = src[start..i].to_string();
+                    out.push(Token {
+                        tok: Tok::RealLit(txt),
+                        pos: start,
+                    });
+                } else {
+                    out.push(Token {
+                        tok: Tok::Int(v),
+                        pos: start,
+                    });
+                }
             }
             _ if is_ident_start(c) => {
                 while i < b.len() && is_ident_char(b[i] as char) {
