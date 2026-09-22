@@ -19,8 +19,8 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_front_rs::{
-    build_cnf_with, check, command_needs_opt, eval, fragment_keys, optimize, optimize_with,
-    parse_int_expr, parse_module, query_value, run, run_opt_command_with, solve,
+    build_cnf_with, check, command_needs_opt, eval, eval_in_scope, fragment_keys, optimize,
+    optimize_with, parse_int_expr, parse_module, query_value, run, run_opt_command_with, solve,
     solve_temporal, validate, validate_temporal, Cnf, CnfKind, CommandKind, Expr,
     IncrementalSession, Instance, KkOptSense, Lowerer, Module, OptSolution, OptTarget,
     OverflowMode, PartialInstance, QueryValue,
@@ -1358,7 +1358,32 @@ fn wrapping_optimum_note(bitwidth: u32, sol: &OptSolution) -> Option<String> {
             println!("no module loaded");
             return;
         }
-        match eval(&self.current_src, expr) {
+        // Ad-hoc checks explore the selected problem: inherit the default
+        // Cnf's command scope when available (e.g. `for N Int` widths that
+        // `setEReal` conversions depend on). Otherwise the default scope.
+        let mut scope_note: Option<String> = None;
+        let mut scope_owned = None;
+        if let (Some(module), Some(cnf_name)) = (self.module.as_ref(), self.default_cnf_name()) {
+            if let Some(cnf) = self.cnfs.get(&cnf_name) {
+                if let Some(cmd) = module.commands.get(cnf.command_index) {
+                    scope_owned = Some(cmd.scope.clone());
+                    scope_note = Some(match &cnf.command_name {
+                        Some(n) => format!("note: :eval inherits scope of `{n}`"),
+                        None => format!("note: :eval inherits scope of `{cnf_name}`"),
+                    });
+                }
+            }
+        }
+        let res = match scope_owned {
+            Some(ref scope) => {
+                if let Some(note) = scope_note {
+                    println!("{note}");
+                }
+                eval_in_scope(&self.current_src, expr, Some(scope))
+            }
+            None => eval(&self.current_src, expr),
+        };
+        match res {
             Ok(sol) => {
                 self.print_solution(&sol.instance, false);
                 if let Some(n) = save_as {
@@ -2069,7 +2094,8 @@ fn print_help() {
     println!("    Use `@ <sol>` as an unambiguous alternative: `:query A @ someA`.");
     println!("  :validate <sol> [in <cnf>]  validate solution vs Cnf (no in = its origin Cnf)");
     println!("  :show [name] [N]            show Cnf clauses and/or solution (no arg = defaults)");
-    println!("  :eval <expr> [as <sol>]     satisfiability check (bare expr lifts with some)
+    println!("  :eval <expr> [as <sol>]     satisfiability check (bare expr lifts with some;
+                              inherits the *default Cnf's command scope when selected)
   :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <n>]
                             result as c ± R (tau); -v adds tuples and detail
   :mepk lit <decimal> [p <maxp>] [n <intcount>]

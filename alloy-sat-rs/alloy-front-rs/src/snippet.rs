@@ -84,6 +84,18 @@ pub fn eval(
     source: &str,
     input: &str,
 ) -> Result<alloy_kodkod_rs::solver::Solution, FrontError> {
+    eval_in_scope(source, input, None)
+}
+
+/// [`eval`], but the synthesized trailing `run { ... }` uses `scope` when
+/// given (REPL `:eval` inherits the selected Cnf's command scope so ad-hoc
+/// checks explore the same problem, e.g. the same `for N Int` widths that
+/// `setEReal` conversions depend on). `None` keeps the default scope.
+pub fn eval_in_scope(
+    source: &str,
+    input: &str,
+    scope: Option<&Scope>,
+) -> Result<alloy_kodkod_rs::solver::Solution, FrontError> {
     let body = if parse_formula(input).is_ok() {
         input.to_string()
     } else {
@@ -92,12 +104,15 @@ pub fn eval(
         format!("some ({input})")
     };
     let wrapped = format!("{source}\nrun {{ {body} }}");
-    let m = crate::parse_module(&wrapped)?;
+    let mut m = crate::parse_module(&wrapped)?;
     let idx = m
         .commands
         .len()
         .checked_sub(1)
         .ok_or_else(|| FrontError::Resolve("eval produced no command".to_string()))?;
+    if let Some(scope) = scope {
+        m.commands[idx].scope = scope.clone();
+    }
     crate::run_command(&m, idx)
 }
 

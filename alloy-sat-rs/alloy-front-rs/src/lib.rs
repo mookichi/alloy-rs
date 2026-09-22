@@ -38,7 +38,8 @@ pub use incremental::{IncrementalSession, MultKind, SessionStats};
 pub use partial::{verifier_pin_from_partial, PartialInstance, PartialInt, PartialRel};
 pub use cegis::{run_cegis, CegisConfig, CegisOutcome, CegisReport};
 pub use snippet::{
-    eval, fragment_keys, parse_expr, parse_formula, parse_int_expr, query, query_value, QueryValue,
+    eval, eval_in_scope, fragment_keys, parse_expr, parse_formula, parse_int_expr, query,
+    query_value, QueryValue,
 };
 pub use alloy_kodkod_rs::tupleset::TupleSet;
 pub use alloy_kodkod_rs::instance::Instance;

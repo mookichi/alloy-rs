@@ -1,7 +1,8 @@
 //! Tests for the REPL snippet API: fragments, bare expressions, eval, query.
 
 use alloy_front_rs::{
-    eval, fragment_keys, parse_expr, parse_int_expr, query, query_value, run, solve, QueryValue,
+    eval, eval_in_scope, fragment_keys, parse_expr, parse_int_expr, query, query_value, run,
+    solve, QueryValue,
 };
 
 const DEMO: &str = r#"
@@ -67,6 +68,44 @@ fn eval_lifts_bare_expression() {
     assert!(sat.satisfiable);
     // garbage is a clean error
     assert!(eval(DEMO, "A +").is_err());
+}
+
+#[test]
+fn eval_in_scope_inherits_widths() {
+    // `setEReal` conversions depend on `for N Int` widths: the inherited
+    // scope must drive the synthesized `run`, not the default scope.
+    let src = "one sig X extends EReal\nfact { setEReal[X, 0.5] }\nrun {} for 8 Int";
+    let m = alloy_front_rs::parse_module(src).expect("parse");
+    let scope = m.commands[0].scope.clone();
+    // Default scope (int_count 4): coarse lanes.
+    let coarse = eval(src, "X").expect("eval");
+    let ci = coarse.instance.expect("SAT");
+    // Inherited `for 8 Int` scope: fine lanes (max_p 8).
+    let fine = eval_in_scope(src, "X", Some(&scope)).expect("eval");
+    let fi = fine.instance.expect("SAT");
+    let plane = |inst: &alloy_front_rs::Instance, rel: &str| -> Vec<String> {
+        // Lane rows of X's (single) atom only; sibling EReal atoms carry
+        // unconstrained lanes.
+        let xr = inst.find_relation_by_name("X").expect("X rel");
+        let xts = inst.tuples(xr).unwrap();
+        let u = inst.universe();
+        let n = u.size() as i64;
+        let owner = xts.index_view().iter().next().expect("X nonempty");
+        let r = inst.find_relation_by_name(rel).expect("lane rel");
+        let ts = inst.tuples(r).unwrap();
+        let mut out: Vec<String> = ts
+            .index_view()
+            .iter()
+            .filter(|flat| *flat / n == owner)
+            .map(|flat| u.atom((flat % n) as usize).unwrap().to_string())
+            .collect();
+        out.sort();
+        out
+    };
+    // Same value, different precision: the p lane reads max_p (4 vs 8),
+    // so its bit set differs.
+    assert_ne!(plane(&ci, "EReal.p"), plane(&fi, "EReal.p"));
+    assert_eq!(plane(&fi, "EReal.p"), vec!["P$3".to_string()]);
 }
 
 fn solved_demo() -> (
