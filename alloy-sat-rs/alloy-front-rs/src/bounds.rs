@@ -11,6 +11,7 @@ use alloy_kodkod_rs::tuple::Tuple;
 use alloy_kodkod_rs::tupleset::TupleSet;
 use alloy_kodkod_rs::universe::Universe;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub const DEFAULT_SCOPE: u32 = 3;
@@ -125,6 +126,34 @@ fn build_scope_map(
     let int_count = crate::ast::effective_int_count(scope);
     let needs_int = crate::ast::module_needs_int_atoms(module, scope);
     (m, overall, bitwidth, int_count, needs_int)
+}
+
+/// Sigs that transitively `extend` the builtin `EReal` (through
+/// `extends`-links only; `in`-children are handled separately).
+/// Fixed point so declaration order does not matter.
+pub fn ereal_extenders(module: &Module) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    loop {
+        let mut grew = false;
+        for sd in &module.sigs {
+            if sd.rel == SigRel::In {
+                continue;
+            }
+            if let Some(p) = &sd.extends {
+                if p == "EReal" || out.contains(p) {
+                    for n in &sd.names {
+                        if out.insert(n.clone()) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    out
 }
 
 /// True when the module mentions the builtin `EReal` (as a type, a scope
@@ -339,8 +368,8 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             ScopeEntry::Num(n) | ScopeEntry::Exactly(n) => *n,
         })
         .unwrap_or(DEFAULT_SCOPE);
-    // `EReal` is a reserved builtin: user declarations, or non-`in`
-    // extension, are rejected (mirrors the `extends Int` rule).
+    // `EReal` is a reserved builtin: user declarations are rejected
+    // (extension is allowed: `in` shares atoms, `extends` partitions).
     for sd in &module.sigs {
         if sd.names.iter().any(|n| n == "EReal") {
             return Err("sig EReal is reserved by the builtin EReal signature".to_string());
@@ -375,12 +404,10 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
                     children.entry(p.clone()).or_default().push(n.clone());
                 } else if p == "EReal" {
                     // Builtin `EReal`: `in EReal` accepted (subset of the
-                    // EReal atoms); `extends EReal` rejected like `Int`.
-                    if sd.rel != SigRel::In {
-                        return Err(format!(
-                            "sig {n} cannot extend the builtin \"{p}\" signature"
-                        ));
-                    }
+                    // EReal atoms); `extends EReal` accepted with Alloy
+                    // partition semantics (subset + disjoint siblings +
+                    // parent covered by extenders; membership constraints
+                    // in lower.rs, shared upper bounds below).
                     children.entry(p.clone()).or_default().push(n.clone());
                 } else {
                     if !all_names.iter().any(|x| x == p)
@@ -582,13 +609,19 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             // `Int`/`Signed`/`EReal`
             if cur == "Int" || cur == "Signed" {
                 in_children_atoms.insert(n.clone(), int_atoms.clone());
-            } else if cur == "EReal" {
+            } else if cur == "EReal" || ereal_extenders(&module).contains(&cur) {
                 in_children_atoms.insert(n.clone(), ereal_atoms.clone());
             } else {
                 let root_atoms = atoms_of.get(&cur).cloned().unwrap_or_default();
                 in_children_atoms.insert(n.clone(), root_atoms);
             }
         }
+    }
+    // `extends EReal` descendants share the EReal atoms as their upper
+    // bound (like `in` children); the partition (subset/disjoint/cover)
+    // is enforced by formulas in lower.rs.
+    for n in ereal_extenders(&module) {
+        in_children_atoms.insert(n, ereal_atoms.clone());
     }
 
     // closure atoms: include own + descendants

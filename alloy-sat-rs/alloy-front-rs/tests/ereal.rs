@@ -79,11 +79,35 @@ fn ereal_in_user_sig_fields() {
 #[test]
 fn in_ereal_accepted_extends_rejected() {
     sat("sig X in EReal {}\npred p { some x: X | erealWellformed[x] }\nrun p for 2 EReal");
-    build_err(
-        "sig X extends EReal {}\npred p { some X }\nrun p for 1",
-        "cannot extend",
-    );
     build_err("sig EReal {}\npred p { some EReal }\nrun p for 1", "reserved");
+}
+
+#[test]
+fn extends_ereal_partitions() {
+    // A lone extender covers the parent.
+    sat("sig X extends EReal {}\npred p { some X }\nrun p for 2 EReal");
+    unsat(
+        "sig X extends EReal {}\npred p { some EReal - X }\nrun p for 2 EReal",
+    );
+    // Lanes work through extenders.
+    sat("sig X extends EReal {}\npred p { some x: X | setEReal[x, 0.5] }\nrun p for 2 EReal");
+    // Siblings are disjoint: one atom cannot host both.
+    unsat(
+        "sig X extends EReal {}\nsig Y extends EReal {}\npred p { some X and some Y }\nrun p for 1 EReal",
+    );
+    sat(
+        "sig X extends EReal {}\nsig Y extends EReal {}\npred p { some X and some Y }\nrun p for 2 EReal",
+    );
+    unsat(
+        "sig X extends EReal {}\nsig Y extends EReal {}\npred p { some (X & Y) }\nrun p for 3 EReal",
+    );
+    // Nested extenders partition level by level.
+    sat(
+        "abstract sig S extends EReal {}\nsig A extends S {}\nsig B extends S {}\npred p { some A and some B }\nrun p for 2 EReal",
+    );
+    unsat(
+        "abstract sig S extends EReal {}\nsig A extends S {}\nsig B extends S {}\npred p { some (A & B) }\nrun p for 3 EReal",
+    );
 }
 
 #[test]

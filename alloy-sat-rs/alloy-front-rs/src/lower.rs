@@ -191,6 +191,105 @@ impl<'m> Lowerer<'m> {
                         }
                     }
                 }
+                // `extends EReal` partition (Alloy hierarchy semantics over
+                // the shared EReal atoms): each extender is a subset of its
+                // parent, siblings are disjoint, and a parent is covered by
+                // its direct extenders. Transitive (`A extends B extends
+                // EReal`) handled level by level; `in`-children keep the
+                // subset-only rule above.
+                {
+                    use std::collections::HashSet;
+                    let mut rooted: HashSet<String> = HashSet::new();
+                    rooted.insert("EReal".to_string());
+                    let mut kids_of: HashMap<String, Vec<String>> = HashMap::new();
+                    loop {
+                        let mut grew = false;
+                        for sd in &ctx.module.sigs {
+                            if sd.rel == crate::ast::SigRel::In {
+                                continue;
+                            }
+                            if let Some(p) = &sd.extends {
+                                if rooted.contains(p) {
+                                    for n in &sd.names {
+                                        let e = kids_of.entry(p.clone()).or_default();
+                                        if !e.contains(n) {
+                                            e.push(n.clone());
+                                        }
+                                        if rooted.insert(n.clone()) {
+                                            grew = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !grew {
+                            break;
+                        }
+                    }
+                    let rel_of = |ctx: &Ctx<'_>, name: &str| {
+                        ctx.lookup_rel(name).ok_or_else(|| {
+                            FrontError::Resolve(format!("unknown sig '{name}'"))
+                        })
+                    };
+                    // `no (A op B)` helper.
+                    let no_some = |arena: &mut kk::AstArena,
+                                   op: kk::BinaryOp,
+                                   a: RelationId,
+                                   b: RelationId| {
+                        let ae = arena.expr_relation(a);
+                        let be = arena.expr_relation(b);
+                        let combined = arena
+                            .binary_expr(op, ae, be)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        let some = arena
+                            .multiplicity_formula(Multiplicity::Some, combined)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        Ok::<_, FrontError>(arena.not(some))
+                    };
+                    let mut parents: Vec<String> = kids_of.keys().cloned().collect();
+                    parents.sort();
+                    for p in &parents {
+                        let kids = &kids_of[p];
+                        let pe = rel_of(ctx, p)?;
+                        // subset: kid in parent
+                        for k in kids {
+                            let ke = rel_of(ctx, k)?;
+                            parts.push(no_some(arena, kk::BinaryOp::Difference, ke, pe)?);
+                        }
+                        // disjoint siblings
+                        for (i, a) in kids.iter().enumerate() {
+                            for b in &kids[..i] {
+                                let ae = rel_of(ctx, a)?;
+                                let be = rel_of(ctx, b)?;
+                                parts.push(no_some(
+                                    arena,
+                                    kk::BinaryOp::Intersection,
+                                    ae,
+                                    be,
+                                )?);
+                            }
+                        }
+                        // coverage: parent in union(kids)
+                        let mut union = {
+                            let first = rel_of(ctx, &kids[0])?;
+                            arena.expr_relation(first)
+                        };
+                        for k in &kids[1..] {
+                            let ke = arena.expr_relation(rel_of(ctx, k)?);
+                            union = arena
+                                .binary_expr(kk::BinaryOp::Union, union, ke)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        }
+                        let pe2 = arena.expr_relation(pe);
+                        let diff = arena
+                            .binary_expr(kk::BinaryOp::Difference, pe2, union)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        let some_diff = arena
+                            .multiplicity_formula(Multiplicity::Some, diff)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        parts.push(arena.not(some_diff));
+                    }
+                }
                 // AlloyMax `soft fact`s: lowered and wrapped as soft
                 // formulas (optimized, not asserted).
                 for (_, f) in &ctx.module.soft_facts {
