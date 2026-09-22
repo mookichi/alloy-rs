@@ -216,3 +216,14 @@ java -Dalloy.native.lib.alloy_engine=$PWD/alloy-sat-rs/target/release/liballoy_e
   -jar org.alloytools.alloy.dist/target/org.alloytools.alloy.dist.jar \
   exec --engine rust -f org.alloytools.alloy.extra/extra/models/book/appendixA/ring.als
 ```
+
+### Iter 13 以降: bitmask-Int / 最適化 / Mepk
+- **bitmask統一Int**: 原子は符号なしW個、回路幅E=W+1、集合はbitmask値で読む。
+  `Signed`ビュー・`MSB`・intアトム遅延割当。詳細は `docs/java-divergences.md` §3。
+- **最適化**: `maximize/minimize`コマンド、pred内マーカー、
+  `maxsome/minsome/soft fact`(AlloyMax subset)。`some/no Overflow`探索モード。
+  詳細は同doc §6〜8。
+- **Mepk/EReal**: 誤差追跡`(m,e,p,k)`擬似実数。Rust
+  (`alloy-kodkod-rs/src/mepk.rs`、front `ereal`、repl `mepk_cmd`)と
+  Javaオラクル(`org.alloytools.alloy.core/.../alloy4/MepkOps.java` +
+  `models/util/mepk.als`、テスト`MepkOpsTest`: 10 tests)が対になる。
