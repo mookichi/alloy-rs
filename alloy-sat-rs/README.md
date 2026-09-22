@@ -1,229 +1,107 @@
 # alloy-sat-rs
 
-Rust 製 SAT ソルバ層(Alloy/Pardinus の Rust 化 Phase 1)。
-
-`liballoy_ipasir.so` は **IPASIR 標準 C ABI** を実装する cdylib で、
-Java(JNI)・C/C++・Python 等あらゆる IPASIR クライアントから利用できる。
-
-## 構成
+Alloy/Pardinus の Rust 再実装。`.als` のパースから SAT 求解・最適化・REPL までを
+Rust ネイティブで完結させ、Java 実装は差分オラクルおよび GUI/CLI ホストとして残す。
+Cargo ワークスペース (5 クレート、計 ~33k 行) + Java 対向物 (engine/mepk 等) からなる。
 
 ```
-alloy-ipasir/
-├── src/
-│   ├── lib.rs            IPASIR C ABI(同期ファサード)+ alloy_worker_* 非同期ABI
-│   ├── worker.rs         ワーカースレッド(コマンドチャネル+キャンセルトークン)
-│   ├── backend.rs        Backend trait + CancelToken + ファクトリ
-│   ├── cadical_backend.rs CaDiCaL(増分・assumptions・検索中割り込み対応、既定)
-│   └── splr_backend.rs   Splr(純Rust、assumptions非対応)
-├── tests/
-│   ├── session.rs        Rustレベルの動作テスト
-│   ├── c_abi.rs          dlopenで実シンボルを検証するIPASIR ABIテスト
-│   └── worker_c_abi.rs   非同期ABIテスト(状態ポーリング/中断/並列ワーカー)
-include/ipasir.h         Cクライアント用リファレンスヘッダ
+.als ──► alloy-front-rs ──► alloy-kodkod-rs ──► alloy-ipasir ──► 解
+ (lex/parse/      (FOL→bool→CNF,          (CaDiCaL / Splr)
+  lower/Cnf)       Int/temporal/opt/         ▲
+                   mepk回路)                 │ SatSolver trait
+                                             │
+alloy-repl (対話層: Cnf/解の名前付きstore) ────┘
+alloy-engine-rs (Java↔Rust 直列化 ARE1/ARE2 + C ABI/JNI)
 ```
 
-## スレッドモデル
+## クレート
 
-セッションごとに **Rust ワーカースレッド 1 本** が立ち、バックエンドは
-そのスレッド内に留まる。ホストはコマンドと共有ステータスのみ扱う:
+### `alloy-front-rs` — フロントエンド (lex→parse→lower→Cnf)
+| モジュール | 役割 |
+|---|---|
+| `lex.rs` / `parser.rs` / `ast.rs` / `types.rs` | 字句・構文・AST・型 (Alloy 6 準拠 + 拡張: `<->`、`{A,B}`集合リテラル、`Int`/`Signed`、`partial`、`maximize`/`minimize`、`some/no Overflow`) |
+| `bounds.rs` / `lower.rs` | Universe 構築・Kodkod AST/Bounds への lowering (bitmask-Int、EReal、temporal展開、partial desugar、optマーカー) |
+| `cnf.rs` | `Cnf` (high-level arena+bounds+formula保持): `run`/`check`/`solve`/temporal/validate、二段階 overflow 探索 |
+| `incremental.rs` | `IncrementalSession` (増分セッション) |
+| `partial.rs` | ASTレベル partial instance (`partial`定義 + `pin`/`avoid`) |
+| `cegis.rs` | CEGIS ドライバ |
+| `snippet.rs` | `:eval`/`:query` 用スニペット評価 |
+| `fuzzgen.rs` | 構造化モデル生成 + 力まかせオラクル (fuzz用) |
+| `bin/als.rs` | `als` CLI (`als_solve`例あり) |
 
-```
-ホスト(任意スレッド)            ワーカースレッド
-alloy_worker_add()      ──►    Add(lits)   → backend.add_clause
-alloy_worker_solve()    ──►    Solve       → backend.solve()
-alloy_worker_status()   ◄──    共有スロット (-1 実行中 / 10 / 20 / 0)
-alloy_worker_cancel()   ──►    AtomicBool → CaDiCaL terminate コールバック
-alloy_worker_release()  ──►    Free → drop & join
-```
+テスト 23 ファイル (`e2e`, `bitvec`, `int_bv`, `opt_cmd`, `temporal`, `total_order`, `partial_ast`, `ereal`, `alloymax_sweep`, `overflow_syntax`, `signed_overflow`, `snippets`, …) + fuzz targets。
 
-`ipasir_*` 同期 ABI はこの上の薄いファサード(solve は wait でブロック、
-`ipasir_set_terminate` のコールバックはポーリングで cancel に変換)。
+### `alloy-kodkod-rs` — 関係論理コア (Pardinus 移植)
+| モジュール | 役割 |
+|---|---|
+| `intset`/`universe`/`tuple`/`tupleset`/`relation`/`dimensions`/`bmatrix` | 集合・宇宙・行列基盤 |
+| `ast`/`bounds`/`instance`/`solver` | AST アリーナ・境界・解・求解器 |
+| `bool`/`cnf`/`sat` (+`ipasir_bridge`, feature `ipasir`) | Bool回路・CNF翻訳・バックエンド抽象 |
+| `fol`/`eval`/`simplify`/`skolem` | FOL→bool、評価器、簡単化、Skolem化 |
+| `int`/`int_ext` | 2の補数 `IntCircuit` (加減乗除算・比較・ choice) |
+| `temporal` | 時制展開・評価 |
+| `opt` | OLL/Fu-Malik core-guided 最適化 |
+| `ucore` | UNSATコア (selector assumption + RCE相当最小化) |
+| `mepk` | `(m,e,p,k)` 誤差追跡擬似実数回路 |
+| `pardinus` | Pardinus互換 API |
+
+テスト 25 ファイル (`fol`, `fol_int`, `int_circuit`, `opt`, `ucore`, `temporal`, `mepk_circuit`, `lane_bits`, `puzzles`, `differential`, …)、計 436 `#[test]`。
+
+### `alloy-repl` — 対話 REPL (`alloy-repl` バイナリ)
+* Cnf と解の名前付き store (`:cnfs`/`:sols`、`*` が既定、` :use` 切替)。
+* `:run`/`:check` で Cnf 構築 → `:solve`/`:next` で求解 → `:query`/`:eval`/`:show`/`:validate` で検査。
+* 最適化: `:optimize`、`:max`/`:min`/`:maxw`/`:minw` (+`cost=` 表示)。
+* バイナリ partial instance: `:psave`/`:pread`/`:ppin`/`:pavoid` (`.apin`)。
+* Mepk: `:mepk add|sub|mul|div|lit|widths` (`mepk_cmd.rs`)。
+* 素行は `:eval` (SAT判定) / `:mode query` 切替で `:query`。詳細は起動後 `:help`。
+* 表示規則: 集合は `{A$0, B$0}` 形 (`fmt.rs`)。
+
+### `alloy-engine-rs` — Java 連携 (`liballoy_engine.so`)
+* 問題直列化 ARE1/ARE2 (solver options + dynamic trailer) → Rust パイプライン → モデル復元。
+* C ABI + JNI (`--features jni`)。Java 側 `RustSerializer`、`A4Solution` のエンジン分岐、CLI `exec --engine rust [--decompose hybrid|parallel] [--core]`。
+* 受け入れ: extra/models 83 例題スイープで Java/Rust 一致 (結果 `docs/engine-sweep-results.txt`)。
+
+### `alloy-ipasir` — SAT 層 (`liballoy_ipasir.so`)
+* IPASIR 標準 C ABI (`ipasir_*` 同期ファサード) + `alloy_worker_*` 非同期 ABI。
+* セッションごとに Rust ワーカースレッド 1 本; バックエンドはそのスレッド内に留まる。
+* バックエンド: `cadical` (既定、増分・assumptions・割込み対応) / `splr` (純Rust、assumptions非対応)。`ALLOY_SAT_BACKEND` で選択。
+* `--features jni` で JNI 10 関数を公開 → Java `IpasirWorker` (`org.alloytools.pardinus.native`)。CLI `exec --solver ipasir`。
+* 制約: `ipasir_set_learn` は no-op。
+
+## 意味論の要点 (Java との差異)
+詳細は `docs/java-divergences.md` (§1–§8)。概要:
+* **構文拡張**: 逆積 `<->`/`-<`、`for Int 8` 等の語順緩和、`{A,B}` 集合リテラル。
+* **bitmask統一Int** (§3): `for W Int` で原子 `{0..W-1}`、回路幅 `E=min(W+1,30)`。
+  int位置の集合は bitmask 値 (`X = 5` ⟺ `X = {0,2}`)。`Signed` ビュー、`MSB`、intアトム遅延割当。
+* **partial/pin/avoid** (§5): ASTレベル部分インスタンス (`Sig$tag` ラベルは定義内局所)。
+* **最適化** (§6): `maximize`/`minimize` コマンド、pred内マーカー (時制では `initially`/`goal`/`restore` で時点指定)、`maxsome`/`minsome`/`soft fact` (AlloyMax subset)。
+* **オーバーフロー** (§7–§8): `some/no Overflow {F}`。`run` は溢れなし優先+fallback、`check` は wrapping 優先。評価器は E-bit ラップ。
+* **Mepk/EReal**: `(m,e,p,k)` 形式。`sig A { x: EReal }`、`erealAdd/Sub/Mul/Div`、`setEReal[x, 3.14]`。Java 対向物は `org.alloytools.alloy.core` の `MepkOps.java` + `models/util/mepk.als` (`MepkOpsTest`: 10 tests)。
 
 ## ビルド / テスト
 
 ```sh
-cargo build --release        # target/release/liballoy_ipasir.so
-cargo test                   # 既定: cadical + splr の両バックエンド
-cargo test --no-default-features --features cadical
-cargo test --no-default-features --features splr
+cargo build --release
+cargo test --workspace --exclude alloy-ipasir   # 既定 (CaDiCaLのC++ビルド回避)
+cargo test -p alloy-kodkod-rs --features ipasir # E2E/differential 込み
+cargo test -p alloy-ipasir                      # SAT層 (cadical+splr)
+cargo run -p alloy-repl                         # REPL
+cargo run -p alloy-front-rs --bin als -- --help # CLI
 ```
 
-## バックエンド選択
-
-実行時に `ALLOY_SAT_BACKEND` 環境変数で指定(`cadical` / `splr`)。
-未指定なら cadical(splr が入っていればその次)の順。
-
-| | cadical | splr |
-|---|---|---|
-| 増分解決 | ◎ | △(毎solve再構築) |
-| assumptions / UNSATコア(`failed`) | ○ | ✗ |
-| 実装 | C++(cargoがビルド) | 純Rust |
-| ライセンス | MIT | MPL-2.0 |
-
-## C API(IPASIR、同期)
-
-```c
-#include "ipasir.h"
-void *s = ipasir_init();
-ipasir_add(s, 1); ipasir_add(s, 2); ipasir_add(s, 0); /* x1 ∨ x2 */
-int r = ipasir_solve(s);            /* 10=SAT, 20=UNSAT, 0=中断/不明 */
-if (r == 10) { int v = ipasir_val(s, 1); }
-ipasir_assume(s, -3);               /* 次のsolveへの仮定 */
-if (ipasir_solve(s) == 20 && ipasir_failed(s, -3)) {
-    /* -3 は UNSAT コアに参加(失敗仮定) */
-}
-ipasir_set_terminate(s, state, my_abort_cb); /* solve中の割り込み */
-ipasir_release(s);
-```
-
-## C API(alloy_worker_*、非同期)
-
-```c
-void *w = alloy_worker_init();
-int32_t c[2] = {1, 2};
-alloy_worker_add(w, c, 2);
-alloy_worker_assume(w, 5);          /* 次のsolveへの仮定(solveで消費) */
-alloy_worker_solve(w);              /* ノンブロッキング */
-while (alloy_worker_status(w) == -1) { /* 他の処理 */ }
-int r = alloy_worker_wait(w);       /* 最終値で確定待ち */
-if (r == 10) int v = alloy_worker_val(w, 1);
-else if (r == 20 && alloy_worker_failed(w, 5)) { /* 失敗仮定 */ }
-alloy_worker_cancel(w);             /* 実行中断(任意スレッドから) */
-alloy_worker_release(w);
-```
-
-## 既知の制約(v0)
-
-- `ipasir_set_learn` は no-op(オプション機能)
-- splr バックエンドは assumptions 非対応(失敗仮定も取得不可)
-
-## Java 統合(実装済み)
-
-`--features jni` でビルドすると `liballoy_ipasir.so` が JNI エクスポート
-(10 関数)を公開し、Java 側の `IpasirWorker`
-(`org.alloytools.pardinus.native` モジュール)から使える。
-
-```bash
-cargo build --release --features jni
-cp target/release/liballoy_ipasir.so \
-   ../org.alloytools.pardinus.native/native/linux/amd64/
-cd .. && ./gradlew :org.alloytools.pardinus.native:test   # JUnit 4, 6 tests
-```
-
-- `IpasirWorker implements SATSolver`: 同期 API に加え
-  `solveAsync()/status()/waitSolution()/cancel()/literalValue(int)` を提供。
-  `free()` 後の呼び出しは `IllegalStateException`、二重 `free()` は no-op。
-- `IpasirRef extends SATFactory`: id=`ipasir`、`@ServiceProvider` 登録済み。
-  dist jar の `solvers` 一覧に表示され、CLI では
-  `exec --solver ipasir -f model.als` で使用する。
-- 単体テストはバンドル jar を経由しないため、テスト側で
-  `-Dalloy.native.lib.alloy_ipasir=<soへのパス>` を設定して読み込む。
-
-## alloy-kodkod-rs(Pardinus コア移行・第1段)
-
-`docs/pardinus-core-survey.md` に調査と設計を記載。実装済み:
-
-- `IntSet`: **i64** ソート済疎集合(和/交/差/min/max/bulk 演算)
-- `Universe`: `Arc<str>` アトム、参照同一性(`Arc::ptr_eq`=Java の identity equals)
-- `Tuple`: (arity, index) のみ保持し atom 列は遅延復元(Java IntTuple 相当)
-- `TupleSet`: arity + 索引集合。product/project/range、容量は i64 checked
-
-```bash
-cargo test -p alloy-kodkod-rs   # 10 tests
-```
-
-### Bool2CNFTranslator 移植(第2段)
-- `bool::BoolFactory` — 回路アリーナ。`BoolRef(i32)` 符号付き参照で Not を
-  無コスト表現(Java の label 反転と等価)、定数畳み込み+ゲートキャッシュ
-- `cnf::translate_to_cnf / translate_into_solver` — 定義的翻訳+極性最適化
-- `sat::SatSolver` トレイトでバックエンド非依存(RecordingSolver/将来 ipasir 橋)
-
-### エンドツーエンド(feature `ipasir`)
-`IpasirSolver` が `SatSolver` を実装し、回路→CNF→CaDiCaL(ワーカースレッド)
-が Rust 内で完結:
-
-```bash
-cargo test -p alloy-kodkod-rs --features ipasir   # +2 tests(fuzz 30 cases)
-```
-
-### Iter 1 完了: relation/bounds/instance
-- RelationPool を抽出し AST↔インスタンス層で同一 id 空間
-- Bounds(挿入順・Java同形式Display)/Instance 材料化API
-- テスト計38(+ipasir時40)、デモ `cargo run --example ring_bounds`
-
-### Iter 2 完了: dimensions/bmatrix
-- Dimensions(dot/cross/transpose、行優先変換)
-- BooleanMatrix(疎セル+欠損=FALSE意味論、not欠損→TRUE規則、choice/cross/transpose)
-- テスト計46(+ipasir時48)、デモ `cargo run --example matrix_demo`
-
-
-### Iter 3 完了: fol(FOL→bool 関係子セット)
-- BooleanMatrix に join / ^闭包 / override_values(Kodkod行単位定義)追加
-- FolTranslator: 境界→回路(下限TRUE/上限差分変数)、量化子は宣言直積、
-  comprehension/multiplicity/if式対応(int・時制は後続Iter)
-- テスト計59(ipasir時61)。デモ `cargo run --example fol_demo --features ipasir`
-
-
-### Iter 4 完了: int(TwosComplementInt)
-- IntCircuit: 加減乗/非回復除算/bitwise/shl-shr-sha/比較/choice
-- FolTranslator 統合: #基数・sum(int境界)・int比較6種・FromInt
-- BoolFactory::ite に定数簡約8則(ConstantInside 問題解消)
-- テスト計72(ipasir時74)
-
-### Iter 9 完了: UNSAT コア(`-core=rce` 相当)
-- `ipasir_failed` / `alloy_worker_failed` + `alloy_worker_assume`(失敗仮定)
-- `SatSolver` 拡張(assume/failed)、RecordingSolver は厳密最小コアを全列挙で算出
-- `ucore`: 連言フラット化→各項を selector **assumption** 化(定義のみ翻訳)
-  → failed から初期コア → RCE相当の削除フィルタ最小化
-- CNFレベル `SoftGroup`+`extract_cnf_core`、デモ
-  `cargo run --release --example sudoku_core --features ipasir`
-  (矛盾ヒント2つを3ソルブで特定)。設計記録は survey doc §7
-
-### Iter 10 完了: Java 逆統合(`--engine rust`)
-- 新クレート `alloy-engine-rs`: 問題直列化(ARE1)→ Rust パイプライン →
-  モデル復元。C ABI + JNI(`RustEngineProxy.solveNative`)
-- Java: `RustSerializer`(kodkod AST/Bounds ⇄ ARE1)、`A4Solution.solve()` の
-  エンジン分岐、CLI `exec --engine rust`
-- 受け入れ: extra/models 全83例題を両エンジン走査 → **結果100%一致**
-  (`scripts/sweep-engines.sh`、結果は docs/engine-sweep-results.txt)
-
-### Iter 11 完了: Wire v2 — 分解とオプションの JNI 有効化
-- **ARE2**: solver options(skolemize / decompose mode / threads)+
-  dynamic 用 trailer(partial 関係 + 記号境界)
-- Java `RustSerializer` が PardinusBounds の**式境界を実体化**(Evaluator
-  固定点評価)。IMPLIES/IFF は脱糖して対応
-- Rust `solve_dynamic` が記号境界を stage-1 モデルから解決し stage-2 へ適用
-  (Pardinus「stage 2 consumes stage 1」)
-- CLI: `exec --engine rust --decompose hybrid|parallel`
-- 受け入れ: ring.als 全モード SAT 一致、83 例題パリティ維持
-
-### Iter 12 完了: UNSAT Core の Java 統合(--core)
-- Wire ARE2 に want_core ビット + `AUNC` 回答(犯者連言のノード位置列)
-- Java: `Serialized.coreOf()`、`A4Solution.rustCore`、CLI `exec --core`
-  で UNSAT 時の犯者制約を表示
-- `no e` フォーミュラのデシュガー(¬some)対応
-- **sweep 実測修正**: Iter 10/11 の sweep は出力ディレクトリ未作成で全行
-  Error/Error の空一致だったことが発覚 → スクリプト修正し再計測。
-  実パリティ測定の過程で 2 件の真ミスマッチ(偽 SAT)を検出 →
-  `bool.rs fold()` の吸収則が否定複合キッドを符号無視で吸収する
-  不具合と特定・修正。修正後の再スイープで応答レベル矛盾 0 件
-  (SAT/SAT 25, UNSAT/UNSAT 11, 未対応構文 Error 45, 他 2)
-
-```bash
-cargo build --release -p alloy-engine-rs --features jni   # liballoy_engine.so
-JAVA_HOME=~/.sdkman/candidates/java/25-amzn ./gradlew :org.alloytools.alloy.dist:build -x test
+Java 連携:
+```sh
+cargo build --release -p alloy-engine-rs --features jni  # liballoy_engine.so
+./gradlew :org.alloytools.alloy.core:test --tests "edu.mit.csail.sdg.alloy4.MepkOpsTest"
 java -Dalloy.native.lib.alloy_engine=$PWD/alloy-sat-rs/target/release/liballoy_engine.so \
   -jar org.alloytools.alloy.dist/target/org.alloytools.alloy.dist.jar \
   exec --engine rust -f org.alloytools.alloy.extra/extra/models/book/appendixA/ring.als
 ```
 
-### Iter 13 以降: bitmask-Int / 最適化 / Mepk
-- **bitmask統一Int**: 原子は符号なしW個、回路幅E=W+1、集合はbitmask値で読む。
-  `Signed`ビュー・`MSB`・intアトム遅延割当。詳細は `docs/java-divergences.md` §3。
-- **最適化**: `maximize/minimize`コマンド、pred内マーカー、
-  `maxsome/minsome/soft fact`(AlloyMax subset)。`some/no Overflow`探索モード。
-  詳細は同doc §6〜8。
-- **Mepk/EReal**: 誤差追跡`(m,e,p,k)`擬似実数。Rust
-  (`alloy-kodkod-rs/src/mepk.rs`、front `ereal`、repl `mepk_cmd`)と
-  Javaオラクル(`org.alloytools.alloy.core/.../alloy4/MepkOps.java` +
-  `models/util/mepk.als`、テスト`MepkOpsTest`: 10 tests)が対になる。
+## ドキュメント
+* `docs/java-divergences.md` — Java との意図的差異 (§1–§8、現行仕様の正本)
+* `docs/pardinus-core-survey.md` — Pardinus 移行の調査・設計記録
+* `docs/agile-iterations.md` — 反復計画・運営規約
+* `docs/engine-sweep-results.txt` (+ `engine-sweep-oracle.txt`) — 83例題スイープ結果
+* `docs/perf-report.md` — 性能記録
+* `docs/repro/` — 再現用モデル
