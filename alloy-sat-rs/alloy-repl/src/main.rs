@@ -636,6 +636,11 @@ impl Session {
                             hints.signed_fields.insert(format!("{owner}.{fname}"));
                         }
                     }
+                    if expr_is_ereal(&d.expr) {
+                        for fname in &d.names {
+                            hints.ereal_fields.insert(format!("{owner}.{fname}"));
+                        }
+                    }
                 }
             }
         }
@@ -2159,6 +2164,26 @@ fn expr_is_signed(e: &Expr) -> bool {
         | Expr::AtExpr(x) => expr_is_signed(x),
         Expr::Bracket(base, args) => {
             expr_is_signed(base) || args.iter().any(|a| expr_is_signed(a))
+        }
+        _ => false,
+    }
+}
+
+/// True when a field TYPE expression mentions `EReal` (so rows decode to
+/// `c ± R`). Same shape walk as `expr_is_signed`.
+fn expr_is_ereal(e: &Expr) -> bool {
+    match e {
+        Expr::Name(n, _) => n == "EReal",
+        Expr::Bin(_, a, b) => expr_is_ereal(a) || expr_is_ereal(b),
+        Expr::Transpose(x)
+        | Expr::TClosure(x)
+        | Expr::RClosure(x)
+        | Expr::ArrowMult(_, x)
+        | Expr::LeadMult(_, x)
+        | Expr::Prime(x)
+        | Expr::AtExpr(x) => expr_is_ereal(x),
+        Expr::Bracket(base, args) => {
+            expr_is_ereal(base) || args.iter().any(|a| expr_is_ereal(a))
         }
         _ => false,
     }
