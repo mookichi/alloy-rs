@@ -156,6 +156,37 @@ pub fn ereal_extenders(module: &Module) -> HashSet<String> {
     out
 }
 
+/// Sigs whose upper bound is the shared `EReal` population: `extends`
+/// descendants of `EReal` plus `in`-children transitively under them
+/// (including direct `in EReal` children). Sig multiplicities on these
+/// cannot use exact bounds (which would pin every shared atom); lower.rs
+/// enforces them as cardinality formulas instead, mirroring Java
+/// `BoundsComputer` (`one`/`some`/`lone` formulas when bounds do not pin).
+pub fn ereal_shared_sigs(module: &Module) -> HashSet<String> {
+    let mut out = ereal_extenders(module);
+    loop {
+        let mut grew = false;
+        for sd in &module.sigs {
+            if sd.rel != SigRel::In {
+                continue;
+            }
+            if let Some(p) = &sd.extends {
+                if p == "EReal" || out.contains(p) {
+                    for n in &sd.names {
+                        if out.insert(n.clone()) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    out
+}
+
 /// True when the module mentions the builtin `EReal` (as a type, a scope
 /// entry, or an `ereal*` operation call). Conservative: any textual
 /// mention allocates (harmless over-approximation); a missed mention
@@ -766,6 +797,10 @@ pub fn bind_sigs(
 ) -> Result<(), String> {
     use std::collections::HashMap as HM;
     let mut exact: HM<String, bool> = HM::new();
+    // Sigs sharing the EReal population keep flexible bounds even under
+    // `one`/`exactly` (exact bounds would pin every shared atom);
+    // their multiplicities become cardinality formulas in lower.rs.
+    let shared = ereal_shared_sigs(module);
     for sd in &module.sigs {
         for n in &sd.names {
             exact.insert(n.clone(), sd.mult == SigMult::One);
@@ -790,17 +825,20 @@ pub fn bind_sigs(
             ts.insert_index(idx as i64);
         }
         let lo = TupleSet::new(&res.universe, 1).map_err(|e| e.to_string())?;
-        let is_exact = *exact.get(name).unwrap_or(&false)
+        let is_exact = (*exact.get(name).unwrap_or(&false)
             || (cmd_scope.overall_exact && !cmd_scope.entries.iter().any(|(n, _)| n == name))
-            || name == "Step";
-        // `some sig` requires a non-empty lower bound
+            || name == "Step")
+            && !shared.contains(name);
+        // `some sig` requires a non-empty lower bound (shared EReal
+        // populations excepted: first-atom pinning would over-constrain,
+        // the `some` formula in lower.rs covers it).
         let has_some_mult = module
             .sigs
             .iter()
             .any(|sd| sd.mult == SigMult::Some && sd.names.iter().any(|n| n == name));
         if is_exact {
             b.bound_exactly(rel, &ts).map_err(|e| e.to_string())?;
-        } else if has_some_mult {
+        } else if has_some_mult && !shared.contains(name) {
             // lower = first atom, upper = allocated atoms
             let mut lo_set = TupleSet::new(&res.universe, 1).map_err(|e| e.to_string())?;
             if let Some(first_a) = atoms.first() {

@@ -289,6 +289,30 @@ impl<'m> Lowerer<'m> {
                             .map_err(|e| FrontError::Resolve(e.to_string()))?;
                         parts.push(arena.not(some_diff));
                     }
+                    // Sig multiplicities on the shared EReal population are
+                    // cardinality formulas (Java `BoundsComputer`: `one` /
+                    // `some` / `lone` formulas when bounds do not pin);
+                    // exact bounds would pin every shared atom.
+                    let shared = crate::bounds::ereal_shared_sigs(ctx.module);
+                    for sd in &ctx.module.sigs {
+                        let op = match sd.mult {
+                            crate::ast::SigMult::One => Multiplicity::One,
+                            crate::ast::SigMult::Lone => Multiplicity::Lone,
+                            crate::ast::SigMult::Some => Multiplicity::Some,
+                            _ => continue,
+                        };
+                        for n in &sd.names {
+                            if !shared.contains(n) {
+                                continue;
+                            }
+                            let re = arena.expr_relation(rel_of(ctx, n)?);
+                            parts.push(
+                                arena
+                                    .multiplicity_formula(op, re)
+                                    .map_err(|e| FrontError::Resolve(e.to_string()))?,
+                            );
+                        }
+                    }
                 }
                 // AlloyMax `soft fact`s: lowered and wrapped as soft
                 // formulas (optimized, not asserted).

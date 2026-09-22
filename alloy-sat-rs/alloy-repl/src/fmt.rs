@@ -282,7 +282,22 @@ fn decode_ereal(inst: &Instance) -> Option<BTreeMap<u32, ((i64, i64, i64, i64), 
         }
     }
     let mut out: BTreeMap<u32, ((i64, i64, i64, i64), String)> = BTreeMap::new();
+    // Only atoms actually in the `EReal` relation decode; sibling atoms
+    // outside the solved extent (e.g. excluded by an extender's `one`)
+    // have unconstrained lanes and would print as noise.
+    let mut members: Option<HashSet<u32>> = None;
+    for (r, ts) in inst.relation_tuples() {
+        if inst.pool().name(r).as_ref() == "EReal" && ts.arity() == 1 {
+            members = Some(ts.index_view().iter().map(|i| i as u32).collect());
+            break;
+        }
+    }
     for (owner, bits) in rows {
+        if let Some(ref m) = members {
+            if !m.contains(&owner) {
+                continue;
+            }
+        }
         let vals: Vec<i64> = bits
             .iter()
             .zip(widths.iter())

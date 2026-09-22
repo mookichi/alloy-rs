@@ -111,6 +111,21 @@ fn extends_ereal_partitions() {
 }
 
 #[test]
+fn extender_sig_mults_are_cardinalities() {
+    // `one` extender holds exactly one atom (bounds stay flexible;
+    // Java `BoundsComputer` enforces `one` as a formula here too).
+    sat("one sig X extends EReal {}\npred p { #X = 1 }\nrun p for 3 EReal");
+    unsat("one sig X extends EReal {}\npred p { #X = 2 }\nrun p for 3 EReal");
+    // `lone` caps at one; `some` forces nonempty.
+    unsat("lone sig X extends EReal {}\npred p { #X = 2 }\nrun p for 3 EReal");
+    sat("lone sig X extends EReal {}\nrun {} for 3 EReal");
+    unsat("some sig X extends EReal {}\npred p { no X }\nrun p for 2 EReal");
+    // Same for `in` children of the shared population.
+    sat("one sig X in EReal {}\npred p { #X = 1 }\nrun p for 3 EReal");
+    unsat("one sig X in EReal {}\npred p { #X = 2 }\nrun p for 3 EReal");
+}
+
+#[test]
 fn models_without_ereal_are_unaffected() {
     // No EReal mention: no lane atoms, no lane relations, legacy reading.
     sat("sig A {}\npred p { some A }\nrun p for 2");
