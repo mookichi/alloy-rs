@@ -2101,6 +2101,8 @@ fn print_help() {
   :mepk lit <decimal> [p <maxp>] [n <intcount>]
                             decimal literal to (m,e,p,k), optimal precision
   :mepk widths [n]          show lane widths from for-n-Int rule (+MEPK_* env)");
+    println!("  :sens [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <n>]
+                            single-parameter sensitivity top-3 (dR rank, tau shown; k floor 0)");
     println!("  :max <intexpr> [in <cnf>] [as <sol>]   maximize int expr, save optimum+cost");
     println!("  :min <intexpr> [in <cnf>] [as <sol>]   minimize int expr, save optimum+cost");
     println!("  :maxw <r>:<w>[, ...] [in <cnf>] [as <sol>]  maximize Σ w·#r");
@@ -2730,6 +2732,11 @@ fn main() {
                 "show" => sess.do_show(&rest),
                 "mepk" => {
                     for line in mepk_cmd::run_mepk(&rest) {
+                        println!("{line}");
+                    }
+                }
+                "sens" => {
+                    for line in mepk_cmd::run_sens(&rest) {
                         println!("{line}");
                     }
                 }

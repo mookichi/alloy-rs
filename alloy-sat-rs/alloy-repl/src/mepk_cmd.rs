@@ -26,6 +26,7 @@ use alloy_kodkod_rs::mepk::{
 use alloy_kodkod_rs::BoolCtx;
 
 pub const USAGE: &str = "usage: :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <decimal>) (<m,e,p,k>|lit <decimal>) [p <maxp>] [n <intcount>] | :mepk [-v] lit <decimal> [p <maxp>] [n <intcount>] | :mepk widths [n]";
+pub const SENS_USAGE: &str = "usage: :sens [-v] add|sub|mul|div (<m,e,p,k>|lit <decimal>) (<m,e,p,k>|lit <decimal>) [p <maxp>] [n <intcount>]";
 
 fn parse_tuple(s: &str) -> Option<Mepk> {
     let parts: Vec<&str> = s.split(',').collect();
@@ -221,12 +222,13 @@ fn conv_note(conv: &alloy_kodkod_rs::mepk::DecimalConv) -> String {
 
 /// Parse one operand at `tokens[i]`: either a `<m,e,p,k>` tuple or
 /// `lit <decimal>` (converted with `max_p`). Returns the value, the next
-/// unconsumed index, and an optional expansion note for `lit`.
+/// unconsumed index, an optional expansion note for `lit`, and whether the
+/// operand came from a `lit` conversion (for `:sens` cap hints).
 fn parse_operand(
     tokens: &[String],
     i: usize,
     max_p: u32,
-) -> Result<(Mepk, usize, Option<String>), String> {
+) -> Result<(Mepk, usize, Option<String>, bool), String> {
     if i >= tokens.len() {
         return Err(USAGE.to_string());
     }
@@ -241,82 +243,105 @@ fn parse_operand(
             )),
             Some(conv) => {
                 let note = format!("lit {lit} -> {} {}", conv.v.interval_string(0), conv_note(&conv));
-                Ok((conv.v, i + 2, Some(note)))
+                Ok((conv.v, i + 2, Some(note), true))
             }
         }
     } else {
         match parse_tuple(&tokens[i]) {
-            Some(v) => Ok((v, i + 1, None)),
+            Some(v) => Ok((v, i + 1, None, false)),
             None => Err("bad tuple: expected <m,e,p,k> with p >= 1".to_string()),
         }
     }
 }
 
-fn op_command(args: &[&str]) -> Vec<String> {
-    let (mut rest, n) = match parse_n(args) {
-        Ok(v) => v,
-        Err(e) => return vec![e],
-    };
+/// Shared operand resolution for `:mepk` arithmetic and `:sens`.
+/// Returns the op, both operands, effective widths, guard,
+/// `lit` expansion notes, `lit`-origin flags, and the `-v` flag.
+struct ResolvedOperands {
+    op: String,
+    x1: Mepk,
+    x2: Mepk,
+    widths: MepkWidths,
+    guard: u32,
+    note1: Option<String>,
+    note2: Option<String>,
+    lit1: bool,
+    lit2: bool,
+    verbose: bool,
+}
+
+fn resolve_operands(args: &[&str], usage: &str) -> Result<ResolvedOperands, String> {
+    let (mut rest, n) = parse_n(args).map_err(|e| e)?;
     let verbose = take_flag(&mut rest, "-v");
-    let max_p_opt = match take_option(&mut rest, "p") {
-        Ok(v) => v,
-        Err(e) => return vec![e],
-    };
+    let max_p_opt = take_option(&mut rest, "p").map_err(|e| e)?;
     if rest.len() < 3 {
-        return vec![USAGE.to_string()];
+        return Err(usage.to_string());
     }
-    let op = rest[0].as_str();
-    if !matches!(op, "add" | "sub" | "mul" | "div") {
-        return vec![USAGE.to_string()];
+    let op = rest[0].clone();
+    if !matches!(op.as_str(), "add" | "sub" | "mul" | "div") {
+        return Err(usage.to_string());
     }
-    let base = match MepkWidths::from_env(n) {
-        Err(e) => return vec![format!("widths error: {e}")],
-        Ok(w) => w,
-    };
-    let max_p = match resolve_max_p(max_p_opt, &base) {
-        Ok(p) => p,
-        Err(e) => return vec![e],
-    };
-    // Operands are `<m,e,p,k>` tuples or `lit <decimal>` conversions.
-    let (x1, next, note1) = match parse_operand(&rest, 1, max_p) {
-        Ok(v) => v,
-        Err(e) => return vec![e],
-    };
-    let (x2, end, note2) = match parse_operand(&rest, next, max_p) {
-        Ok(v) => v,
-        Err(e) => return vec![e],
-    };
+    let base = MepkWidths::from_env(n).map_err(|e| format!("widths error: {e}"))?;
+    let max_p = resolve_max_p(max_p_opt, &base)?;
+    let (x1, next, note1, lit1) = parse_operand(&rest, 1, max_p)?;
+    let (x2, end, note2, lit2) = parse_operand(&rest, next, max_p)?;
     if end != rest.len() {
-        return vec![USAGE.to_string()];
+        return Err(usage.to_string());
     }
     let w = effective_widths(&base, &x1, &x2);
+    let guard = w.guard;
+    Ok(ResolvedOperands {
+        op,
+        x1,
+        x2,
+        widths: w,
+        guard,
+        note1,
+        note2,
+        lit1,
+        lit2,
+        verbose,
+    })
+}
+
+/// Concrete oracle dispatch shared by `:mepk` and `:sens`.
+fn apply_concrete(op: &str, x1: &Mepk, x2: &Mepk, guard: u32) -> Option<Mepk> {
+    match op {
+        "add" => mepk_add(x1, x2, 1),
+        "sub" => mepk_add(x1, x2, -1),
+        "mul" => mepk_mul(x1, x2),
+        "div" => mepk_div(x1, x2, guard),
+        _ => None,
+    }
+}
+
+fn op_command(args: &[&str]) -> Vec<String> {
+    let r = match resolve_operands(args, USAGE) {
+        Ok(v) => v,
+        Err(e) => return vec![e],
+    };
+    let w = r.widths;
+    let guard = r.guard;
     let mut out = Vec::new();
-    if verbose {
+    if r.verbose {
         out.push(format!(
             "widths: m={} e={} p={} k={} guard={}",
             w.m_width, w.e_width, w.p_width, w.k_width, w.guard
         ));
     }
     // Echo `lit` expansions so the converted operands are visible.
-    for note in [note1, note2].into_iter().flatten() {
+    for note in [r.note1, r.note2].into_iter().flatten() {
         out.push(note);
     }
 
     // Concrete oracle.
-    let guard = w.guard;
-    let concrete = match op {
-        "add" => mepk_add(&x1, &x2, 1),
-        "sub" => mepk_add(&x1, &x2, -1),
-        "mul" => mepk_mul(&x1, &x2),
-        "div" => mepk_div(&x1, &x2, guard),
-        _ => unreachable!(),
-    };
+    let concrete = apply_concrete(&r.op, &r.x1, &r.x2, guard);
     match concrete {
-        Some(r) => {
-            out.push(r.interval_string(0));
-            if verbose {
-                out.push(format!("raw {}", fmt_mepk(&r)));
-                out.push(format!("full {}", r.interval_string_full(0)));
+        Some(v) => {
+            out.push(v.interval_string(0));
+            if r.verbose {
+                out.push(format!("raw {}", fmt_mepk(&v)));
+                out.push(format!("full {}", v.interval_string_full(0)));
             }
         }
         None => out.push("concrete DivisionUndefined (k2 >= p2) or overflow".to_string()),
@@ -324,6 +349,10 @@ fn op_command(args: &[&str]) -> Vec<String> {
 
     // Symbolic cross-check over constant circuits.
     let ctx = BoolCtx::new();
+    let x1 = r.x1;
+    let x2 = r.x2;
+    let op = r.op.as_str();
+    let verbose = r.verbose;
     let a = MepkCircuit::constant(x1.m as i64, x1.e as i64, x1.p as i64, x1.k as i64, &w, &ctx);
     let b = MepkCircuit::constant(x2.m as i64, x2.e as i64, x2.p as i64, x2.k as i64, &w, &ctx);
     // Inputs must fit the lanes for the check to be meaningful.
@@ -386,9 +415,317 @@ fn op_command(args: &[&str]) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// `:sens`: single-parameter sensitivity ranking (top 3) over the concrete
+// oracle. Candidates are p1+1, p2+1, k1-1, k2-1 (guard excluded by design).
+// Ranked by radius-exponent improvement (dR), tau change shown alongside.
+// ---------------------------------------------------------------------------
+
+/// Run a `:sens` command body (tokens after `:sens`), returning output lines.
+pub fn run_sens(args: &[&str]) -> Vec<String> {
+    if args.is_empty() {
+        return vec![SENS_USAGE.to_string()];
+    }
+    sens_command(args)
+}
+
+/// Dominant error term of the op for the given inputs, naming the max
+/// branch of A/C/D that governs `k'` (see `int_ext::{add_a,mul_c,div_d}`).
+fn dominant_term(op: &str, x1: &Mepk, x2: &Mepk) -> String {
+    match op {
+        "add" | "sub" => {
+            let ell = x1.lsb().min(x2.lsb());
+            let d1 = x1.lsb() - ell;
+            let d2 = x2.lsb() - ell;
+            let t1 = x1.k + d1;
+            let t2 = x2.k + d2;
+            if t1 >= t2 {
+                format!("dominant error term: k1+d1={t1} (op1 side; A=ell+max over k+d)")
+            } else {
+                format!("dominant error term: k2+d2={t2} (op2 side; A=ell+max over k+d)")
+            }
+        }
+        "mul" => {
+            let t1 = x1.k - x1.p as i32 + 1;
+            let t2 = x2.k - x2.p as i32 + 1;
+            let t3 = (x1.k + x2.k) - (x1.p as i32 + x2.p as i32);
+            let m = t1.max(t2).max(t3);
+            let which = if m == t3 && t3 >= t1 && t3 >= t2 {
+                "k1+k2-p1-p2 (joint; raise p1 AND p2 together)"
+            } else if m == t1 && t1 >= t2 {
+                "k1-p1+1 (op1 side)"
+            } else {
+                "k2-p2+1 (op2 side)"
+            };
+            format!("dominant error term: {which} (C=e1+e2+max+2)")
+        }
+        "div" => {
+            let u1 = x1.k - x1.p as i32;
+            let u2 = x2.k - x2.p as i32;
+            if u1 >= u2 {
+                format!("dominant error term: k1-p1={u1} (numerator side; D=e1-e2+max+3)")
+            } else {
+                format!("dominant error term: k2-p2={u2} (denominator side; D=e1-e2+max+3)")
+            }
+        }
+        _ => "dominant error term: unknown op".to_string(),
+    }
+}
+
+struct SensRow {
+    name: String,
+    result: Mepk,
+    dr: i32,
+    dtau: i32,
+    from_lit: bool,
+}
+
+fn sens_command(args: &[&str]) -> Vec<String> {
+    let r = match resolve_operands(args, SENS_USAGE) {
+        Ok(v) => v,
+        Err(e) => return vec![e],
+    };
+    let mut out = Vec::new();
+    if r.verbose {
+        out.push(format!(
+            "widths: m={} e={} p={} k={} guard={}",
+            r.widths.m_width,
+            r.widths.e_width,
+            r.widths.p_width,
+            r.widths.k_width,
+            r.widths.guard
+        ));
+    }
+    for note in [r.note1.clone(), r.note2.clone()].into_iter().flatten() {
+        out.push(note);
+    }
+    let base = match apply_concrete(&r.op, &r.x1, &r.x2, r.guard) {
+        Some(v) => v,
+        None => {
+            return vec![
+                "base is undefined (DivisionUndefined k2>=p2 or overflow): no sensitivity to rank"
+                    .to_string(),
+            ]
+        }
+    };
+    let base_r = base.radius_exp();
+    let base_tau = base.tau(0);
+    out.push(format!(
+        "base: {} [r_exp={base_r}, tau={base_tau}] (guard={})",
+        base.interval_string(0),
+        r.guard
+    ));
+    out.push(dominant_term(&r.op, &r.x1, &r.x2));
+
+    // Candidates: p+1 (cap 127), k-1 (floor at wellformed k>=0).
+    let mut cands: Vec<(String, Mepk, bool)> = Vec::with_capacity(4);
+    if r.x1.p < 127 {
+        let mut v = r.x1;
+        v.p += 1;
+        cands.push(("p1+1".to_string(), v, r.lit1));
+    } else {
+        out.push("p1+1: skipped (at p cap 127)".to_string());
+    }
+    if r.x2.p < 127 {
+        let mut v = r.x2;
+        v.p += 1;
+        cands.push(("p2+1".to_string(), v, r.lit2));
+    } else {
+        out.push("p2+1: skipped (at p cap 127)".to_string());
+    }
+    if r.x1.k > 0 {
+        let mut v = r.x1;
+        v.k -= 1;
+        cands.push(("k1-1".to_string(), v, false));
+    } else {
+        out.push("k1-1: skipped (at floor wellformed k>=0)".to_string());
+    }
+    if r.x2.k > 0 {
+        let mut v = r.x2;
+        v.k -= 1;
+        cands.push(("k2-1".to_string(), v, false));
+    } else {
+        out.push("k2-1: skipped (at floor wellformed k>=0)".to_string());
+    }
+
+    let mut rows: Vec<SensRow> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for (name, pert, from_lit) in cands {
+        // Name convention: p1/k1 perturb x1, p2/k2 perturb x2.
+        let (qx1, qx2) = if name == "p1+1" || name == "k1-1" {
+            (pert, r.x2)
+        } else {
+            (r.x1, pert)
+        };
+        match apply_concrete(&r.op, &qx1, &qx2, r.guard) {
+            Some(res) => rows.push(SensRow {
+                name,
+                result: res,
+                dr: res.radius_exp() - base_r,
+                dtau: res.tau(0) - base_tau,
+                from_lit,
+            }),
+            None => failed.push(name),
+        }
+    }
+    for name in failed {
+        out.push(format!("{name}: perturbs to undefined (overflow/div-guard); excluded"));
+    }
+    // Rank: dR ascending, then dTau descending, then name for stability.
+    rows.sort_by(|a, b| {
+        a.dr
+            .cmp(&b.dr)
+            .then(b.dtau.cmp(&a.dtau))
+            .then(a.name.cmp(&b.name))
+    });
+    let improved: Vec<&SensRow> = rows
+        .iter()
+        .filter(|row| row.dr < 0 || row.dtau > 0)
+        .collect();
+    let unchanged: Vec<&SensRow> = rows
+        .iter()
+        .filter(|row| row.dr == 0 && row.dtau == 0)
+        .collect();
+    let worsened: Vec<&SensRow> = rows
+        .iter()
+        .filter(|row| !(row.dr < 0 || row.dtau > 0) && !(row.dr == 0 && row.dtau == 0))
+        .collect();
+
+    if improved.is_empty() {
+        out.push(
+            "note: saturated (err-dominated). No single p/k step shrinks R; try raising p1 AND p2 together, or lowering the dominant k".to_string(),
+        );
+    }
+    // Top 3 improved with tie notation (`1t.` for equal (dR,dTau)).
+    let mut prev_key: Option<(i32, i32)> = None;
+    let mut prev_rank: usize = 0;
+    for (i, row) in improved.iter().take(3).enumerate() {
+        let key = (row.dr, row.dtau);
+        let rank = if prev_key == Some(key) {
+            format!("{prev_rank}t.")
+        } else {
+            prev_rank = i + 1;
+            format!("{}.", prev_rank)
+        };
+        prev_key = Some(key);
+        let lit_hint = if row.from_lit {
+            " (lit: raise cap via `p <maxp>` / `n <n>`)".to_string()
+        } else {
+            String::new()
+        };
+        let dr_s = if row.dr == 0 {
+            "0".to_string()
+        } else {
+            format!("{:+}", row.dr)
+        };
+        let dtau_s = if row.dtau == 0 {
+            "0".to_string()
+        } else {
+            format!("{:+}", row.dtau)
+        };
+        let mut line = format!(
+            "{rank} {}: {} [dR={dr_s}bit, dTau={dtau_s}]{lit_hint}",
+            row.name,
+            row.result.interval_string(0),
+        );
+        if r.verbose {
+            line.push_str(&format!(" raw {}", fmt_mepk(&row.result)));
+        }
+        out.push(line);
+    }
+    for row in unchanged {
+        out.push(format!(
+            "— {}: no change ({})",
+            row.name,
+            row.result.interval_string(0)
+        ));
+    }
+    for row in worsened {
+        let dr_s = if row.dr == 0 {
+            "0".to_string()
+        } else {
+            format!("{:+}", row.dr)
+        };
+        let dtau_s = if row.dtau == 0 {
+            "0".to_string()
+        } else {
+            format!("{:+}", row.dtau)
+        };
+        out.push(format!(
+            "— {}: worsens {} [dR={dr_s}bit, dTau={dtau_s}]",
+            row.name,
+            row.result.interval_string(0),
+        ));
+    }
+    out.push("note: p' = min(p1,p2); only the minimum-p side (or dominant k-p term) moves R".to_string());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sens_prefers_min_p_side() {
+        // p1=4 < p2=8: p1+1 moves p'=min, p2+1 is a no-op.
+        let lines = run_sens(&["add", "10,3,4,1", "50,5,8,1"]);
+        assert!(lines.iter().any(|l| l.starts_with("base:")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("dominant error term")), "{lines:?}");
+        let top: Vec<&String> = lines.iter().filter(|l| l.starts_with("1")).collect();
+        assert!(!top.is_empty(), "{lines:?}");
+        assert!(top.iter().any(|l| l.contains("p1+1") && l.contains("dR=-1bit")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("— p2+1: no change")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn sens_k_floor_and_dominant_term() {
+        // k=0 on both sides: k-1 candidates are skipped, not recommended.
+        let lines = run_sens(&["add", "100,6,8,0", "50,5,8,0"]);
+        assert!(
+            lines.iter().any(|l| l.contains("k1-1: skipped (at floor wellformed k>=0)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("k2-1: skipped (at floor wellformed k>=0)")),
+            "{lines:?}"
+        );
+        // mul names the dominant max branch.
+        let lines = run_sens(&["mul", "100,6,8,1", "50,5,8,2"]);
+        assert!(
+            lines.iter().any(|l| l.contains("dominant error term: k2-p2+1 (op2 side)")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("k2-1") && l.contains("dR=-1bit")), "{lines:?}");
+    }
+
+    #[test]
+    fn sens_saturation_and_undef() {
+        // Err-dominated: no single step shrinks R; saturation hint appears.
+        let lines = run_sens(&["add", "100,6,8,1", "50,5,8,2"]);
+        assert!(lines.iter().any(|l| l.contains("saturated (err-dominated)")), "{lines:?}");
+        // Undefined base: single message, no ranking.
+        let lines = run_sens(&["div", "100,6,8,1", "50,5,4,4"]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("base is undefined"), "{lines:?}");
+        // Usage.
+        assert_eq!(run_sens(&[]), vec![SENS_USAGE.to_string()]);
+        assert!(run_sens(&["add", "1,2,3"]).iter().any(|l| l.contains("usage:")), "{lines:?}");
+    }
+
+    #[test]
+    fn sens_lit_hint_and_verbose() {
+        let lines = run_sens(&["add", "lit", "0.1", "lit", "0.2", "p", "8"]);
+        assert!(
+            lines.iter().any(|l| l.contains("lit: raise cap via `p <maxp>` / `n <n>`")),
+            "{lines:?}"
+        );
+        let lines = run_sens(&["-v", "add", "10,3,4,1", "50,5,8,1"]);
+        assert!(lines.iter().any(|l| l.starts_with("widths:")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("raw (m=")), "{lines:?}");
+    }
 
     #[test]
     fn tuple_parsing() {
