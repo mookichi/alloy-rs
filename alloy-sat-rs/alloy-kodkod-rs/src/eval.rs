@@ -493,6 +493,9 @@ impl<'a> Evaluator<'a> {
                     crate::ast::WidenOp::Sub => {
                         self.wrap((l as i128) - (r as i128))
                     }
+                    crate::ast::WidenOp::Mul => {
+                        self.wrap((l as i128) * (r as i128))
+                    }
                     crate::ast::WidenOp::Shl(width) => {
                         let v = if !(0..=60).contains(&r) {
                             0i128

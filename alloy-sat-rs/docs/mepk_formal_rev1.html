@@ -1,0 +1,276 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}</style><style>:root{color-scheme:light dark;--md-bg:#fff;--md-text:rgba(0,0,0,.8);--md-muted:rgba(0,0,0,.6);--md-fill:rgba(0,0,0,.04);--md-fill-strong:rgba(0,0,0,.06);--md-rule:rgba(0,0,0,.1);--md-rule-strong:rgba(0,0,0,.16);--md-link:hsl(210 100% 45%)}@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])){--md-bg:#0d0d0d;--md-text:rgba(255,255,255,.85);--md-muted:rgba(255,255,255,.6);--md-fill:rgba(255,255,255,.06);--md-fill-strong:rgba(255,255,255,.09);--md-rule:rgba(255,255,255,.14);--md-rule-strong:rgba(255,255,255,.22);--md-link:hsl(210 100% 72%)}}:root[data-theme="dark"]{color-scheme:dark;--md-bg:#0d0d0d;--md-text:rgba(255,255,255,.85);--md-muted:rgba(255,255,255,.6);--md-fill:rgba(255,255,255,.06);--md-fill-strong:rgba(255,255,255,.09);--md-rule:rgba(255,255,255,.14);--md-rule-strong:rgba(255,255,255,.22);--md-link:hsl(210 100% 72%)}:root[data-theme="light"]{color-scheme:light}@media print{:root,:root[data-theme="dark"]{color-scheme:light;--md-bg:#fff;--md-text:rgba(0,0,0,.8);--md-muted:rgba(0,0,0,.6);--md-fill:rgba(0,0,0,.04);--md-fill-strong:rgba(0,0,0,.06);--md-rule:rgba(0,0,0,.1);--md-rule-strong:rgba(0,0,0,.16);--md-link:hsl(210 100% 45%)}}body{background:var(--md-bg);color:var(--md-text);max-width:720px;margin:0 auto;padding:32px;display:flex;flex-direction:column;gap:10px;font:14px/1.55 -apple-system,BlinkMacSystemFont,'SF Pro','Segoe UI',sans-serif;overflow-wrap:break-word}body>:first-child{margin-top:0}h1,h2,h3,h4,h5,h6{margin:6px 0 0;line-height:1.25;font-weight:600;text-wrap:balance}h1{font-size:1.35em}h2{font-size:1.15em;color:var(--md-muted)}h3,h4,h5,h6{font-size:1em}p,ul,ol,blockquote,table,pre,hr{margin:0}strong{font-weight:600}a{color:var(--md-link);text-decoration:none}a:hover{text-decoration:underline}ul,ol{display:flex;flex-direction:column;gap:6px;padding-left:22px}ul{list-style:disc}ol{list-style:decimal}:is(li,td,th)>*+:is(p,ul,ol,blockquote){margin-top:6px}blockquote{display:flex;flex-direction:column;gap:10px;border-left:2px solid var(--md-rule);padding-left:10px;color:var(--md-muted)}:not(pre)>code{background:var(--md-fill);padding:1px 3px;border-radius:4px;font:.92em 'SF Mono',ui-monospace,Menlo,Consolas,monospace}a>code{background:none;color:inherit}pre{background:var(--md-fill);padding:10px 12px;border-radius:6px;overflow-x:auto;font:12px/1.5 'SF Mono',ui-monospace,Menlo,Consolas,monospace;margin-block:4px}pre code{background:none;padding:0;font:inherit}table{width:100%;border-collapse:separate;border-spacing:2px;font:inherit}th,td{padding:6px 8px;border-radius:3px;text-align:left;vertical-align:top}th{background:var(--md-fill-strong);font-weight:600}td{background:var(--md-fill)}:is(th,td) :not(pre)>code{background:transparent}hr{border:0;border-top:1px solid var(--md-rule-strong);margin-block:10px}img{max-width:100%;height:auto;border-radius:4px}</style>
+</head><body>
+<h1>(m, e, p, k) 誤差追跡浮動小数フォーマット ― 形式的健全性の証明</h1>
+<h2>0. 概要</h2>
+<p><code>(m, e, p, k)</code> は「仮数・指数・局所精度・累積誤差指数」の4つ組で数を表現し、
+各値に対して常に誤差半径 <code>R = 2^(e-p+k)</code> による保証区間を保つ数値表現方式である。</p>
+<p>本ドキュメントは、加減乗除の各演算規則を <strong>三角不等式と2つの補題だけから機械的に導出</strong>し、
+「規則に従って計算する限り誤差半径の保証が破れない」ことを構造帰納法で証明する。
+すべての中間ステップは整数の指数比較に帰着するため、SMT/SAT ソルバでの形式検証や
+Lean/Coq 等への翻訳にも適した形になっている。</p>
+<p>導出した規則は、境界値・総当たり・精度混在・長鎖の4系統・<strong>233万点以上</strong>の
+アドバーサリアル検証で反例ゼロを確認済み(§6)。さらに、演算木(式木)を
+直接評価しCEGARで自動精緻化する実装まで拡張し、実装中に見つかった
+追加の反例2件も修正済み(§9)。</p>
+<hr>
+<h2>1. 定義</h2>
+<table>
+<thead>
+<tr>
+<th>記号</th>
+<th>意味</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>m</code></td>
+<td>pビット正規化整数マンティッサ: `2^(p-1) ≤</td>
+</tr>
+<tr>
+<td><code>e</code></td>
+<td>先頭ビット(MSB)指数: `2^e ≤</td>
+</tr>
+<tr>
+<td><code>p</code></td>
+<td>精度(ビット数)</td>
+</tr>
+<tr>
+<td><code>k</code></td>
+<td>累積誤差指数</td>
+</tr>
+<tr>
+<td><code>lsb</code></td>
+<td>最下位ビットの重み: <code>lsb = e - p + 1</code></td>
+</tr>
+<tr>
+<td><code>value</code></td>
+<td>中心値: <code>c = m · 2^lsb</code></td>
+</tr>
+<tr>
+<td><code>R</code></td>
+<td>誤差半径: <code>R = 2^(e-p+k)</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>健全性(soundness)</strong>: ノード <code>(m,e,p,k)</code> が真の値 <code>x</code> を表すとは、<code>|x - c| ≤ R</code> が成り立つことをいう。</p>
+<hr>
+<h2>2. 基礎補題</h2>
+<h3>補題1(丸め補題)</h3>
+<p>整数 <code>raw</code>(スケール <code>raw_lsb</code>、すなわち実値 <code>raw · 2^raw_lsb</code>)を
+round-to-nearest で <code>p</code> ビット正規化マンティッサ <code>m'</code>(スケール <code>lsb'</code>, <code>e' = lsb'+p-1</code>)に
+丸めた結果は、次を満たす。</p>
+<pre><code>| raw · 2^raw_lsb − m&#39; · 2^lsb&#39; | ≤ 2^(lsb&#39;−1) = 2^(e&#39;−p)
+</code></pre>
+<p>(round-to-nearest の定義から自明。ビット数が <code>p</code> に満たない場合はゼロ埋めのみで丸め誤差 0。)</p>
+<h3>補題2(n項和の指数まとめ)</h3>
+<p>正の実数 <code>a_1,...,a_n</code> について</p>
+<pre><code>a_1 + ... + a_n ≤ 2^( max_i(log2 a_i) + ⌈log2 n⌉ )
+</code></pre>
+<p>(全項が最大値に等しい最悪ケースで <code>n · 2^max</code>、<code>n ≤ 2^⌈log2 n⌉</code> より従う。<code>n=2</code>→<code>+1</code>、<code>n=3</code>→<code>+2</code>。)</p>
+<p>以降、2つの誤差指数 <code>A, B</code> を合成して十分な <code>k'</code> を得る操作を次のように定義する:</p>
+<pre><code>combine_k(A, B) := max(A − B, 0) + 1
+</code></pre>
+<p>これは補題2(n=2)の直接の帰結であり、<code>2^A + 2^B ≤ 2^(B + combine_k(A,B))</code> を保証する。</p>
+<hr>
+<h2>3. 加算・減算規則</h2>
+<p><code>x_i</code> の中心 <code>c_i</code>、<code>lsb_i = e_i-p_i+1</code>とし、<code>ℓ = min(lsb_1,lsb_2)</code>、<code>Δ_i = lsb_i-ℓ ≥ 0</code> とする。</p>
+<p><strong>手順</strong>:</p>
+<ol>
+<li><code>m_1·2^Δ_1 ± m_2·2^Δ_2 = T</code>(整数、正確、丸め無し)</li>
+<li><code>round_to_precision(T, ℓ, p') → (m', e')</code>, <code>p' = min(p_1,p_2)</code>(補題1)</li>
+<li><code>A = ℓ + max(k_1+Δ_1, k_2+Δ_2)</code>(<code>R_1+R_2</code> の指数上界。補題2, n=2)</li>
+<li><code>B = e' - p'</code>(丸め誤差の指数。補題1)</li>
+<li><code>k' = combine_k(A, B)</code></li>
+</ol>
+<p><strong>証明</strong>:</p>
+<pre><code>|x1±x2 − (c1±c2)| ≤ R1+R2 ≤ 2^A                       (三角不等式 + 補題2)
+|(c1±c2) − value&#39;|        ≤ 2^B                       (補題1)
+|x1±x2 − value&#39;|          ≤ 2^A+2^B ≤ 2^(B+k&#39;) = R&#39;    (補題2, combine_k)
+</code></pre>
+<p><code>e'</code> はキャンセル(桁落ち)が起きれば自動的に縮小するため、
+<strong>桁落ち補正 <code>s</code> を別立てにする必要がなく、この一般式に吸収される。</strong></p>
+<hr>
+<h2>4. 乗算規則</h2>
+<p><code>x1x2 − c1c2 = c1δ2 + c2δ1 + δ1δ2</code> の3項に補題2(n=3, <code>+2</code>)を適用し、
+<code>|c_i| &lt; 2^(e_i+1)</code>(正規化から)を使うと:</p>
+<pre><code>C = e1+e2 + max(k1-p1+1, k2-p2+1, k1+k2-p1-p2) + 2
+B = e&#39;-p&#39;
+k&#39; = combine_k(C, B)
+</code></pre>
+<p><strong>証明</strong>: <code>|c1δ2| &lt; 2^(e1+e2-p2+k2+1)</code>、<code>|c2δ1| &lt; 2^(e1+e2-p1+k1+1)</code>、
+<code>|δ1δ2| = 2^(e1+e2-p1-p2+k1+k2)</code> の3項和を補題2(n=3)でまとめると <code>2^C</code> の上界を得る。
+残りは加減算と同様に補題1・combine_kで丸め誤差と合成する。</p>
+<hr>
+<h2>5. 除算規則 ― 前提条件が数学的に必然であることの証明</h2>
+<pre><code>x1/x2 − c1/c2 = (δ1c2 − δ2c1) / (x2·c2)
+</code></pre>
+<p>分子は補題2(n=2)で <code>|δ1c2−δ2c1| ≤ 2^(e1+e2+max(k1-p1,k2-p2)+2)</code> と抑えられるが、
+分母 <code>|x2|</code> の<strong>下界</strong>が必要になる:</p>
+<pre><code>|x2| ≥ |c2| − R2 ≥ 2^e2 − 2^(e2-p2+k2) = 2^e2·(1 − 2^(k2-p2))
+</code></pre>
+<p>この下界が正であるためには <strong><code>k2 &lt; p2</code> が数学的に必須</strong>である
+(前回「経験的にマージン4bitが必要」と誤って結論したが、これは規則の定数が弱かっただけで、
+正しく導出すれば<strong>自然な前提条件 <code>k2&lt;p2</code> のみ</strong>で十分であることが後の検証で確認された)。</p>
+<p><code>k2&lt;p2</code> の下で <code>1-2^(k2-p2) ≥ 1/2</code> なので <code>|x2·c2| ≥ 2^(2e2-1)</code>。これを使うと:</p>
+<pre><code>D = e1-e2 + max(k1-p1, k2-p2) + 3
+B = e&#39;-p&#39;
+k&#39; = combine_k(D, B)
+</code></pre>
+<p><strong>前提条件</strong>: <code>k2 ≥ p2</code> の場合、除算は定義域外として <code>DivisionUndefinedError</code> を送出し、
+CEGAR に「分母不確定(ゼロ除算の恐れ)」として即座に返す。この前提条件を課さない限り、
+除算の誤差はいかなる有限の定数でも吸収不可能である(分母区間がゼロを跨ぎうるため)。</p>
+<p><strong>注意(§9.1で詳述)</strong>: <code>k2&lt;p2</code> は「分母の相対誤差が100%未満」を保証するために導いたが、
+加減算の結果が完全にキャンセルして中心値がちょうど <code>m=0</code> になるケース(正規化の枠外の
+特殊値)は、<code>k2&lt;p2</code> が成立していてもすり抜ける。実装では <code>x2.m==0</code> を独立にガードする
+必要がある。</p>
+<hr>
+<h2>6. 健全性定理と実証検証</h2>
+<h3>定理(Soundness)</h3>
+<p>すべてのleafが <code>|x-c|≤R</code> を満たすと仮定し、すべての内部ノードが
+§3-5 の規則(除算は <code>k2&lt;p2</code> を満たす場合のみ)で構築されるならば、
+式木の<strong>すべてのノード</strong>で <code>|x-c|≤R</code> が成立する。</p>
+<p><strong>証明</strong>: 式木上の構造帰納法。基底ケース(leaf)は仮定、
+帰納ステップは各演算について §3-5 の各補題の連鎖で従う。∎</p>
+<p>各ステップが整数の指数比較のみに帰着するため、この帰納法の骨格は
+SMT/SATベースの検証や証明支援系(Lean/Coq等)への翻訳が容易である。</p>
+<h3>実証検証結果</h3>
+<table>
+<thead>
+<tr>
+<th>検証</th>
+<th>内容</th>
+<th>検証点数</th>
+<th>違反</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A</td>
+<td>境界値(δ=±R)ランダム演算木、深さ6</td>
+<td>10,000件</td>
+<td>0(最大比率 1.000000)</td>
+</tr>
+<tr>
+<td>B</td>
+<td>総当たり(p=5、全マンティッサ×全演算×全境界)</td>
+<td>2,359,296点</td>
+<td>0</td>
+</tr>
+<tr>
+<td>C</td>
+<td>p1≠p2混在(前提条件<code>k&lt;p</code>のみ、追加マージンなし)</td>
+<td>30,000件</td>
+<td>0</td>
+</tr>
+<tr>
+<td>E</td>
+<td>乗算/除算の長さ80チェーン</td>
+<td>300試行×80</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p>境界値(内点でなく <code>δ=±R</code> の極値)を用いることで、ランダムサンプリングでは
+検出できない反例(丸め誤差の見落とし、guardビット不足、除算の特異点近傍)を
+すべて洗い出し、修正した。</p>
+<hr>
+<h2>7. CEGARとの統合</h2>
+<pre><code>τ = p - k - g   (g: 目標保証ビット数)
+</code></pre>
+<ul>
+<li><code>k ≥ p</code> または <code>τ ≤ 0</code> → 精度喪失。CEGARは <code>p</code> をrefinement対象とする。</li>
+<li>除算実行前に <code>k2 &lt; p2</code> を確認し、満たさなければ即座に精度喪失として扱う
+(これは除算特有の追加ゲートであり、<code>τ</code>だけでは捕捉できない)。</li>
+<li>大量の値を合計する場合、<strong>逐次加算ではなく二分木(pairwise)加算</strong>を用いること。
+逐次だと <code>k</code> が項数 <code>N</code> に比例して増大し(過度に悲観的)、
+二分木だと <code>k</code> は <code>O(log N)</code> で済む(実測: N=1024で逐次k=1124 vs 二分木k=26)。</li>
+</ul>
+<hr>
+<h2>8. 実装(要点)</h2>
+<pre><code class="language-python">def combine_k(A: int, B: int) -&gt; int:
+    return max(A - B, 0) + 1
+
+def add_sub(x1, x2, sign):
+    lsb1, lsb2 = x1.lsb(), x2.lsb()
+    ell = min(lsb1, lsb2)
+    d1, d2 = lsb1 - ell, lsb2 - ell
+    total = (x1.m &lt;&lt; d1) + sign * (x2.m &lt;&lt; d2)
+    p_new = min(x1.p, x2.p)
+    m_new, _, e_new = round_to_precision(total, ell, p_new)
+    A = ell + max(x1.k + d1, x2.k + d2)
+    B = e_new - p_new
+    return PNum(m_new, e_new, p_new, combine_k(A, B))
+
+def div(x1, x2):
+    if x2.k &gt;= x2.p:
+        raise DivisionUndefinedError(&#34;分母の相対誤差が過大&#34;)
+    # ...(商の計算は guard ビット付き整数除算)
+    D = x1.e - x2.e + max(x1.k - x1.p, x2.k - x2.p) + 3
+    B = e_new - p_new
+    return PNum(m_new, e_new, p_new, combine_k(D, B))
+</code></pre>
+<p>完全な実装(<code>round_to_precision</code> を含む)と検証スクリプト一式は、
+本ドキュメントと合わせて配布したPythonファイルを参照。</p>
+<hr>
+<h2>9. 演算木(式木)への対応とCEGARループ</h2>
+<h3>9.0 構成</h3>
+<ul>
+<li><strong>Expr AST</strong>: <code>Leaf</code>(真の値+初期精度 <code>p</code>)と <code>BinOp</code>(演算子+左右の子)。
+Python の <code>+ - * /</code> 演算子オーバーロードにより <code>(a*b - c*d) / (e-f)</code> のように自然に書ける。</li>
+<li><strong><code>evaluate(expr)</code></strong>: 式木をボトムアップに評価し、各ノードの <code>(m,e,p,k)</code> と
+「真の値」を同時に追跡する(真の値はテスト・デモ用にFractionで厳密に伝播)。</li>
+<li><strong><code>cegar_evaluate(expr, g, delta)</code></strong>: <code>τ=p-k-g≤0</code> や <code>k≥p</code>、除算前提条件違反を
+検出したら、原因箇所を絞り込んで該当の葉の <code>p</code> だけを引き上げ再評価する
+refinementループ。</li>
+</ul>
+<h3>9.1 実装中に見つかった追加の反例(2件)</h3>
+<p><strong>(a) 除算: 完全キャンセルによる <code>m=0</code> のすり抜け</strong></p>
+<p>前提条件 <code>k2&lt;p2</code> は「分母の相対誤差が100%未満」を保証するために導いたが、
+加減算の結果が完全にキャンセルして中心値がちょうど <code>m=0</code> になるケース
+(§3の丸め補題の <code>raw=0</code> 分岐、正規化 <code>2^(p-1)≤|m|&lt;2^p</code> の枠外の特殊値)は、
+<code>k2&lt;p2</code> が成立していてもすり抜ける。<code>m=0</code> のとき相対誤差は定義上無限大であり、
+除算は常に定義域外として扱う必要がある。</p>
+<pre><code class="language-python">if x2.m == 0:
+    raise DivisionUndefinedError(&#34;分母の中心値がちょうどゼロ(完全キャンセル)&#34;)
+</code></pre>
+<p><strong>(b) CEGARの絞り込みヒューリスティックの発散</strong></p>
+<p>当初「<code>k</code>が大きい方の子を辿って葉を1つだけ引き上げる」方式を採用したところ、
+桁落ちが起きる減算(例: <code>e-f</code>, <code>e≈f</code>)を含む式で<strong>無限ループ</strong>した。</p>
+<p>原因は加減算規則の <code>p'=min(p1,p2)</code> という構造にある。桁落ちで発生する <code>k</code> の増大は
+<strong>両オペランドに共通のボトルネック <code>p'</code></strong> に起因するため、<code>k</code>の大小だけで片方の葉を
+選んで精度を上げても <code>p'=min(p1,p2)</code> は変わらず、収束しない。</p>
+<p>修正: 木全体をトレースし、<strong><code>p-k</code> マージンが最小のノード</strong>(最も精度を消費した箇所)を
+特定し、そのノードの<strong>両オペランド配下の葉すべて</strong>を一括で引き上げる。</p>
+<pre><code class="language-python">worst = min(candidates, key=lambda t: t.node.p - t.node.k)
+leaves = collect_leaves(worst.expr)   # 両方の子孫を含む
+for l in leaves:
+    l.p += delta
+</code></pre>
+<h3>9.2 動作例</h3>
+<p>桁落ちを含む式 <code>(355·113 − 22·7) / (e−f)</code>(<code>e≈f</code>)を全leaf <code>p=8</code> から評価:</p>
+<pre><code>iter1: 除算前提条件違反(分母部分木) → e,f を p=14 に引き上げ
+iter2: 精度不足(k=11,p=8)  → a,b,c,d,e,f をまとめて引き上げ
+iter3: 精度不足(k=11,p=14) → さらに引き上げ
+iter4: 成功。k=11, p=20, tau=3   (実際の誤差536 ≤ R=65536)
+</code></pre>
+<p>このヒューリスティックは「<code>p-k</code>マージンが最小のノードを全体から探す」という
+<strong>大域的</strong>な判断であり、§4-5で導出した <code>A,B,C,D</code> の各項のうちどれが支配的かという
+<strong>局所的</strong>な情報までは使っていない(§10で今後の課題として言及)。</p>
+<hr>
+<h2>10. 残された課題</h2>
+<ul>
+<li><strong>タイト性</strong>: 補題2の <code>⌈log2 n⌉</code> は最悪ケース(全項が等しい)を仮定しており、
+実際にはさらに数ビット切り詰め可能な余地がある(例: 乗算の交差項は通常桁違いに小さい)。</li>
+<li><strong>形式検証系への翻訳</strong>: 本証明は整数の指数比較のみで構成されるため、
+Lean/Coq上での機械可読な証明化が現実的な次のステップ。</li>
+<li><strong>除算前提条件のCEGAR設計</strong>: <code>k2 ≥ p2</code> を検出した際、単に失敗させるのではなく
+「どちらのオペランドの <code>p</code> を上げるべきか」を提案するヒューリスティックの設計。</li>
+<li><strong>CEGAR絞り込みの精密化</strong>: 現行の「<code>p-k</code>マージン最小のノードの両葉を一括で
+引き上げる」方式(§9.1(b))は大域的な代理指標であり収束は確認済みだが、
+<code>A,B,C,D</code>(§3-5)の各項のうちどれが支配的かという局所情報を使えば、
+加算/減算では「実際に <code>p_new</code> を制限している側」だけ、乗算/除算では
+<code>k1-p1</code> と <code>k2-p2</code> の大小比較で「支配的な誤差項を持つ側」だけを狙い撃ちでき、
+再精緻化の反復回数をさらに減らせる可能性がある。</li>
+</ul>
+
+</body></html>

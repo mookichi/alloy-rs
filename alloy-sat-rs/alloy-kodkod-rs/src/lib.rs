@@ -10,6 +10,7 @@ pub mod instance;
 pub mod int;
 pub mod int_ext;
 pub mod mepk;
+pub mod mepk_tree;
 pub mod intset;
 #[cfg(feature = "ipasir")]
 pub mod ipasir_bridge;

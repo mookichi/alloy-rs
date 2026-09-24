@@ -2102,7 +2102,9 @@ fn print_help() {
                             decimal literal to (m,e,p,k), optimal precision
   :mepk widths [n]          show lane widths from for-n-Int rule (+MEPK_* env)");
     println!("  :sens [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <n>]
-                            single-parameter sensitivity top-3 (dR rank, tau shown; k floor 0)");
+                             single-parameter sensitivity top-3 (dR rank, tau shown; k floor 0)");
+    println!("  :cegar [-v] ( <op> <expr> <expr> ) [g <goal>] [delta <d>] [iters <n>] [guard0 <g0>] [abs <rexp>] [p <maxp>] [n <n>]
+                             expression-tree CEGAR (leaves are lit decimals; parens spaced)");
     println!("  :max <intexpr> [in <cnf>] [as <sol>]   maximize int expr, save optimum+cost");
     println!("  :min <intexpr> [in <cnf>] [as <sol>]   minimize int expr, save optimum+cost");
     println!("  :maxw <r>:<w>[, ...] [in <cnf>] [as <sol>]  maximize Σ w·#r");
@@ -2737,6 +2739,11 @@ fn main() {
                 }
                 "sens" => {
                     for line in mepk_cmd::run_sens(&rest) {
+                        println!("{line}");
+                    }
+                }
+                "cegar" => {
+                    for line in mepk_cmd::run_cegar(&rest) {
                         println!("{line}");
                     }
                 }

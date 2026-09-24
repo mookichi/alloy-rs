@@ -761,6 +761,7 @@ impl<'a> FolTranslator<'a> {
                     crate::ast::WidenOp::Add => l.widen_add(&r),
                     crate::ast::WidenOp::Sub => l.widen_sub(&r),
                     crate::ast::WidenOp::Shl(width) => l.shl(&r, width),
+                    crate::ast::WidenOp::Mul => l.widen_mul(&r),
                 }
             }
             IntNode::If { cond, then, els } => {

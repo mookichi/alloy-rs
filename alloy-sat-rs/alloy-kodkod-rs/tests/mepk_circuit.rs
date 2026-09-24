@@ -267,6 +267,29 @@ fn symbolic_div_matches_concrete_and_guards() {
     assert!(mepk_div(&num, &bad, 4).is_none());
 }
 
+#[test]
+fn symbolic_div_zero_centre_is_undef() {
+    // rev2 §9.1(a): exact cancellation `m2 == 0` is out of domain even
+    // when `k2 < p2` holds (infinite relative error).
+    let w = MepkWidths::uniform(12).with_guard(4);
+    let num = Mepk::new(100, 6, 8, 1).unwrap();
+    let zero_den = Mepk::new(0, 7, 8, 1).unwrap();
+    assert!(zero_den.k < zero_den.p as i32);
+    assert!(mepk_div(&num, &zero_den, 4).is_none());
+    let ctx = BoolCtx::new();
+    let a = mepk_const(num.m as i64, num.e as i64, num.p as i64, num.k as i64, &w, &ctx);
+    let b = mepk_const(
+        zero_den.m as i64,
+        zero_den.e as i64,
+        zero_den.p as i64,
+        zero_den.k as i64,
+        &w,
+        &ctx,
+    );
+    let (_, undef) = mepk_div_c(&a, &b, &w);
+    assert!(ctx.eval(undef, &[]));
+}
+
 // ---- carry contract: e' lower estimate, k' conservative -------------------
 // A round-up carry bumps the true exponent past E0 (bit length of the
 // unrounded total) by one. Symbolic lanes must satisfy

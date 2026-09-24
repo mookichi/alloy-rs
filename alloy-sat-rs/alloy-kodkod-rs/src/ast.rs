@@ -373,6 +373,8 @@ pub enum WidenOp {
     Sub,
     /// Variable shift-left with explicit exact output width in bits.
     Shl(u32),
+    /// Exact widening multiplication (`w1 + w2` bits, no truncation).
+    Mul,
 }
 
 #[derive(Clone, Debug)]

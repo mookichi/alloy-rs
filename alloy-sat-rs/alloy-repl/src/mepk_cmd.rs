@@ -20,9 +20,10 @@
 //! usable mantissa precision `m_width - 1`.
 
 use alloy_kodkod_rs::mepk::{
-    decimal_to_mepk, mepk_add, mepk_add_c, mepk_div, mepk_div_c, mepk_mul, mepk_mul_c, Mepk,
-    MepkCircuit, MepkWidths,
+    decimal_rational, decimal_to_mepk, mepk_add, mepk_add_c, mepk_div, mepk_div_c, mepk_mul,
+    mepk_mul_c, Mepk, MepkCircuit, MepkWidths,
 };
+use alloy_kodkod_rs::mepk_tree::{cegar_evaluate, evaluate, true_value, verify, CegarError, MepkExpr, MepkOp};
 use alloy_kodkod_rs::BoolCtx;
 
 pub const USAGE: &str = "usage: :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <decimal>) (<m,e,p,k>|lit <decimal>) [p <maxp>] [n <intcount>] | :mepk [-v] lit <decimal> [p <maxp>] [n <intcount>] | :mepk widths [n]";
@@ -344,7 +345,7 @@ fn op_command(args: &[&str]) -> Vec<String> {
                 out.push(format!("full {}", v.interval_string_full(0)));
             }
         }
-        None => out.push("concrete DivisionUndefined (k2 >= p2) or overflow".to_string()),
+        None => out.push("concrete DivisionUndefined (k2 >= p2, m2 == 0) or overflow".to_string()),
     }
 
     // Symbolic cross-check over constant circuits.
@@ -406,7 +407,7 @@ fn op_command(args: &[&str]) -> Vec<String> {
             });
         }
         (None, "div") => out.push(if undef {
-            "MATCH: both report DivisionUndefined (k2 >= p2)".to_string()
+            "MATCH: both report DivisionUndefined (k2 >= p2 or m2 == 0)".to_string()
         } else {
             "MISMATCH: concrete undefined but symbolic undef=false".to_string()
         }),
@@ -666,6 +667,208 @@ fn sens_command(args: &[&str]) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// `:cegar`: expression-tree CEGAR over the oracle (`mepk_tree`).
+//
+// S-expression input over whitespace-separated tokens (parens must be
+// spaced): `( <op> <expr> <expr> )` with `<op>` in add|sub|mul|div and
+// `lit <decimal>` leaves (exact rationals; integers like `lit 355` work).
+// Leaf precision comes from `p` (same default as `:mepk lit`).
+// Tuples are rejected as leaves: an error budget is not exact input.
+// Example:
+//   :cegar ( div ( sub ( mul lit 355 lit 113 ) ( mul lit 22 lit 7 ) )
+//              ( sub lit 1000 lit 999 ) ) g 3
+// ---------------------------------------------------------------------------
+
+pub const CEGAR_USAGE: &str = "usage: :cegar [-v] ( <op> <expr> <expr> ) [g <goal>] [delta <d>] [iters <n>] [guard0 <g0>] [abs <rexp>] [p <maxp>] [n <intcount>]";
+
+/// Run a `:cegar` command body (tokens after `:cegar`), returning output lines.
+pub fn run_cegar(args: &[&str]) -> Vec<String> {
+    if args.is_empty() {
+        return vec![CEGAR_USAGE.to_string()];
+    }
+    cegar_command(args)
+}
+
+/// Parse one `:cegar` s-expression at `tokens[i]`. Leaves are `lit`
+/// decimals only (exact rationals; leaf precision from `max_p`):
+/// error-budgeted `<m,e,p,k>` tuples cannot serve as exact leaves.
+fn parse_cegar_expr(
+    tokens: &[String],
+    i: usize,
+    max_p: u32,
+) -> Result<(MepkExpr, usize), String> {
+    if i >= tokens.len() {
+        return Err(CEGAR_USAGE.to_string());
+    }
+    if tokens[i] == "(" {
+        if i + 1 >= tokens.len() {
+            return Err(CEGAR_USAGE.to_string());
+        }
+        let op = match tokens[i + 1].as_str() {
+            "add" => MepkOp::Add,
+            "sub" => MepkOp::Sub,
+            "mul" => MepkOp::Mul,
+            "div" => MepkOp::Div,
+            _ => return Err(CEGAR_USAGE.to_string()),
+        };
+        let (l, j) = parse_cegar_expr(tokens, i + 2, max_p)?;
+        let (r, k) = parse_cegar_expr(tokens, j, max_p)?;
+        if k >= tokens.len() || tokens[k] != ")" {
+            return Err(CEGAR_USAGE.to_string());
+        }
+        Ok((MepkExpr::bin(op, l, r), k + 1))
+    } else if tokens[i] == "lit" {
+        if i + 1 >= tokens.len() {
+            return Err(CEGAR_USAGE.to_string());
+        }
+        match decimal_rational(tokens[i + 1].as_str()) {
+            Some((num, den)) => Ok((MepkExpr::leaf(num, den, max_p), i + 2)),
+            None => Err(format!(
+                "cannot convert {:?}: malformed literal or outside the i128 oracle range",
+                tokens[i + 1]
+            )),
+        }
+    } else {
+        Err(CEGAR_USAGE.to_string())
+    }
+}
+
+/// Render a tree with final leaf precisions (`num/den@p` leaves).
+fn fmt_cegar_expr(e: &MepkExpr) -> String {
+    match e {
+        MepkExpr::Leaf { num, den, p } => format!("{num}/{den}@{p}"),
+        MepkExpr::Bin { op, left, right } => {
+            let o = match op {
+                MepkOp::Add => "add",
+                MepkOp::Sub => "sub",
+                MepkOp::Mul => "mul",
+                MepkOp::Div => "div",
+            };
+            format!("( {o} {} {} )", fmt_cegar_expr(left), fmt_cegar_expr(right))
+        }
+    }
+}
+
+fn cegar_command(args: &[&str]) -> Vec<String> {
+    let (mut rest, n) = match parse_n(args) {
+        Ok(v) => v,
+        Err(e) => return vec![e],
+    };
+    let verbose = take_flag(&mut rest, "-v");
+    let max_p_opt = match take_option(&mut rest, "p") {
+        Ok(v) => v,
+        Err(e) => return vec![e],
+    };
+    let g = match take_option(&mut rest, "g") {
+        Ok(v) => v.map(|x| x as i32).unwrap_or(3),
+        Err(e) => return vec![e],
+    };
+    let delta = match take_option(&mut rest, "delta") {
+        Ok(v) => v.unwrap_or(6),
+        Err(e) => return vec![e],
+    };
+    let max_iters = match take_option(&mut rest, "iters") {
+        Ok(v) => v.unwrap_or(20),
+        Err(e) => return vec![e],
+    };
+    let guard0 = match take_option(&mut rest, "guard0") {
+        Ok(v) => v.unwrap_or(4),
+        Err(e) => return vec![e],
+    };
+    // `abs` takes a signed radius exponent (`R <= 2^abs`); parsed
+    // separately since `take_option` is unsigned-only.
+    let abs_tol = match rest.iter().position(|s| s == "abs") {
+        None => None,
+        Some(pos) => {
+            if pos + 1 >= rest.len() {
+                return vec![CEGAR_USAGE.to_string()];
+            }
+            match rest[pos + 1].parse::<i32>() {
+                Ok(v) => {
+                    rest.drain(pos..pos + 2);
+                    Some(v)
+                }
+                Err(_) => return vec![CEGAR_USAGE.to_string()],
+            }
+        }
+    };
+    let base = match MepkWidths::from_env(n) {
+        Ok(w) => w,
+        Err(e) => return vec![format!("widths error: {e}")],
+    };
+    let max_p = match resolve_max_p(max_p_opt, &base) {
+        Ok(p) => p,
+        Err(e) => return vec![e],
+    };
+    let (mut expr, end) = match parse_cegar_expr(&rest, 0, max_p) {
+        Ok(v) => v,
+        Err(e) => return vec![e],
+    };
+    if end != rest.len() {
+        return vec![CEGAR_USAGE.to_string()];
+    }
+    // Independent truth readout for the final verdict (may overflow).
+    let truth = true_value(&expr);
+    match cegar_evaluate(&mut expr, g, delta, max_iters, guard0, abs_tol) {
+        Ok(out) => {
+            let mut lines = vec![format!(
+                "{} iters={} guard={} (goal g={g}{})",
+                out.root.interval_string(0),
+                out.iters,
+                out.guard,
+                match abs_tol {
+                    Some(a) => format!(", abs<=2^{a}"),
+                    None => String::new(),
+                },
+            )];
+            match truth.and_then(|t| verify(&out.root, t)) {
+                Some(true) => lines.push("verify: holds (|truth - centre| <= R)".to_string()),
+                Some(false) => lines.push("verify: VIOLATED (implementation bug)".to_string()),
+                None => lines.push("verify: unavailable (exact truth overflowed i128)".to_string()),
+            }
+            // Vacuity warning (m = 0 blind spot of the tau criterion):
+            // a zero centre has no relative error, so a huge absolute R
+            // can coexist with tau > 0. Only warned when the user did not
+            // manage tightness via `abs` themselves.
+            if abs_tol.is_none() && out.root.m == 0 {
+                let r_exp = out.root.e - out.root.p as i32 + out.root.k;
+                if r_exp > 0 {
+                    lines.push(format!(
+                        "warning: vacuous zero centre (R=2^{r_exp}); pass abs <rexp> to tighten"
+                    ));
+                }
+            }
+            if verbose {
+                lines.push(format!("final: {}", fmt_cegar_expr(&expr)));
+            }
+            lines
+        }
+        Err(e) => {
+            let why = match e {
+                CegarError::UnrefineableDiv => {
+                    "divisor left its domain and leaves cannot grow further".to_string()
+                }
+                CegarError::UnrefineablePrecision => {
+                    "precision loss persists but leaves cannot grow further".to_string()
+                }
+                CegarError::OracleRange => "i128 oracle range exceeded".to_string(),
+                CegarError::MaxIters => format!("did not converge in {max_iters} iters"),
+                CegarError::GuardExhausted => {
+                    "Q-blocked division needs guard beyond 64".to_string()
+                }
+            };
+            // Show the best-effort current root when the tree still evaluates.
+            let mut lines = vec![format!("cegar failed: {why}")];
+            if let Ok(v) = evaluate(&expr, guard0) {
+                lines.push(format!("last root: {}", v.interval_string(0)));
+            }
+            lines.push("hint: raise iters/delta, lower g, or raise guard0".to_string());
+            lines
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,5 +1077,85 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("usage:")), "{lines:?}");
         let lines = run_mepk(&["lit", "0.5", "p", "0"]);
         assert!(lines.iter().any(|l| l.contains("1 <= p <= 127")), "{lines:?}");
+    }
+
+    #[test]
+    fn cegar_walkthrough_converges() {
+        // rev2 §9.2 shape with leaf precision p=8: must converge to a
+        // tight answer with guard co-refinement, and verify.
+        // (At default max_p=4 the loop still converges formally, but the
+        // radius stays huge — precision must come from somewhere.)
+        let lines = run_cegar(&[
+            "(", "div",
+            "(", "sub", "(", "mul", "lit", "355", "lit", "113", ")",
+            "(", "mul", "lit", "22", "lit", "7", ")", ")",
+            "(", "sub", "lit", "1000", "lit", "999", ")", ")",
+            "g", "3", "p", "8",
+        ]);
+        assert!(
+            lines.iter().any(|l| l.contains("iters=") && l.contains("guard=")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("verify: holds")),
+            "{lines:?}"
+        );
+        // Root denotes ~39961 (centre within a small radius of it).
+        assert!(lines[0].contains("3996"), "{lines:?}");
+        // Q-blocked division forced guard co-refinement (4 -> 10).
+        assert!(lines[0].contains("guard=10"), "{lines:?}");
+    }
+
+    #[test]
+    fn cegar_div_zero_and_syntax_errors() {        // Structurally-zero denominator: loud failure, never a hang.
+        let lines = run_cegar(&[
+            "(", "div", "lit", "3", "(", "sub", "lit", "5", "lit", "5", ")", ")",
+            "iters", "3",
+        ]);
+        assert!(lines[0].starts_with("cegar failed"), "{lines:?}");
+        // Bad shapes.
+        assert_eq!(run_cegar(&[]), vec![CEGAR_USAGE.to_string()]);
+        let lines = run_cegar(&["(", "add", "lit", "1", ")"]);
+        assert!(lines.iter().any(|l| l.contains("usage:")), "{lines:?}");
+        let lines = run_cegar(&["(", "add", "lit", "1", "lit", "2"]);
+        assert!(lines.iter().any(|l| l.contains("usage:")), "{lines:?}");
+        let lines = run_cegar(&["add", "lit", "1", "lit", "2", ")"]);
+        assert!(lines.iter().any(|l| l.contains("usage:")), "{lines:?}");
+        // Tuples are rejected as leaves (not exact input).
+        let lines = run_cegar(&["(", "add", "1,0,4,0", "lit", "2", ")"]);
+        assert!(lines.iter().any(|l| l.contains("usage:")), "{lines:?}");
+        // Bad literal.
+        let lines = run_cegar(&["(", "add", "lit", "abc", "lit", "1", ")"]);
+        assert!(lines.iter().any(|l| l.contains("cannot convert")), "{lines:?}");
+    }
+
+    #[test]
+    fn cegar_abs_tightens_zero_and_warns() {
+        // (2^100 − 2^100): vacuous zero at default settings (warned),
+        // tightened by `abs 0`, honestly refused at `abs -200`.
+        let big = "1267650600228229401496703205376"; // 2^100
+        let base = [
+            "(", "sub", "lit", big, "lit", big, ")",
+        ];
+        let plain: Vec<&str> = base.to_vec();
+        let lines = run_cegar(&plain);
+        assert!(lines[0].contains("0 ±"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("warning: vacuous zero centre")),
+            "{lines:?}"
+        );
+        let mut tight = base.to_vec();
+        tight.extend(["abs", "0"]);
+        let lines = run_cegar(&tight);
+        assert!(lines.iter().any(|l| l.contains("abs<=2^0")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("verify: holds")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("vacuous")),
+            "{lines:?}"
+        );
+        let mut hopeless = base.to_vec();
+        hopeless.extend(["abs", "-200", "iters", "30"]);
+        let lines = run_cegar(&hopeless);
+        assert!(lines[0].starts_with("cegar failed"), "{lines:?}");
     }
 }

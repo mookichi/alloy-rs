@@ -9,10 +9,24 @@
 //! * **Symbolic layer** ([`MepkCircuit`] + `mepk_*_c`): pins the *error
 //!   exponents* (`p'`, `k'`, `div_guard`) as solver-backed constraints
 //!   over exponent circuits, like `util/mepk.als` (`mepkAdd/mepkMul/`
-//!   `mepkDiv` pin `res.p`/`res.k`; the exact centre is delegated to the
+//!   `mepkDiv` pin `res.p/res.k`; the exact centre is delegated to the
 //!   oracle). `e'` is pinned to `E0` (see below); the result mantissa
 //!   `m'` is a fresh free variable, to be bound by the oracle / future
 //!   full rounding encoding (see `round_mag_const_drop`).
+//!
+//! # P2-1 note: divergence from the solver lowering
+//!
+//! The solver lowering (`alloy-front-rs`, `ereal_add_sub`/`ereal_mul`/
+//! `ereal_div`) does **not** call `mepk_*_c`; it mirrors the exponent
+//! formulas and additionally window-pins result centres
+//! (`|c_r − f(c_a, c_b)| ≤ 2^B`) with result normalization, so chained
+//! reasoning is sound there. This symbolic layer instead leaves `m'`
+//! free (REPL `:mepk` cross-checks and exponent-shape experiments only):
+//! do not mistake its free-`m'` outputs for solver-verified intervals,
+//! and do not chain symbolic `e'` into downstream error exponents
+//! without an oracle rerounding in between (carry contract below).
+//! The `k'` formulas (including the P0-1 `D'` fold) are kept identical
+//! in both layers; only the centre handling differs.
 //!
 //! # Carry contract (`e'` is a lower estimate)
 //!
@@ -340,11 +354,34 @@ pub fn mepk_mul(x1: &Mepk, x2: &Mepk) -> Option<Mepk> {
     Mepk::new(m_new, e_new, p_new, int_ext::combine_k(c, b))
 }
 
-/// Division (§5). `None` when `k2 >= p2` (denominator may span zero),
-/// on overflow, or on bad precision. `guard` is the caller's
-/// `MepkWidths::guard` (default 4).
+/// Division (§5 + rev2 §9.1(a) + P0-1 Q-fix). `None` when `k2 >= p2`
+/// (denominator may span zero) or `m2 == 0` (exact cancellation:
+/// infinite relative error even when `k2 < p2` holds), on overflow, or
+/// on bad precision. `guard` is the caller's `MepkWidths::guard`
+/// (default 4).
+///
+/// The centre goes through TWO roundings: scaled pre-rounding
+/// (`scaled_div_nearest`, error `E1 ≤ 2^(q_lsb−1)` with
+/// `Q = q_lsb − 1`) and final `round_to_precision` (Lemma 1,
+/// `E2 ≤ 2^B`). The input-error budget therefore folds the pre-rounding
+/// exponent in: `D' = max(D, Q) + 1`, `k' = combine_k(D', B)`, covering
+/// input error + pre-rounding + final rounding
+/// (`2^D + 2^Q ≤ 2^D'`, then `+ 2^B ≤ 2^(B+k')`, Lemma 2 twice).
+/// Folding into `D` (not `B`) is load-bearing: the radius reads the lane
+/// `B`, so a `B'`-side fix would not enlarge it. Omitting `Q` is unsound:
+/// zero-fill can move `lsb'` strictly below `q_lsb`, leaving `E1` far
+/// above both `2^D` and `2^B` (e.g. `(23,-1,5,0)/(44,1,6,0)` at guard 0
+/// centres on `0.5` with `R' = 0.125` while the true quotient is
+/// `0.2614...`; a second shape `(18,3,5,0)/(-29,1,5,1)` breaks even the
+/// `B'`-side variant). The fix only loosens outputs where pre-rounding
+/// dominates (`Q ≥ max(D, B)`); otherwise `R'` is bit-identical.
+/// `guard` is a tightness knob only (larger guard shrinks `Q` and the
+/// zero-quotient threshold); soundness holds for every `guard ≥ 0`.
 pub fn mepk_div(x1: &Mepk, x2: &Mepk, guard: u32) -> Option<Mepk> {
     if !x2.div_guard() {
+        return None;
+    }
+    if x2.m == 0 {
         return None;
     }
     let p_new = x1.p.min(x2.p);
@@ -368,7 +405,9 @@ pub fn mepk_div(x1: &Mepk, x2: &Mepk, guard: u32) -> Option<Mepk> {
         x2.p as i32,
     );
     let b = e_new - p_new as i32;
-    Mepk::new(m_new, e_new, p_new, int_ext::combine_k(d, b))
+    // P0-1: fold the pre-rounding exponent into the input-error budget.
+    let d_star = d.max(q_lsb - 1) + 1;
+    Mepk::new(m_new, e_new, p_new, int_ext::combine_k(d_star, b))
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +486,23 @@ fn to_i128(v: u128) -> Option<i128> {
     Some(v as i128)
 }
 
+/// Exact rational value of a decimal literal as `(num, den)` with
+/// `den > 0` (`value = num / den`), for exact-rational leaves
+/// (`:cegar`, `mepk_tree`). Returns `None` on malformed input or values
+/// outside the `i128` oracle range.
+pub fn decimal_rational(s: &str) -> Option<(i128, i128)> {
+    let (neg, digits, exp10) = parse_decimal(s)?;
+    let mag = to_i128(digits)?;
+    let num = if neg { mag.checked_neg()? } else { mag };
+    if exp10 >= 0 {
+        let num = num.checked_mul(to_i128(pow10_u128(exp10 as u32)?)?)?;
+        Some((num, 1))
+    } else {
+        let den = to_i128(pow10_u128(exp10.checked_neg()? as u32)?)?;
+        Some((num, den))
+    }
+}
+
 /// `floor(log2(digits / 10^k))` for `digits > 0` via binary search with
 /// overflow-proof comparisons (overflow on either side decides the order).
 fn floor_log2_div(digits: u128, k: u32) -> Option<i32> {
@@ -490,10 +546,11 @@ fn floor_log2_div(digits: u128, k: u32) -> Option<i32> {
 ///   integers) encode **exactly**: zero-fill (or exact-drop of trailing
 ///   zeros) pads them up to `max_p` with `k = 0`. `min_p` reports the
 ///   minimal exactly-encoding precision (`bit length − trailing zeros`);
-/// - other values round to nearest at `max_p` with `k = 1` (one guard bit
-///   absorbs the decimal→binary pre-rounding; the pre-scale carries two
-///   extra bits of margin). `min_p` is `None` (no finite precision
-///   suffices).
+/// - other values round to nearest at `max_p` with `k = 1`: the pre-scale
+///   `s = max_p − e_est + 2` forces the final rounding to always drop
+///   ≥ 3 bits, so the decimal→binary pre-rounding is at most `2^B/8`
+///   against the Lemma-1 budget `2^B` (P0-2 proof at the call site).
+///   `min_p` is `None` (no finite precision suffices).
 /// - dyadic values with `min_p > max_p` round at the cap with `k = 0`
 ///   (still sound: a single rounding of an exact integer is within the
 ///   Lemma-1 bound); `min_p` reports the unmet need.
@@ -568,10 +625,18 @@ pub fn decimal_to_mepk(s: &str, max_p: u32) -> Option<DecimalConv> {
             min_p: Some(p_star),
         });
     }
-    // Non-dyadic: pre-round value × 2^s to an integer with two margin
-    // bits (s = max_p − e + 2), reusing the ties-to-even scaled
-    // division; the combined error stays below 2^(e−p+1), hence k = 1.
-    // Factoring out 2^a keeps intermediates small: q ≈ value × 2^s.
+    // Non-dyadic: pre-round value × 2^s to an integer with margin bits
+    // (s = max_p − e_est + 2, `e_est = floor(log2 value)`), reusing the
+    // ties-to-even scaled division, then a single Lemma-1 rounding.
+    //
+    // P0-2 soundness (k = 1 always suffices): since `V ≥ 2^e_est`,
+    // `q ≈ V·2^s ≥ 2^(max_p+2)`, so `bitlen(q) ≥ max_p + 3` and the final
+    // rounding always drops ≥ 3 bits. Hence the pre-rounding error
+    // `E1 ≤ 2^(q_lsb−1)` is at most `2^B/8` (`B` the final rounding
+    // exponent), and `E1 + E2 ≤ 1.125·2^B < 2·2^B = R` with `k = 1`.
+    // Unlike division (P0-1) there is no zero-fill subcase here, so no
+    // `Q`-fold is needed. Factoring out 2^a keeps intermediates small:
+    // q ≈ value × 2^s.
     let o = den_r;
     let e_est = floor_log2_div(digits, k)?;
     let s = (max_p as i32 - e_est + 2).max(0) as u32;
@@ -775,10 +840,12 @@ pub fn mepk_mul_c(x1: &MepkCircuit, x2: &MepkCircuit, w: &MepkWidths) -> MepkCir
     res
 }
 
-/// Division (§5, symbolic exponent layer). Returns `(result, undef)` where
-/// `undef = (k2 >= p2)` is the §5 precondition-violation flag: a model with
-/// `undef` true must be treated as UNSAT (no finite bound can absorb a
-/// denominator interval spanning zero), mirroring `divGuard` in `mepk.als`
+/// Division (§5 + rev2 §9.1(a), symbolic exponent layer). Returns
+/// `(result, undef)` where `undef = (k2 >= p2) OR (m2 == 0)` is the
+/// precondition-violation flag: a model with `undef` true must be treated
+/// as UNSAT (no finite bound can absorb a denominator interval spanning
+/// zero; `m2 == 0` from exact cancellation has infinite relative error
+/// even when `k2 < p2` holds), mirroring `divGuard` in `mepk.als`
 /// and division-by-zero handling in [`IntCircuit::div`].
 /// `e'`/`k'` follow the carry contract (lower estimate / conservative).
 pub fn mepk_div_c(
@@ -788,14 +855,16 @@ pub fn mepk_div_c(
 ) -> (MepkCircuit, BoolRef) {
     let ctx = x1.ctx().clone();
     let ew = w.e_width;
-    // `undef = (k2 >= p2) = NOT (k2 < p2)`.
-    let undef = ctx.not(x2.k.lt(&x2.p));
     // Quotient scale needs no division circuit: `q_lsb = lsb1 - lsb2 - guard`.
     let guard_c = IntCircuit::constant(w.guard as i64, ew, &ctx);
     let q_lsb = x1.lsb_c(w).sub(&x2.lsb_c(w), ew).sub(&guard_c, ew);
     // `e'` needs `bitlen(|q|)`: obtain the wide truncated quotient magnitude
-    // via the exact division circuit on magnitudes.
-    let (_q_wide, _round_up, _neg, _dbz) = x1.m.div_nearest_wide(&x2.m, w.guard);
+    // via the exact division circuit on magnitudes. Its `dbz` flag is
+    // exactly `(m2 == 0)` (magnitude zero <=> value zero).
+    let (_q_wide, _round_up, _neg, dbz) = x1.m.div_nearest_wide(&x2.m, w.guard);
+    // `undef = (k2 >= p2) OR (m2 == 0)`.
+    let kviol = ctx.not(x2.k.lt(&x2.p));
+    let undef = ctx.or(&[kviol, dbz]);
     // `e'` from the wide quotient's bit-length (zero case handled inside).
     let p_new = x1.p.min_c(&x2.p);
     let e_new = result_exp_c(&_q_wide, &q_lsb, &p_new, w);
@@ -808,8 +877,13 @@ pub fn mepk_div_c(
         .sub(&x2.e, ew)
         .add(&v1.max_c(&v2), ew)
         .add(&three, ew);
+    // P0-1: `D' = max(D, Q) + 1` with `Q = q_lsb - 1` (pre-rounding
+    // exponent folded into the input-error budget); `k' = combine_k(D', B)`.
     let b = e_new.sub(&p_new, ew);
-    let k_new = combine_k_c(&d_exp, &b);
+    let one = IntCircuit::constant(1, ew, &ctx);
+    let q_exp = q_lsb.sub(&one, ew);
+    let d_star = d_exp.max_c(&q_exp).add(&one, ew);
+    let k_new = combine_k_c(&d_star, &b);
     let mut res = MepkCircuit::free(w, &ctx);
     res.p = resize(&p_new, w.p_width);
     res.e = resize(&e_new, w.e_width);
@@ -873,9 +947,182 @@ mod tests {
         assert!(mepk_div(&num, &bad, 4).is_none());
         let ok = Mepk::new(50, 5, 8, 1).unwrap();
         let r = mepk_div(&num, &ok, 4).unwrap();
-        // D = (e1-e2) + max(k1-p1, k2-p2) + 3 = 1 + (-7) + 3.
-        let d = (6 - 5) + (1 - 8) + 3;
-        assert_eq!(r.k, int_ext::combine_k(d, r.e - r.p as i32));
+        // D = (e1-e2) + max(k1-p1, k2-p2) + 3 = 1 + (-7) + 3 = -3;
+        // Q = q_lsb - 1 = (lsb1-lsb2-guard) - 1 = (-1+2-4) - 1 = -4;
+        // D' = max(D, Q) + 1 = -2.
+        let d_star = (6 - 5) + (1 - 8).max(1 - 8) + 3;
+        let d_star = d_star.max(-1 + 2 - 4 - 1) + 1;
+        assert_eq!(r.k, int_ext::combine_k(d_star, r.e - r.p as i32));
+    }
+
+    /// P0-1 regression: two counterexamples that break the old `B`-budget
+    /// formula (both need the `D' = max(D, Q) + 1` fix to be sound).
+    /// Each asserts the corrected `k'` and checks `|Q − c'| ≤ R'`
+    /// rationally in units of `2^lo` (mirrors `assert_decimal_sound`).
+    #[test]
+    fn div_prerounding_counterexamples() {
+        // (23,-1,5,0)/(44,1,6,0) at guard 0: true quotient 0.2614...,
+        // old centre 0.5 with R' = 0.125.
+        let x1 = Mepk::new(23, -1, 5, 0).unwrap();
+        let x2 = Mepk::new(44, 1, 6, 0).unwrap();
+        let r = mepk_div(&x1, &x2, 0).unwrap();
+        // D = -4, Q = -2, D' = -1, B = -6 → k' = 6, R' = 1.
+        assert_eq!((r.m, r.e, r.p, r.k), (16, -1, 5, 6));
+        assert_div_sound(&x1, &x2, &r);
+        // (18,3,5,0)/(-29,1,5,1) at guard 0: breaks even the `B'`-side
+        // variant (radius reads the lane `B`, so only the `D'` fold works).
+        let y1 = Mepk::new(18, 3, 5, 0).unwrap();
+        let y2 = Mepk::new(-29, 1, 5, 1).unwrap();
+        let s = mepk_div(&y1, &y2, 0).unwrap();
+        // D = 1, Q = 1, D' = 2, B = -3 → k' = 6, R' = 8.
+        assert_eq!((s.m, s.e, s.p, s.k), (-16, 2, 5, 6));
+        assert_div_sound(&y1, &y2, &s);
+    }
+
+    /// Check `|c1/c2 − c'| ≤ R'` rationally: `|M1 − K·M2·2^-lo... ` —
+    /// concretely `|M1·2^-lo − K·M2| ≤ 2^(rn−lo)·|M2|` with all shifts
+    /// non-negative (`lo ≤ 0` forced). Inputs are small.
+    fn assert_div_sound(x1: &Mepk, x2: &Mepk, r: &Mepk) {
+        let lsb1 = x1.lsb();
+        let lsb2 = x2.lsb();
+        let lsbn = r.e - r.p as i32 + 1;
+        let rn = r.e - r.p as i32 + r.k;
+        let lo = 0.min(lsb1).min(lsb2).min(lsbn).min(rn);
+        let sc = |v: i128, e: i32| v.checked_shl((e - lo) as u32).unwrap();
+        let lhs = (sc(x1.m, lsb1).checked_shl((-lo) as u32).unwrap()
+            - sc(r.m, lsbn) * sc(x2.m, lsb2))
+        .abs();
+        let rhs = sc(x2.m, lsb2)
+            .abs()
+            .checked_mul(1i128 << ((rn - lo) as u32))
+            .unwrap();
+        assert!(lhs <= rhs, "div centre outside radius");
+    }
+
+    /// P0-1 guard-shift theorem, adversarial boundary check: the two-stage
+    /// centre error of [`mepk_div`] (scaled pre-rounding `E1 ≤ 2^(q_lsb−1)`
+    /// plus Lemma-1 `E2 ≤ 2^B`) together with the input error (`D`) stays
+    /// within `R'` for every guard in 0..=6.
+    ///
+    /// Inputs are normalized/bounded per the lowering's Phase-2
+    /// preconditions (denominator `|m| ∈ [2^(p−1), 2^p)`, numerator
+    /// `|m| < 2^p` or zero, `k ≥ 0`, `k2 < p2`); true values run over the
+    /// four boundary corners (`δ = ±R`). Exact scaled-integer arithmetic
+    /// in units of `2^lo`; oracle-`None` (overflow) samples are skipped.
+    /// Also tracks `min(D − B)` over nonzero-quotient samples to prove the
+    /// near-tight slack region (`D − B ≤ 3`) was actually exercised.
+    #[test]
+    fn div_two_stage_sound_fuzz() {
+        let mut s: u64 = 0x123456789ABCDEF;
+        let mut next = move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s = s.wrapping_mul(0x2545F4914F6CDD1D);
+            s
+        };
+        let mut min_slack = i32::MAX;
+        let mut guard_seen = [false; 7];
+        let mut checked = 0u32;
+        for _ in 0..30000 {
+            let p1 = 1 + (next() % 6) as u32;
+            let p2 = 1 + (next() % 6) as u32;
+            let e1 = (next() % 7) as i32 - 3;
+            let e2 = (next() % 7) as i32 - 3;
+            // Normalized mantissae (`|m| ∈ [2^(p−1), 2^p)`); numerator
+            // is exactly zero one sample in eight.
+            let mag1 = if next() & 7 == 0 {
+                0
+            } else {
+                (1u128 << (p1 - 1)) + (next() as u128 % (1u128 << (p1 - 1)))
+            };
+            let mag2 = (1u128 << (p2 - 1)) + (next() as u128 % (1u128 << (p2 - 1)));
+            let m1 = if next() & 1 == 1 {
+                -(mag1 as i128)
+            } else {
+                mag1 as i128
+            };
+            let m2 = if next() & 1 == 1 {
+                -(mag2 as i128)
+            } else {
+                mag2 as i128
+            };
+            // `k2 < p2` (div precondition); `k1` may exceed `p1`
+            // (huge-error shapes, still covered by the theorem).
+            let k1 = (next() % (p1 as u64 + 3)) as i32;
+            let k2 = (next() % (p2 as u64)) as i32;
+            let g = (next() % 7) as u32;
+            let (x1, x2) = match (Mepk::new(m1, e1, p1, k1), Mepk::new(m2, e2, p2, k2)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue,
+            };
+            let r = match mepk_div(&x1, &x2, g) {
+                Some(v) => v,
+                None => continue,
+            };
+            guard_seen[g as usize] = true;
+            checked += 1;
+            if r.m != 0 {
+                let d = int_ext::div_d(x1.e, x2.e, x1.k, x1.p as i32, x2.k, x2.p as i32);
+                min_slack = min_slack.min(d - (r.e - r.p as i32));
+            }
+            let lsb1 = x1.lsb();
+            let r1 = x1.radius_exp();
+            let lsb2 = x2.lsb();
+            let r2 = x2.radius_exp();
+            let lsbn = r.e - r.p as i32 + 1;
+            let rn = r.e - r.p as i32 + r.k;
+            // Unit `2^lo` (forced `≤ 0` so the cross-multiplied check
+            // below uses only non-negative shifts):
+            // `|x1'/x2' − c'| ≤ R'` ⟺ `|M1·2^-lo − K·M2| ≤ 2^(rn−lo)·|M2|`
+            // with `K = m·2^(lsb'−lo)`.
+            let lo = 0
+                .min(lsb1)
+                .min(r1)
+                .min(lsb2)
+                .min(r2)
+                .min(lsbn)
+                .min(rn);
+            let sc = |v: i128, e: i32| {
+                v.checked_shl((e - lo) as u32)
+                    .expect("fuzz shift out of small-domain range")
+            };
+            let m1s = sc(m1, lsb1);
+            let r1s = sc(1, r1);
+            let m2s = sc(m2, lsb2);
+            let r2s = sc(1, r2);
+            let k = sc(r.m, lsbn);
+            let unscale = (-lo) as u32;
+            let rhs_pow = (rn - lo) as u32;
+            for s1 in [-1i128, 1] {
+                for s2 in [-1i128, 1] {
+                    let x1s = m1s + s1 * r1s;
+                    let x2s = m2s + s2 * r2s;
+                    // `k2 < p2` + normalization keep every boundary
+                    // denominator away from zero.
+                    assert!(x2s != 0, "fuzz denominator hit zero");
+                    let lhs = (x1s.checked_shl(unscale).expect("fuzz unscale") - k * x2s).abs();
+                    let rhs = x2s
+                        .abs()
+                        .checked_shl(rhs_pow)
+                        .expect("fuzz rhs out of range");
+                    assert!(
+                        lhs <= rhs,
+                        "div unsound: g={g} x1=({m1},{e1},{p1},{k1}) x2=({m2},{e2},{p2},{k2}) r=({},{},{},{}) s1={s1} s2={s2}",
+                        r.m,
+                        r.e,
+                        r.p,
+                        r.k,
+                    );
+                }
+            }
+        }
+        assert!(checked > 20000, "fuzz sampled too few points");
+        assert!(guard_seen.iter().all(|&b| b), "guard coverage hole");
+        assert!(
+            min_slack <= 3,
+            "near-tight slack region (D-B <= 3) not exercised: min={min_slack}"
+        );
     }
 
     /// Check `|decimal − centre| ≤ R` rationally in units of `2^lo`
@@ -995,6 +1242,163 @@ mod tests {
         for s in ["0.5", "2.5", "0.25", "3", "12", "1e2", "0.75", "6.25"] {
             for p in [1u32, 2, 4, 8] {
                 assert_decimal_sound(s, p);
+            }
+        }
+    }
+
+    /// P0-2: randomized decimal soundness with margin lock. The proof gives
+    /// `(E1 + E2)/R ≤ 9/16` on the non-dyadic rounded path (`k = 1`:
+    /// pre-rounding ≤ `R/8` via drop ≥ 3, final rounding ≤ `R/2`);
+    /// soundness itself is checked in exact `i128` arithmetic (mirrors
+    /// `assert_decimal_sound`) for every path, while the `f64` ratio only
+    /// locks the margin (`< 0.8`) on the `k = 1` path — dyadic paths
+    /// (`k = 0`) legitimately hit `err/R = 1` on exact ties (Lemma 1 with
+    /// equality) and are covered by the exactness grid tests instead.
+    /// Shapes cover near-ties, long mantissae, and extreme exponents
+    /// (deterministic xorshift, no rand dependency).
+    #[test]
+    fn decimal_randomized_sound_fuzz() {
+        let mut s: u64 = 0x243F6A8885A308D3;
+        let mut next = move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s = s.wrapping_mul(0x2545F4914F6CDD1D);
+            s
+        };
+        let mut worst = 0f64;
+        let mut checked = 0u32;
+        for _ in 0..8000 {
+            // Mantissa: 1..=15 digits (top digit nonzero), optional
+            // fraction point, optional exponent.
+            let ndig = 1 + (next() % 15) as usize;
+            let mut digits = String::new();
+            for i in 0..ndig {
+                let d = if i == 0 {
+                    (1 + next() % 9) as u8
+                } else {
+                    (next() % 10) as u8
+                };
+                digits.push((b'0' + d) as char);
+            }
+            let mut lit = digits.clone();
+            if next() & 1 == 1 && ndig > 1 {
+                let at = 1 + (next() as usize % (ndig - 1));
+                lit.insert(at, '.');
+            } else if next() & 3 == 0 {
+                lit.push_str(".0");
+            }
+            if next() & 1 == 1 {
+                let e = (next() % 25) as i32 - 12;
+                lit.push_str(&format!("e{e}"));
+            }
+            if next() & 7 == 0 {
+                lit.insert(0, '-');
+            }
+            let max_p = 1 + (next() % 16) as u32;
+            let conv = match decimal_to_mepk(&lit, max_p) {
+                Some(c) => c,
+                None => continue, // i128-range overflow: loud None, skip.
+            };
+            // Exact soundness check (same pattern as assert_decimal_sound).
+            let x = conv.v;
+            let (neg, digits_v, exp10) = parse_decimal(&lit).unwrap();
+            let (num10, den10) = if exp10 >= 0 {
+                (pow10_u128(exp10 as u32).unwrap() as i128, 1i128)
+            } else {
+                (
+                    1i128,
+                    pow10_u128(exp10.checked_neg().unwrap() as u32).unwrap() as i128,
+                )
+            };
+            let num = (if neg { -(digits_v as i128) } else { digits_v as i128 })
+                .checked_mul(num10)
+                .unwrap();
+            let den = den10;
+            let lsb = x.e - x.p as i32 + 1;
+            let lo = lsb.min(0);
+            let a = (0 - lo) as u32;
+            let b = (lsb - lo) as u32;
+            // Keep magnitudes in range: skip monster literals here
+            // (conversion-None already covers out-of-range inputs).
+            let (lhs, rhs) = match (
+                num.checked_mul(1i128.checked_shl(a).unwrap_or(i128::MAX)),
+                x.m
+                    .checked_mul(den)
+                    .and_then(|v| v.checked_mul(1i128.checked_shl(b).unwrap_or(i128::MAX))),
+            ) {
+                (Some(n), Some(c)) => (n, c),
+                _ => continue,
+            };
+            let err = (lhs - rhs).abs();
+            let rexp = (x.e - x.p as i32 + x.k) - lo;
+            let runits = if rexp >= 0 {
+                match den.checked_mul(1i128.checked_shl(rexp as u32).unwrap_or(i128::MAX)) {
+                    Some(v) => v,
+                    None => continue,
+                }
+            } else {
+                // Scale the error up instead (test values are small).
+                match err.checked_shl((-rexp) as u32) {
+                    Some(e2) => {
+                        assert!(e2 <= den, "unsound conversion of {lit}");
+                        if den != 0 && x.k == 1 {
+                            worst = worst.max(e2 as f64 / den as f64);
+                        }
+                        checked += 1;
+                        continue;
+                    }
+                    None => continue,
+                }
+            };
+            assert!(err <= runits, "unsound conversion of {lit}");
+            if runits > 0 && x.k == 1 {
+                worst = worst.max(err as f64 / runits as f64);
+            }
+            checked += 1;
+        }
+        assert!(checked > 6000, "fuzz sampled too few points");
+        assert!(
+            worst < 0.8,
+            "decimal error margin eroded: worst err/R = {worst}"
+        );
+        assert!(
+            worst > 0.2,
+            "margin lock vacuous: k=1 path never exercised (worst={worst})"
+        );
+    }
+
+    /// `floor_log2_div` is load-bearing for the P0-2 margin (an
+    /// overestimated `e_est` shrinks the pre-scale drop): check it against
+    /// an exact loop for small values.
+    #[test]
+    fn floor_log2_div_sane() {
+        for digits in [1u128, 2, 3, 9, 10, 11, 99, 100, 101, 999, 1024, 123456789] {
+            for k in 0..=9u32 {
+                let got = floor_log2_div(digits, k).unwrap();
+                let den = 10u128.pow(k);
+                // Exact reference: largest e with digits >= den*2^e (e >= 0),
+                // smallest |e| with digits*2^-e >= den (e < 0).
+                let mut want = -100i32;
+                for e in -100..=100i32 {
+                    let holds = if e >= 0 {
+                        match den.checked_mul(2u128.pow(e as u32)) {
+                            Some(v) => v <= digits,
+                            None => false,
+                        }
+                    } else {
+                        match digits.checked_shl((-e) as u32) {
+                            Some(v) => v >= den,
+                            None => true,
+                        }
+                    };
+                    if holds {
+                        want = e;
+                    } else {
+                        break;
+                    }
+                }
+                assert_eq!(got, want, "floor_log2({digits}/10^{k})");
             }
         }
     }

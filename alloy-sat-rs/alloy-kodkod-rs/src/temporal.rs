@@ -1629,6 +1629,11 @@ impl<'a> TemporalEval<'a> {
                 self.bitwidth,
                 &self.overflow,
             ),
+            crate::ast::WidenOp::Mul => crate::eval::wrap_int(
+                (l as i128) * (r as i128),
+                self.bitwidth,
+                &self.overflow,
+            ),
             crate::ast::WidenOp::Shl(width) => {
                 let v = if !(0..=60).contains(&r) {
                     0i128
