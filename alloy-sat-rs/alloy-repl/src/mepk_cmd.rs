@@ -517,35 +517,40 @@ fn sens_command(args: &[&str]) -> Vec<String> {
     ));
     out.push(dominant_term(&r.op, &r.x1, &r.x2));
 
-    // Candidates: p+1 (cap 127), k-1 (floor at wellformed k>=0).
+    // Candidates: p+1 (cap 127; m<<=1 so the denoted centre c=m*2^lsb
+    // is preserved — bumping p alone would halve the input value),
+    // k-1 (floor at wellformed k>=0; centre-preserving by construction).
     let mut cands: Vec<(String, Mepk, bool)> = Vec::with_capacity(4);
-    if r.x1.p < 127 {
-        let mut v = r.x1;
-        v.p += 1;
-        cands.push(("p1+1".to_string(), v, r.lit1));
-    } else {
-        out.push("p1+1: skipped (at p cap 127)".to_string());
-    }
-    if r.x2.p < 127 {
-        let mut v = r.x2;
-        v.p += 1;
-        cands.push(("p2+1".to_string(), v, r.lit2));
-    } else {
-        out.push("p2+1: skipped (at p cap 127)".to_string());
-    }
-    if r.x1.k > 0 {
-        let mut v = r.x1;
-        v.k -= 1;
-        cands.push(("k1-1".to_string(), v, false));
-    } else {
-        out.push("k1-1: skipped (at floor wellformed k>=0)".to_string());
-    }
-    if r.x2.k > 0 {
-        let mut v = r.x2;
-        v.k -= 1;
-        cands.push(("k2-1".to_string(), v, false));
-    } else {
-        out.push("k2-1: skipped (at floor wellformed k>=0)".to_string());
+    for (tag, x, is_p, from_lit) in [
+        ("p1+1", r.x1, true, r.lit1),
+        ("p2+1", r.x2, true, r.lit2),
+        ("k1-1", r.x1, false, false),
+        ("k2-1", r.x2, false, false),
+    ] {
+        if is_p {
+            if x.p >= 127 {
+                out.push(format!("{tag}: skipped (at p cap 127)"));
+                continue;
+            }
+            let mut v = x;
+            v.p += 1;
+            if v.m != 0 {
+                match v.m.checked_shl(1) {
+                    Some(m) => v.m = m,
+                    None => {
+                        out.push(format!("{tag}: skipped (m<<1 overflows i128)"));
+                        continue;
+                    }
+                }
+            }
+            cands.push((tag.to_string(), v, from_lit));
+        } else if x.k <= 0 {
+            out.push(format!("{tag}: skipped (at floor wellformed k>=0)"));
+        } else {
+            let mut v = x;
+            v.k -= 1;
+            cands.push((tag.to_string(), v, from_lit));
+        }
     }
 
     let mut rows: Vec<SensRow> = Vec::new();
@@ -664,6 +669,58 @@ fn sens_command(args: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exact denoted-value equality `m_a*2^lsb_a == m_b*2^lsb_b` via a
+    /// common binary scale (no floats).
+    fn same_centre(a: &Mepk, b: &Mepk) -> bool {
+        let lo = a.lsb().min(b.lsb());
+        let sa = a.m.checked_shl((a.lsb() - lo) as u32).unwrap();
+        let sb = b.m.checked_shl((b.lsb() - lo) as u32).unwrap();
+        sa == sb
+    }
+
+    #[test]
+    fn sens_perturbations_preserve_input_values() {
+        // Every ranked/excluded candidate must denote the same input values
+        // as the base operands (regression: naive p+1 halved the centre).
+        for args in [
+            vec!["add", "100,6,8,1", "50,5,8,2"],
+            vec!["mul", "100,6,8,1", "50,5,8,2"],
+            vec!["div", "100,6,8,1", "50,5,8,1"],
+            vec!["sub", "10,3,4,2", "9,3,8,0"],
+            vec!["add", "lit", "0.1", "lit", "0.2", "p", "8"],
+        ] {
+            let r = resolve_operands(&args, SENS_USAGE).unwrap();
+            // Recompute the four perturbations exactly as sens_command does.
+            let perts = [
+                ("p1+1", r.x1, true),
+                ("p2+1", r.x2, true),
+                ("k1-1", r.x1, false),
+                ("k2-1", r.x2, false),
+            ];
+            for (tag, x, is_p) in perts {
+                let mut v = x;
+                if is_p {
+                    if v.p >= 127 {
+                        continue;
+                    }
+                    v.p += 1;
+                    if v.m != 0 {
+                        v.m = v.m.checked_shl(1).unwrap();
+                    }
+                } else {
+                    if v.k <= 0 {
+                        continue;
+                    }
+                    v.k -= 1;
+                }
+                assert!(
+                    same_centre(&v, &x),
+                    "{tag} changes denoted value for {args:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn sens_prefers_min_p_side() {
