@@ -31,6 +31,10 @@ use crate::mepk::{mepk_add, mepk_div, mepk_mul, Mepk};
 pub const DEFAULT_GUARD: u32 = 4;
 /// Hard cap for guard co-refinement (mirrors `MEPK_GUARD` range `0..=64`).
 pub const MAX_GUARD: u32 = 64;
+/// Cost weight of one guard bit: raising the ambient guard tightens every
+/// division at once, so it counts heavier than a single leaf-precision bit.
+/// Tunable placeholder (see [`CegarOutcome::cost`]).
+pub const COST_GUARD_WEIGHT: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Exact rationals (verification / leaf inputs only)
@@ -397,7 +401,7 @@ fn trace_all(e: &MepkExpr, guard: u32) -> (Vec<(bool, Mepk)>, Result<Mepk, EvalE
 }
 
 /// A descent step from a [`Bin`] node to a child.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     L,
     R,
@@ -461,6 +465,18 @@ pub struct CegarOutcome {
     /// Ambient guard at success (raised above `guard0` iff some division
     /// was `Q`-blocked during refinement).
     pub guard: u32,
+    /// Refinement cost: `Σ(leaf p growth) + COST_GUARD_WEIGHT·(guard growth)`
+    /// measured from entry (`guard0`, initial leaf precisions). Sniped
+    /// refinement (§B5) lowers this without changing the converged root.
+    pub cost: u32,
+}
+
+/// Sum of leaf precisions in a (sub)tree (cost accounting baseline).
+fn leaf_p_sum(e: &MepkExpr) -> u32 {
+    match e {
+        MepkExpr::Leaf { p, .. } => *p,
+        MepkExpr::Bin { left, right, .. } => leaf_p_sum(left) + leaf_p_sum(right),
+    }
 }
 
 /// Why [`cegar_evaluate`] gave up.
@@ -477,6 +493,8 @@ pub enum CegarError {
     MaxIters,
     /// A `Q`-blocked division needs more guard than [`MAX_GUARD`].
     GuardExhausted,
+    /// `max_cost` budget exhausted before convergence.
+    BudgetExhausted,
 }
 
 /// CEGAR evaluation with goal `g` (target guarantee bits), starting guard
@@ -499,6 +517,10 @@ pub enum CegarError {
 ///
 /// Mutates leaf precisions in place; returns the final root on success
 /// (success implies both loss-free and, when given, abs-met nodes).
+/// `cost` accumulates `Σ(leaf p growth) + COST_GUARD_WEIGHT·(guard growth)`;
+/// `max_cost` caps it (`None` = unbounded): a further refinement step that
+/// would exceed the budget fails with [`CegarError::BudgetExhausted`]
+/// instead. A converged answer is always returned, even at the cap.
 pub fn cegar_evaluate(
     expr: &mut MepkExpr,
     g: i32,
@@ -506,11 +528,23 @@ pub fn cegar_evaluate(
     max_iters: u32,
     guard0: u32,
     abs_tol: Option<i32>,
+    max_cost: Option<u32>,
 ) -> Result<CegarOutcome, CegarError> {
     if delta == 0 {
         return Err(CegarError::UnrefineablePrecision);
     }
     let mut guard = guard0.min(MAX_GUARD);
+    let guard_init = guard;
+    let p0_sum = leaf_p_sum(expr);
+    let current_cost = |expr: &MepkExpr, guard: u32| {
+        leaf_p_sum(expr).saturating_sub(p0_sum).saturating_add(
+            COST_GUARD_WEIGHT.saturating_mul(guard.saturating_sub(guard_init)),
+        )
+    };
+    // No-progress guard for sniped refinement: (target, margin) of the
+    // previous leaf step and whether it was sniped. A sniped step that
+    // leaves the same target unimproved falls back to a both-side bump.
+    let mut last: Option<(usize, i32, bool)> = None;
     for it in 0..=max_iters {
         let (nodes, status) = trace_all(expr, guard);
         match status {
@@ -518,8 +552,11 @@ pub fn cegar_evaluate(
                 if it >= max_iters {
                     return Err(CegarError::MaxIters);
                 }
+                if max_cost.is_some_and(|cap| current_cost(expr, guard) >= cap) {
+                    return Err(CegarError::BudgetExhausted);
+                }
                 // Guard cannot fix domain violations: leaf-bump only.
-                if !refine_leaves(expr, &nodes, delta) {
+                if !refine_step(expr, &nodes, guard, delta, &mut last) {
                     return Err(CegarError::UnrefineableDiv);
                 }
             }
@@ -537,10 +574,14 @@ pub fn cegar_evaluate(
                     None => false,
                 };
                 if !lost && !loose {
-                    return Ok(CegarOutcome { root, iters: it, guard });
+                    let cost = current_cost(expr, guard);
+                    return Ok(CegarOutcome { root, iters: it, guard, cost });
                 }
                 if it >= max_iters {
                     return Err(CegarError::MaxIters);
+                }
+                if max_cost.is_some_and(|cap| current_cost(expr, guard) >= cap) {
+                    return Err(CegarError::BudgetExhausted);
                 }
                 match pick_refine(expr, &nodes, guard) {
                     Pick::Guard => {
@@ -548,9 +589,10 @@ pub fn cegar_evaluate(
                             return Err(CegarError::GuardExhausted);
                         }
                         guard = guard.saturating_add(delta).min(MAX_GUARD);
+                        last = None;
                     }
                     Pick::Leaves => {
-                        if !refine_leaves(expr, &nodes, delta) {
+                        if !refine_step(expr, &nodes, guard, delta, &mut last) {
                             return Err(CegarError::UnrefineablePrecision);
                         }
                     }
@@ -572,20 +614,7 @@ enum Pick {
 /// a division whose `Q` dominates (`Q + 1 > max(D, B)`); `Leaves`
 /// otherwise.
 fn pick_refine(expr: &MepkExpr, nodes: &[(bool, Mepk)], guard: u32) -> Pick {
-    let mut worst: Option<(usize, i32)> = None;
-    let mut bin_idx = 0usize;
-    for (is_bin, v) in nodes {
-        if *is_bin {
-            let margin = v.p as i32 - v.k;
-            match worst {
-                None => worst = Some((bin_idx, margin)),
-                Some((_, m)) if margin < m => worst = Some((bin_idx, margin)),
-                _ => {}
-            }
-            bin_idx += 1;
-        }
-    }
-    let (target, _) = match worst {
+    let (target, _) = match worst_bin(nodes) {
         Some(w) => w,
         None => return Pick::Leaves,
     };
@@ -624,11 +653,8 @@ fn pick_refine(expr: &MepkExpr, nodes: &[(bool, Mepk)], guard: u32) -> Pick {
     }
 }
 
-/// Find the [`Bin`] node with the smallest `p − k` margin in the given
-/// trace and bump all leaves beneath it by `delta`. Returns `false` when
-/// nothing can grow (bare leaf, or every leaf saturated at 127).
-fn refine_leaves(expr: &mut MepkExpr, nodes: &[(bool, Mepk)], delta: u32) -> bool {
-    // Bin nodes in trace order with margins; pick the minimum `p − k`.
+/// Worst-margin [`Bin`] node (trace index, `p − k`) in the given trace.
+fn worst_bin(nodes: &[(bool, Mepk)]) -> Option<(usize, i32)> {
     let mut worst: Option<(usize, i32)> = None;
     let mut bin_idx = 0usize;
     for (is_bin, v) in nodes {
@@ -642,16 +668,99 @@ fn refine_leaves(expr: &mut MepkExpr, nodes: &[(bool, Mepk)], delta: u32) -> boo
             bin_idx += 1;
         }
     }
-    let (target, _) = match worst {
-        Some(w) => w,
-        None => return false, // bare leaf: nothing to refine beneath.
+    worst
+}
+
+/// Sniped refinement side for the `target`-th [`Bin`] node: bump only the
+/// leaves beneath the child that governs the error budget —
+/// - add/sub: the child with the smaller `p` (`p' = min` bottleneck);
+/// - mul/div: the child with the larger `k − p` (dominant `t`/`u` term).
+/// Returns `None` on a tie (or unevaluatable children): fall back to
+/// bumping both sides (§9.1(b) convergence shape).
+fn snipe_side(expr: &MepkExpr, target: usize, guard: u32) -> Option<Step> {
+    let mut counter = 0usize;
+    let mut path = Vec::new();
+    if !find_bin_path(expr, target, &mut counter, &mut path) {
+        return None;
+    }
+    let (op, l, r) = match follow(expr, &path) {
+        MepkExpr::Bin { op, left, right } => (op, left, right),
+        MepkExpr::Leaf { .. } => return None,
     };
+    let (lv, rv) = match (evaluate_traced(l, guard), evaluate_traced(r, guard)) {
+        (Ok(l), Ok(r)) => (l.v, r.v),
+        _ => return None,
+    };
+    match op {
+        MepkOp::Add | MepkOp::Sub => {
+            if lv.p < rv.p {
+                Some(Step::L)
+            } else if rv.p < lv.p {
+                Some(Step::R)
+            } else {
+                None
+            }
+        }
+        MepkOp::Mul => {
+            let a = lv.k - lv.p as i32;
+            let b = rv.k - rv.p as i32;
+            if a > b {
+                Some(Step::L)
+            } else if b > a {
+                Some(Step::R)
+            } else {
+                None
+            }
+        }
+        // Div always refines both sides: the scaled quotient
+        // `qmag = m1_mag << guard / m2_mag` couples both magnitudes through
+        // the fixed guard, so one-sided bumps unbalance the quotient (it can
+        // collapse to a vacuous `m = 0`, e.g. the §9.2 walkthrough converges
+        // to `(0,30,14,2)` instead of `~39961` when only the denominator is
+        // refined). Add/sub/mul use exact integer arithmetic and are immune.
+        MepkOp::Div => None,
+    }
+}
+
+/// Bump `delta` on the `side` child of the `target`-th [`Bin`] node
+/// (`None` = both sides, the §9.1(b) shape). Returns `false` when nothing
+/// can grow (bare leaf, or a bumped leaf saturated at 127).
+fn bump_target(expr: &mut MepkExpr, target: usize, side: Option<Step>, delta: u32) -> bool {
     let mut counter = 0usize;
     let mut path = Vec::new();
     if !find_bin_path(expr, target, &mut counter, &mut path) {
         return false;
     }
-    follow_mut(expr, &path).bump_leaves(delta)
+    match follow_mut(expr, &path) {
+        MepkExpr::Leaf { .. } => false,
+        MepkExpr::Bin { left, right, .. } => match side {
+            None => left.bump_leaves(delta) && right.bump_leaves(delta),
+            Some(Step::L) => left.bump_leaves(delta),
+            Some(Step::R) => right.bump_leaves(delta),
+        },
+    }
+}
+
+/// One leaf-refinement step with sniping and no-progress fallback.
+/// `last` tracks `(target, margin, sniped)` of the previous leaf step: a
+/// sniped step that leaves the same target unimproved degrades to a
+/// both-side bump. Returns `false` when nothing can grow.
+fn refine_step(
+    expr: &mut MepkExpr,
+    nodes: &[(bool, Mepk)],
+    guard: u32,
+    delta: u32,
+    last: &mut Option<(usize, i32, bool)>,
+) -> bool {
+    let (target, margin) = match worst_bin(nodes) {
+        Some(w) => w,
+        None => return false, // bare leaf: nothing to refine beneath.
+    };
+    let stalled = matches!(*last, Some((t, m, true)) if t == target && margin >= m);
+    let side = if stalled { None } else { snipe_side(expr, target, guard) };
+    let ok = bump_target(expr, target, side, delta);
+    *last = Some((target, margin, side.is_some() && ok));
+    ok
 }
 
 #[cfg(test)]
@@ -661,6 +770,8 @@ mod tests {
     fn leaf_i(n: i128, p: u32) -> MepkExpr {
         MepkExpr::leaf(n, 1, p)
     }
+
+
 
     #[test]
     fn leaf_rounding_and_verify() {
@@ -717,7 +828,7 @@ mod tests {
             MepkExpr::bin(MepkOp::Sub, leaf_i(1000, 8), leaf_i(999, 8)),
         );
         let g = 3;
-        let out = cegar_evaluate(&mut e, g, 6, 10, DEFAULT_GUARD, None).expect("must converge");
+        let out = cegar_evaluate(&mut e, g, 6, 10, DEFAULT_GUARD, None, None).expect("must converge");
         assert!(out.iters >= 1, "expected at least one refinement, got {out:?}");
         // The root division is Q-blocked (pre-rounding dominates), so
         // convergence must have raised the guard, not just leaf `p`s.
@@ -755,14 +866,46 @@ mod tests {
         // CEGAR cannot fix a structurally-zero denominator: it must give
         // up (any error), never succeed and never hang.
         let mut e2 = e.clone();
-        assert!(cegar_evaluate(&mut e2, 3, 6, 4, DEFAULT_GUARD, None).is_err());
+        assert!(cegar_evaluate(&mut e2, 3, 6, 4, DEFAULT_GUARD, None, None).is_err());
     }
 
     #[test]
     fn already_precise_needs_no_refinement() {
         let mut e = MepkExpr::bin(MepkOp::Add, leaf_i(1, 8), leaf_i(2, 8));
-        let out = cegar_evaluate(&mut e, 0, 6, 10, DEFAULT_GUARD, None).unwrap();
+        let out = cegar_evaluate(&mut e, 0, 6, 10, DEFAULT_GUARD, None, None).unwrap();
         assert_eq!(out.iters, 0);
+        assert_eq!(out.cost, 0);
+    }
+
+    fn walkthrough_tree() -> MepkExpr {
+        MepkExpr::bin(
+            MepkOp::Div,
+            MepkExpr::bin(
+                MepkOp::Sub,
+                MepkExpr::bin(MepkOp::Mul, leaf_i(355, 8), leaf_i(113, 8)),
+                MepkExpr::bin(MepkOp::Mul, leaf_i(22, 8), leaf_i(7, 8)),
+            ),
+            MepkExpr::bin(MepkOp::Sub, leaf_i(1000, 8), leaf_i(999, 8)),
+        )
+    }
+
+    #[test]
+    fn budget_caps_refinement() {
+        // Zero budget: the walkthrough needs refinement from iter 0.
+        let mut e = walkthrough_tree();
+        assert_eq!(
+            cegar_evaluate(&mut e, 3, 6, 10, DEFAULT_GUARD, None, Some(0)),
+            Err(CegarError::BudgetExhausted)
+        );
+        // Generous budget converges and reports positive cost.
+        let mut e = walkthrough_tree();
+        let out = cegar_evaluate(&mut e, 3, 6, 10, DEFAULT_GUARD, None, Some(100000)).unwrap();
+        assert!(out.cost > 0);
+        // Already-precise trees converge at zero cost even under zero budget
+        // (convergence is checked before the budget gate).
+        let mut e = MepkExpr::bin(MepkOp::Add, leaf_i(1, 8), leaf_i(2, 8));
+        let out = cegar_evaluate(&mut e, 0, 6, 10, DEFAULT_GUARD, None, Some(0)).unwrap();
+        assert_eq!(out.cost, 0);
     }
 
     /// `τ`-blind vacuity without division: `(x−x)` at `x ~ 2^100` gives
@@ -776,7 +919,7 @@ mod tests {
             MepkExpr::leaf(big, 1, 8),
             MepkExpr::leaf(big, 1, 8),
         );
-        let out = cegar_evaluate(&mut e, 3, 6, 10, DEFAULT_GUARD, None).unwrap();
+        let out = cegar_evaluate(&mut e, 3, 6, 10, DEFAULT_GUARD, None, None).unwrap();
         assert_eq!(out.iters, 0);
         assert_eq!(out.root.m, 0);
         let r_exp = out.root.e - out.root.p as i32 + out.root.k;
@@ -794,7 +937,7 @@ mod tests {
             MepkExpr::leaf(big, 1, 8),
             MepkExpr::leaf(big, 1, 8),
         );
-        let out = cegar_evaluate(&mut e, 3, 6, 40, DEFAULT_GUARD, Some(0)).unwrap();
+        let out = cegar_evaluate(&mut e, 3, 6, 40, DEFAULT_GUARD, Some(0), None).unwrap();
         assert!(out.iters > 0);
         let r_exp = out.root.e - out.root.p as i32 + out.root.k;
         assert!(r_exp <= 0, "R still loose: 2^{r_exp}");
@@ -812,7 +955,7 @@ mod tests {
             MepkExpr::leaf(big, 1, 8),
         );
         assert_eq!(
-            cegar_evaluate(&mut e, 3, 6, 40, DEFAULT_GUARD, Some(-200)),
+            cegar_evaluate(&mut e, 3, 6, 40, DEFAULT_GUARD, Some(-200), None),
             Err(CegarError::UnrefineablePrecision)
         );
     }

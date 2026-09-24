@@ -6,10 +6,15 @@
 //! - [`parse_expr`] parses a bare relational expression (`let`..`in` allowed).
 //! - [`eval`] checks a bare formula, or a bare expression lifted with `some`,
 //!   as `run { ... }` (satisfiability check).
-//! - [`query`] lowers an expression reusing a solved `Cnf`'s arena (so
-//!   relation IDs line up with the instance) and evaluates it against that
-//!   instance (Java-Evaluator style).
+//! - [`query`] lowers an expression into a scratch arena sharing the
+//!   instance's relation pool (so relation IDs line up with the instance
+//!   even when `cnf` comes from an independent lowering whose own pool
+//!   assigns different IDs) and evaluates it against that instance
+//!   (Java-Evaluator style). `cnf` still supplies int bounds + bitwidth.
 
+use std::sync::Arc;
+
+use alloy_kodkod_rs::ast::AstArena;
 use alloy_kodkod_rs::instance::Instance;
 use alloy_kodkod_rs::intset::IntSet;
 use alloy_kodkod_rs::tupleset::TupleSet;
@@ -187,7 +192,7 @@ pub fn query_value(
                     .map_err(|_| FrontError::Resolve("cannot build Int tuple set".to_string()))?;
                 return Ok(QueryValue::Set(1, ts));
             }
-            let mut arena = cnf.arena.clone();
+            let mut arena = AstArena::with_pool(Arc::clone(instance.pool()));
             let mut lower = Lowerer::new(module);
             let (eid, arity) = lower.lower_expr_in_scope(scope, &mut arena, &e)?;
             let empty_env = Vec::new();
@@ -229,7 +234,7 @@ fn query_formula(
             ));
         }
     }
-    let mut arena = cnf.arena.clone();
+    let mut arena = AstArena::with_pool(Arc::clone(instance.pool()));
     let mut lower = Lowerer::new(module);
     let fid = lower.lower_formula_in_scope(scope, &mut arena, &f)?;
     let empty_env = Vec::new();
@@ -268,7 +273,7 @@ fn query_int_parsed(
     // Out-of-range literals wrap at evaluation (`Evaluator` truncates
     // constants to the problem bitwidth, matching the solve path and
     // Java's evaluator), so no literal rewriting is needed here.
-    let mut arena = cnf.arena.clone();
+    let mut arena = AstArena::with_pool(Arc::clone(instance.pool()));
     let mut lower = Lowerer::new(module);
     let iid = lower.lower_int_in_scope(scope, &mut arena, ie)?;
     let empty_env = Vec::new();

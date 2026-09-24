@@ -680,7 +680,7 @@ fn sens_command(args: &[&str]) -> Vec<String> {
 //              ( sub lit 1000 lit 999 ) ) g 3
 // ---------------------------------------------------------------------------
 
-pub const CEGAR_USAGE: &str = "usage: :cegar [-v] ( <op> <expr> <expr> ) [g <goal>] [delta <d>] [iters <n>] [guard0 <g0>] [abs <rexp>] [p <maxp>] [n <intcount>]";
+pub const CEGAR_USAGE: &str = "usage: :cegar [-v] ( <op> <expr> <expr> ) [g <goal>] [delta <d>] [iters <n>] [guard0 <g0>] [abs <rexp>] [budget <b>] [p <maxp>] [n <intcount>]";
 
 /// Run a `:cegar` command body (tokens after `:cegar`), returning output lines.
 pub fn run_cegar(args: &[&str]) -> Vec<String> {
@@ -776,6 +776,10 @@ fn cegar_command(args: &[&str]) -> Vec<String> {
         Ok(v) => v.unwrap_or(4),
         Err(e) => return vec![e],
     };
+    let budget = match take_option(&mut rest, "budget") {
+        Ok(v) => v,
+        Err(e) => return vec![e],
+    };
     // `abs` takes a signed radius exponent (`R <= 2^abs`); parsed
     // separately since `take_option` is unsigned-only.
     let abs_tol = match rest.iter().position(|s| s == "abs") {
@@ -810,13 +814,14 @@ fn cegar_command(args: &[&str]) -> Vec<String> {
     }
     // Independent truth readout for the final verdict (may overflow).
     let truth = true_value(&expr);
-    match cegar_evaluate(&mut expr, g, delta, max_iters, guard0, abs_tol) {
+    match cegar_evaluate(&mut expr, g, delta, max_iters, guard0, abs_tol, budget) {
         Ok(out) => {
             let mut lines = vec![format!(
-                "{} iters={} guard={} (goal g={g}{})",
+                "{} iters={} guard={} cost={} (goal g={g}{})",
                 out.root.interval_string(0),
                 out.iters,
                 out.guard,
+                out.cost,
                 match abs_tol {
                     Some(a) => format!(", abs<=2^{a}"),
                     None => String::new(),
@@ -857,6 +862,9 @@ fn cegar_command(args: &[&str]) -> Vec<String> {
                 CegarError::GuardExhausted => {
                     "Q-blocked division needs guard beyond 64".to_string()
                 }
+                CegarError::BudgetExhausted => {
+                    "refinement budget exhausted: raise budget/delta or lower g".to_string()
+                }
             };
             // Show the best-effort current root when the tree still evaluates.
             let mut lines = vec![format!("cegar failed: {why}")];
@@ -887,10 +895,10 @@ mod tests {
         // Every ranked/excluded candidate must denote the same input values
         // as the base operands (regression: naive p+1 halved the centre).
         for args in [
-            vec!["add", "100,6,8,1", "50,5,8,2"],
-            vec!["mul", "100,6,8,1", "50,5,8,2"],
-            vec!["div", "100,6,8,1", "50,5,8,1"],
-            vec!["sub", "10,3,4,2", "9,3,8,0"],
+            vec!["add", "200,5,8,1", "200,3,8,2"],
+            vec!["mul", "200,5,8,1", "200,3,8,2"],
+            vec!["div", "200,5,8,1", "200,3,8,1"],
+            vec!["sub", "10,3,4,2", "144,-1,8,0"],
             vec!["add", "lit", "0.1", "lit", "0.2", "p", "8"],
         ] {
             let r = resolve_operands(&args, SENS_USAGE).unwrap();
@@ -928,7 +936,7 @@ mod tests {
     #[test]
     fn sens_prefers_min_p_side() {
         // p1=4 < p2=8: p1+1 moves p'=min, p2+1 is a no-op.
-        let lines = run_sens(&["add", "10,3,4,1", "50,5,8,1"]);
+        let lines = run_sens(&["add", "10,3,4,1", "200,3,8,1"]);
         assert!(lines.iter().any(|l| l.starts_with("base:")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("dominant error term")), "{lines:?}");
         let top: Vec<&String> = lines.iter().filter(|l| l.starts_with("1")).collect();
@@ -943,7 +951,7 @@ mod tests {
     #[test]
     fn sens_k_floor_and_dominant_term() {
         // k=0 on both sides: k-1 candidates are skipped, not recommended.
-        let lines = run_sens(&["add", "100,6,8,0", "50,5,8,0"]);
+        let lines = run_sens(&["add", "200,5,8,0", "200,3,8,0"]);
         assert!(
             lines.iter().any(|l| l.contains("k1-1: skipped (at floor wellformed k>=0)")),
             "{lines:?}"
@@ -953,7 +961,7 @@ mod tests {
             "{lines:?}"
         );
         // mul names the dominant max branch.
-        let lines = run_sens(&["mul", "100,6,8,1", "50,5,8,2"]);
+        let lines = run_sens(&["mul", "200,5,8,1", "200,3,8,2"]);
         assert!(
             lines.iter().any(|l| l.contains("dominant error term: k2-p2+1 (op2 side)")),
             "{lines:?}"
@@ -963,11 +971,12 @@ mod tests {
 
     #[test]
     fn sens_saturation_and_undef() {
-        // Err-dominated: no single step shrinks R; saturation hint appears.
-        let lines = run_sens(&["add", "100,6,8,1", "50,5,8,2"]);
+        // Err-dominated tie (k1+d1 == k2+d2 == 3): no single step shrinks
+        // R; saturation hint appears.
+        let lines = run_sens(&["add", "200,5,8,1", "200,3,8,3"]);
         assert!(lines.iter().any(|l| l.contains("saturated (err-dominated)")), "{lines:?}");
         // Undefined base: single message, no ranking.
-        let lines = run_sens(&["div", "100,6,8,1", "50,5,4,4"]);
+        let lines = run_sens(&["div", "200,5,8,1", "50,5,4,4"]);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("base is undefined"), "{lines:?}");
         // Usage.
@@ -982,29 +991,29 @@ mod tests {
             lines.iter().any(|l| l.contains("lit: raise cap via `p <maxp>` / `n <n>`")),
             "{lines:?}"
         );
-        let lines = run_sens(&["-v", "add", "10,3,4,1", "50,5,8,1"]);
+        let lines = run_sens(&["-v", "add", "10,3,4,1", "200,3,8,1"]);
         assert!(lines.iter().any(|l| l.starts_with("widths:")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("raw (m=")), "{lines:?}");
     }
 
     #[test]
     fn tuple_parsing() {
-        let x = parse_tuple("100,6,8,1").unwrap();
-        assert_eq!((x.m, x.e, x.p, x.k), (100, 6, 8, 1));
+        let x = parse_tuple("200,5,8,1").unwrap();
+        assert_eq!((x.m, x.e, x.p, x.k), (200, 5, 8, 1));
         assert!(parse_tuple("1,2,0,3").is_none()); // p >= 1
         assert!(parse_tuple("1,2,3").is_none());
     }
 
     #[test]
     fn add_demo_matches() {
-        let lines = run_mepk(&["add", "100,6,8,1", "50,5,8,2"]);
-        assert!(lines.iter().any(|l| l.contains("62.5 ± 2 (tau=4)")), "{lines:?}");
+        let lines = run_mepk(&["add", "200,5,8,1", "200,3,8,2"]);
+        assert!(lines.iter().any(|l| l.contains("62.5 ± 1 (tau=5)")), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("MATCH")), "{lines:?}");
         // Verbose adds widths, raw tuple, full digits, symbolic detail.
-        let lines = run_mepk(&["-v", "add", "100,6,8,1", "50,5,8,2"]);
+        let lines = run_mepk(&["-v", "add", "200,5,8,1", "200,3,8,2"]);
         assert!(lines.iter().any(|l| l.starts_with("widths:")), "{lines:?}");
         assert!(
-            lines.iter().any(|l| l.contains("raw (m=250, e=5, p=8, k=4)")),
+            lines.iter().any(|l| l.contains("raw (m=250, e=5, p=8, k=3)")),
             "{lines:?}"
         );
         assert!(lines.iter().any(|l| l.starts_with("symbolic ")), "{lines:?}");
@@ -1012,7 +1021,7 @@ mod tests {
 
     #[test]
     fn div_guard_demo_matches() {
-        let lines = run_mepk(&["div", "100,6,8,1", "50,5,4,4"]);
+        let lines = run_mepk(&["div", "200,5,8,1", "50,5,4,4"]);
         assert!(lines.iter().any(|l| l.contains("DivisionUndefined")), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("MATCH")), "{lines:?}");
     }
@@ -1042,7 +1051,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("7 ± 0.5 (tau=3)")), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("MATCH")), "{lines:?}");
         // Mixed tuple + lit (carry-tolerant MATCH), and option parsing.
-        let lines = run_mepk(&["add", "100,6,8,1", "lit", "0.5"]);
+        let lines = run_mepk(&["add", "200,5,8,1", "lit", "0.5"]);
         assert!(lines.iter().any(|l| l.starts_with("MATCH")), "{lines:?}");
         let lines = run_mepk(&["add", "lit", "0.1", "lit", "0.2", "p", "8"]);
         assert!(lines.iter().any(|l| l.contains("rounded")), "{lines:?}");
@@ -1104,6 +1113,27 @@ mod tests {
         assert!(lines[0].contains("3996"), "{lines:?}");
         // Q-blocked division forced guard co-refinement (4 -> 10).
         assert!(lines[0].contains("guard=10"), "{lines:?}");
+    }
+
+    #[test]
+    fn cegar_budget_and_cost() {
+        let base = [
+            "(", "div",
+            "(", "sub", "(", "mul", "lit", "355", "lit", "113", ")",
+            "(", "mul", "lit", "22", "lit", "7", ")", ")",
+            "(", "sub", "lit", "1000", "lit", "999", ")", ")",
+            "g", "3", "p", "8",
+        ];
+        // Zero budget refuses the first refinement step.
+        let mut starved: Vec<&str> = base.to_vec();
+        starved.extend(["budget", "0"]);
+        let lines = run_cegar(&starved);
+        assert!(lines[0].starts_with("cegar failed"), "{lines:?}");
+        assert!(lines[0].contains("budget"), "{lines:?}");
+        // Uncapped run reports its cost.
+        let lines = run_cegar(&base);
+        assert!(lines.iter().any(|l| l.contains("cost=")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("verify: holds")), "{lines:?}");
     }
 
     #[test]

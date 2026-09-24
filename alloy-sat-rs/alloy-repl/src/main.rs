@@ -2149,9 +2149,9 @@ fn print_help() {
     println!("  (`R = 1.2`, `erealAdd[a, 2.5, c]`); needs a decimal point (`1e3` is not a real);");
     println!("  interval comparisons over [c-R, c+R]: `erealExactEq`, `erealMayEq`,");
     println!("  `erealCovers`, `erealLT`, `erealLTE`, `erealMayLTE`;");
-    println!("  `EReal` is non-abstract (like `Int`): extenders are proper subsets,");
-    println!("  direct atoms allowed; lane widths come from `for N Int` (+MEPK_*_WIDTH);");
-    println!("  `for N EReal` scopes atoms.");
+    println!("  `EReal` is abstract: extenders partition it (like any Alloy parent);");
+    println!("  decimal literals are constants needing no atoms (`for 0 EReal` still works);");
+    println!("  lane widths come from `for N Int` (+MEPK_*_WIDTH); `for N EReal` scopes atoms.");
 }
 
 /// Resolve an explicit `:psave` relation argument: exact pool name first,

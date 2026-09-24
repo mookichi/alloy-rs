@@ -184,22 +184,26 @@ fn exact_proto_matches_oracle_grid() {
     let p_new = 8u32;
     // (m1, e1, m2, e2, sign): ties, carry-out renormalize, zero-fill,
     // cancellation to zero, negatives, mixed magnitudes.
+    // Valid-normalized (p = 8: |m| in [128, 256) or 0): each mantissa is
+    // scaled into range with `e` unchanged, so `lsb` gaps (hence the
+    // doubled-`m` barrel shifts) match the original denormalized shapes
+    // (ties, carry-out, zero-fill, cancellation, negatives, magnitudes).
     let cases: &[(i64, i64, i64, i64, i8)] = &[
-        (100, 6, 50, 5, 1),
-        (100, 6, 50, 5, -1),
-        (15, 0, 1, 0, 1),
-        (100, 6, 1, -1, 1),
-        (4, 2, 4, 2, -1), // exact cancellation to zero
-        (0, 3, 50, 5, 1), // zero addend
-        (-100, 6, 50, 5, 1),
-        (-100, 6, 50, 5, -1),
-        (127, 6, 63, 5, 1),
-        (1, 0, 1, 0, 1),
-        (1, 0, -1, 0, 1), // cancellation of ones
-        (3, 0, 5, 0, 1),
-        (7, 2, 7, 2, 1),
-        (96, 3, 32, 2, -1),
-        (-7, 2, -7, 2, -1),
+        (200, 6, 200, 5, 1),
+        (200, 6, 200, 5, -1),
+        (240, 0, 128, 0, 1),
+        (200, 6, 128, -1, 1),
+        (128, 2, 128, 2, -1), // exact cancellation to zero
+        (0, 3, 200, 5, 1), // zero addend
+        (-200, 6, 200, 5, 1),
+        (-200, 6, 200, 5, -1),
+        (254, 6, 252, 5, 1),
+        (128, 0, 128, 0, 1),
+        (128, 0, -128, 0, 1), // cancellation of ones
+        (192, 0, 160, 0, 1),
+        (224, 2, 224, 2, 1),
+        (192, 3, 128, 2, -1),
+        (-224, 2, -224, 2, -1),
     ];
     for &(m1, e1, m2, e2, sign) in cases {
         let x1 = Mepk::new(m1 as i128, e1 as i32, 8, 1).unwrap();
@@ -229,8 +233,23 @@ fn exact_proto_matches_oracle_fuzz() {
         s
     };
     for _ in 0..300 {
-        let m1 = (next() % 201) as i64 - 100;
-        let m2 = (next() % 201) as i64 - 100;
+        // Valid-normalized mantissae (p = 8): |m| in [128, 256), occasional zero.
+        let mag1 = 128 + (next() % 128) as i64;
+        let mag2 = 128 + (next() % 128) as i64;
+        let m1 = if next() % 16 == 0 {
+            0
+        } else if next() & 1 == 1 {
+            -mag1
+        } else {
+            mag1
+        };
+        let m2 = if next() % 16 == 0 {
+            0
+        } else if next() & 1 == 1 {
+            -mag2
+        } else {
+            mag2
+        };
         let e1 = (next() % 9) as i64 - 2;
         let e2 = (next() % 9) as i64 - 2;
         let sign = if next() & 1 == 1 { 1 } else { -1 };

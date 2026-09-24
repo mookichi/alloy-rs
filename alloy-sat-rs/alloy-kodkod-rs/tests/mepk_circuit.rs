@@ -203,9 +203,10 @@ fn check_add(x1: Mepk, x2: Mepk, sign: i8, w: &MepkWidths) {
 #[test]
 fn symbolic_add_matches_concrete() {
     let w = MepkWidths::uniform(10);
-    // MepkOpsTest.addSubKRule values.
-    let x1 = Mepk::new(100, 6, 8, 1).unwrap();
-    let x2 = Mepk::new(50, 5, 8, 2).unwrap();
+    // Valid-normalized MepkOpsTest.addSubKRule shape
+    // (centres 50 and 12.5, as the denormalized (100,6,8,1)/(50,5,8,2)).
+    let x1 = Mepk::new(200, 5, 8, 1).unwrap();
+    let x2 = Mepk::new(200, 3, 8, 2).unwrap();
     check_add(x1, x2, 1, &w);
     check_add(x1, x2, -1, &w);
     // Cancellation to zero: T = 0 -> e' = ell + p' - 1.
@@ -213,11 +214,11 @@ fn symbolic_add_matches_concrete() {
     let z2 = Mepk::new(4, 2, 3, 1).unwrap();
     check_add(z1, z2, -1, &w);
     // Mixed precisions.
-    let m1 = Mepk::new(127, 6, 8, 1).unwrap();
-    let m2 = Mepk::new(63, 5, 7, 2).unwrap();
+    let m1 = Mepk::new(254, 5, 8, 1).unwrap();
+    let m2 = Mepk::new(126, 4, 7, 2).unwrap();
     check_add(m1, m2, 1, &w);
     // Negative operands.
-    let n1 = Mepk::new(-100, 6, 8, 1).unwrap();
+    let n1 = Mepk::new(-200, 5, 8, 1).unwrap();
     check_add(n1, x2, 1, &w);
     check_add(n1, x2, -1, &w);
 }
@@ -226,10 +227,10 @@ fn symbolic_add_matches_concrete() {
 fn symbolic_mul_matches_concrete() {
     let w = MepkWidths::uniform(10);
     let cases = [
-        (Mepk::new(127, 6, 8, 1).unwrap(), Mepk::new(63, 5, 7, 2).unwrap()),
-        (Mepk::new(100, 6, 8, 1).unwrap(), Mepk::new(50, 5, 8, 2).unwrap()),
-        (Mepk::new(-6, 2, 4, 0).unwrap(), Mepk::new(7, 2, 4, 1).unwrap()),
-        (Mepk::new(1, 0, 3, 0).unwrap(), Mepk::new(1, 0, 3, 0).unwrap()),
+        (Mepk::new(254, 5, 8, 1).unwrap(), Mepk::new(126, 4, 7, 2).unwrap()),
+        (Mepk::new(200, 5, 8, 1).unwrap(), Mepk::new(200, 3, 8, 2).unwrap()),
+        (Mepk::new(-12, 1, 4, 0).unwrap(), Mepk::new(14, 1, 4, 1).unwrap()),
+        (Mepk::new(4, -2, 3, 0).unwrap(), Mepk::new(4, -2, 3, 0).unwrap()),
     ];
     for (x1, x2) in cases {
         let ctx = BoolCtx::new();
@@ -246,8 +247,8 @@ fn symbolic_mul_matches_concrete() {
 #[test]
 fn symbolic_div_matches_concrete_and_guards() {
     let w = MepkWidths::uniform(12).with_guard(4);
-    let num = Mepk::new(100, 6, 8, 1).unwrap();
-    let den = Mepk::new(50, 5, 8, 1).unwrap();
+    let num = Mepk::new(200, 5, 8, 1).unwrap();
+    let den = Mepk::new(200, 3, 8, 1).unwrap();
     let ctx = BoolCtx::new();
     let a = mepk_const(num.m as i64, num.e as i64, num.p as i64, num.k as i64, &w, &ctx);
     let b = mepk_const(den.m as i64, den.e as i64, den.p as i64, den.k as i64, &w, &ctx);
@@ -272,7 +273,7 @@ fn symbolic_div_zero_centre_is_undef() {
     // rev2 §9.1(a): exact cancellation `m2 == 0` is out of domain even
     // when `k2 < p2` holds (infinite relative error).
     let w = MepkWidths::uniform(12).with_guard(4);
-    let num = Mepk::new(100, 6, 8, 1).unwrap();
+    let num = Mepk::new(200, 5, 8, 1).unwrap();
     let zero_den = Mepk::new(0, 7, 8, 1).unwrap();
     assert!(zero_den.k < zero_den.p as i32);
     assert!(mepk_div(&num, &zero_den, 4).is_none());
@@ -298,9 +299,9 @@ fn symbolic_div_zero_centre_is_undef() {
 #[test]
 fn symbolic_carry_within_contract() {
     let w = MepkWidths::uniform(10);
-    // T = 101 at p' = 1 rounds 1 -> 2 -> renormalize: oracle e = 6,
-    // symbolic E0 = -1 + bitlen(101) - 1 = 5.
-    let x1 = Mepk::new(100, 6, 8, 1).unwrap();
+    // T = 202 at p' = 1 rounds 1 -> 2 -> renormalize: oracle e = 6,
+    // symbolic E0 = -2 + bitlen(202) - 1 = 5.
+    let x1 = Mepk::new(200, 5, 8, 1).unwrap();
     let x2 = Mepk::new(1, -1, 1, 0).unwrap();
     let ctx = BoolCtx::new();
     let a = mepk_const(x1.m as i64, x1.e as i64, x1.p as i64, x1.k as i64, &w, &ctx);

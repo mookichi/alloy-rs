@@ -8,7 +8,7 @@ use alloy_kodkod_rs::ast::{
     self as kk, CastToIntOp, ExprCompOp, ExprId, FormulaId, IntId, Multiplicity, Quantifier,
 };
 use alloy_kodkod_rs::bounds::Bounds;
-use alloy_kodkod_rs::mepk::decimal_to_mepk;
+use alloy_kodkod_rs::mepk::{decimal_to_mepk, Mepk};
 use alloy_kodkod_rs::opt::OptSense;
 use alloy_kodkod_rs::relation::{RelationId, RelationPool};
 use std::collections::HashMap;
@@ -270,35 +270,34 @@ impl<'m> Lowerer<'m> {
                             }
                         }
                         // coverage: parent in union(kids).
-                        // The builtin `EReal` is exempt: it is a
-                        // non-abstract value sort (like `Int`), so it may
-                        // hold direct atoms outside its extenders. Without
-                        // this, `one sig R extends EReal` plus a scope
-                        // would collapse `EReal` onto the extenders and
-                        // leave no room for literal witnesses or free
-                        // values (`for N EReal` would be silently
-                        // ignored). Abstract parents keep coverage (Java
-                        // parity); subset/disjoint apply everywhere.
-                        if p != "EReal" {
-                            let mut union = {
-                                let first = rel_of(ctx, &kids[0])?;
-                                arena.expr_relation(first)
-                            };
-                            for k in &kids[1..] {
-                                let ke = arena.expr_relation(rel_of(ctx, k)?);
-                                union = arena
-                                    .binary_expr(kk::BinaryOp::Union, union, ke)
-                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            }
-                            let pe2 = arena.expr_relation(pe);
-                            let diff = arena
-                                .binary_expr(kk::BinaryOp::Difference, pe2, union)
+                        // The builtin `EReal` is abstract like any other
+                        // parent: with extenders present it is covered by
+                        // them, so `one sig R extends EReal` collapses
+                        // `EReal` onto `R`. This is sound now that decimal
+                        // literals are `ERealConstant` tuples needing no
+                        // witness atoms (previously the exemption kept room
+                        // for hoisted `$elit` witnesses). Parents without
+                        // kids never reach this loop, so free `EReal` values
+                        // (`some a: EReal`, `for N EReal`) keep working.
+                        // Subset/disjoint apply everywhere (Java parity).
+                        let mut union = {
+                            let first = rel_of(ctx, &kids[0])?;
+                            arena.expr_relation(first)
+                        };
+                        for k in &kids[1..] {
+                            let ke = arena.expr_relation(rel_of(ctx, k)?);
+                            union = arena
+                                .binary_expr(kk::BinaryOp::Union, union, ke)
                                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            let some_diff = arena
-                                .multiplicity_formula(Multiplicity::Some, diff)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            parts.push(arena.not(some_diff));
                         }
+                        let pe2 = arena.expr_relation(pe);
+                        let diff = arena
+                            .binary_expr(kk::BinaryOp::Difference, pe2, union)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        let some_diff = arena
+                            .multiplicity_formula(Multiplicity::Some, diff)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        parts.push(arena.not(some_diff));
                     }
                     // Sig multiplicities on the shared EReal population are
                     // cardinality formulas (Java `BoundsComputer`: `one` /
@@ -1343,26 +1342,10 @@ impl<'a> Ctx<'a> {
         args: &[Expr],
         env: &mut Env,
     ) -> LResult<Option<FormulaId>> {
-        // Decimal literals in EReal value positions (`erealAdd[a, 2.5, c]`):
-        // hoist each literal to a fresh witness pinned by `setEReal`.
+        // Decimal literals in EReal value positions (`erealAdd[a, 2.5, c]`)
+        // resolve to `ERealConstant` tuples inline (no witness atoms).
         // `erealNeedsRefine` takes an integer goal second, so only its
-        // first arg hoists; `setEReal` keeps its literal second arg.
-        let hoist: &[usize] = match name {
-            "erealAdd" | "erealSub" | "erealMul" | "erealDiv" => &[0, 1, 2],
-            "erealExactEq" | "erealMayEq" | "erealCovers" | "erealLT" | "erealLTE"
-            | "erealMayLTE" => &[0, 1],
-            "erealWellformed" | "erealDivGuard" => &[0],
-            "erealNeedsRefine" => &[0],
-            _ => &[],
-        };
-        if !hoist.is_empty()
-            && hoist
-                .iter()
-                .any(|&i| i < args.len() && matches!(args[i], Expr::RealLit(..)))
-        {
-            let wrapped = self.wrap_ereal_lit_args(name, args, hoist)?;
-            return Ok(Some(self.lower_formula(arena, &wrapped, env)?));
-        }
+        // first arg is an operand; `setEReal` keeps its literal second arg.
         let body = match name {
             "erealAdd" | "erealSub" => {
                 if args.len() != 3 {
@@ -1371,7 +1354,7 @@ impl<'a> Ctx<'a> {
                 let wv = self.ereal_shift_width()?;
                 let mw = self.res.mepk_widths.m_width;
                 let sign = if name == "erealAdd" { 1 } else { -1 };
-                ereal_add_sub(&args[0], &args[1], &args[2], sign, wv, mw)
+                ereal_add_sub(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, &self.ereal_op(&args[2])?, sign, wv, mw)
             }
             "erealMul" => {
                 if args.len() != 3 {
@@ -1379,7 +1362,7 @@ impl<'a> Ctx<'a> {
                 }
                 let wv = self.ereal_shift_width_mul()?;
                 let mw = self.res.mepk_widths.m_width;
-                ereal_mul(&args[0], &args[1], &args[2], wv, mw)
+                ereal_mul(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, &self.ereal_op(&args[2])?, wv, mw)
             }
             "erealDiv" => {
                 if args.len() != 3 {
@@ -1387,31 +1370,39 @@ impl<'a> Ctx<'a> {
                 }
                 let wv = self.ereal_shift_width_mul()?;
                 let w = &self.res.mepk_widths;
-                ereal_div(&args[0], &args[1], &args[2], wv, w.m_width, w.guard)
+                ereal_div(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, &self.ereal_op(&args[2])?, wv, w.m_width, w.guard)
             }
             "erealWellformed" => {
                 if args.len() != 1 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
                 }
-                ereal_wellformed(&args[0])
+                ereal_wellformed(&self.ereal_op(&args[0])?)
+            }
+            "erealValid" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
+                }
+                let wv = self.ereal_shift_width()?;
+                let mw = self.res.mepk_widths.m_width;
+                ereal_valid_strict(&self.ereal_op(&args[0])?, wv, mw)
             }
             "erealDivGuard" => {
                 if args.len() != 1 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
                 }
-                ereal_div_guard(&args[0])
+                ereal_div_guard(&self.ereal_op(&args[0])?)
             }
             "erealNeedsRefine" => {
                 if args.len() != 2 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
                 }
-                ereal_needs_refine(&args[0], &args[1])
+                ereal_needs_refine(&self.ereal_op(&args[0])?, &args[1])
             }
             "erealExactEq" => {
                 if args.len() != 2 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
                 }
-                ereal_exact_eq(&args[0], &args[1])
+                ereal_exact_eq(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?)
             }
             "erealMayEq" | "erealCovers" | "erealLT" | "erealLTE" | "erealMayLTE" => {
                 if args.len() != 2 {
@@ -1419,11 +1410,11 @@ impl<'a> Ctx<'a> {
                 }
                 let wv = self.ereal_shift_width()?;
                 match name {
-                    "erealMayEq" => ereal_may_eq(&args[0], &args[1], wv),
-                    "erealCovers" => ereal_covers(&args[0], &args[1], wv),
-                    "erealLT" => ereal_lt(&args[0], &args[1], wv),
-                    "erealLTE" => ereal_lte(&args[0], &args[1], wv),
-                    _ => ereal_may_lte(&args[0], &args[1], wv),
+                    "erealMayEq" => ereal_may_eq(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, wv),
+                    "erealCovers" => ereal_covers(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, wv),
+                    "erealLT" => ereal_lt(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, wv),
+                    "erealLTE" => ereal_lte(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, wv),
+                    _ => ereal_may_lte(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, wv),
                 }
             }
             "setEReal" => {
@@ -1443,6 +1434,24 @@ impl<'a> Ctx<'a> {
     /// same default as `:mepk lit`).
     fn ereal_max_p(&self) -> u32 {
         self.res.mepk_widths.m_width.saturating_sub(1).max(1)
+    }
+
+    /// Resolve an `EReal` operand: decimal literals become `ERealConstant`
+    /// tuples (Kodkod `IntConstant` analogue: fixed lanes, no witness atom,
+    /// no scope consumed); anything else stays an atom reference.
+    /// Out-of-range literals fail loudly, as in `setEReal`.
+    fn ereal_op<'e>(&self, e: &'e Expr) -> LResult<ERealOp<'e>> {
+        match e {
+            Expr::RealLit(s, _) => {
+                let conv = decimal_to_mepk(s, self.ereal_max_p()).ok_or_else(|| {
+                    FrontError::Resolve(format!(
+                        "cannot convert {s:?} (malformed or outside the i128 oracle range)"
+                    ))
+                })?;
+                Ok(ERealOp::Const(conv.v))
+            }
+            _ => Ok(ERealOp::Ref(e)),
+        }
     }
 
     /// Static barrel width for scaled interval comparisons:
@@ -1504,69 +1513,6 @@ impl<'a> Ctx<'a> {
         let lo = (e_lo - p_hi + 1).min(e_lo - p_hi + k_lo);
         let hi = (e_hi - p_lo + 1).max(e_hi - p_lo + k_hi);
         (hi - lo).max(0) as u64
-    }
-
-    /// Mint a collision-free witness name (`$` is banned in user bindings).
-    fn fresh_elit(&self) -> String {
-        let n = self.pin_seq.get();
-        self.pin_seq.set(n + 1);
-        format!("$elit{n}")
-    }
-
-    /// Rewrite `pred[.., lit, ..]` to
-    /// `some $elitN: EReal | setEReal[$elitN, lit] and ... and pred[..]`
-    /// for each literal at a hoistable position. The re-emitted call goes
-    /// back through lowering (one level; the inner call holds no literals
-    /// and terminates in the predicate desugar below).
-    fn wrap_ereal_lit_args(
-        &self,
-        name: &str,
-        args: &[Expr],
-        hoist: &[usize],
-    ) -> LResult<Formula> {
-        let mut conj: Option<Formula> = None;
-        let mut new_args = args.to_vec();
-        // Minted witnesses, in first-seen order (flat single decl works
-        // since every minted name is unique).
-        let mut names: Vec<String> = Vec::new();
-        for &i in hoist {
-            if i >= new_args.len() {
-                continue;
-            }
-            if let Expr::RealLit(s, _) = &new_args[i] {
-                let fresh = self.fresh_elit();
-                let target = Expr::Name(fresh.clone(), 0);
-                let lit = Expr::RealLit(s.clone(), 0);
-                // Out-of-range literals fail loudly here, as in `setEReal`.
-                let set = ereal_set(&target, &lit, self.ereal_max_p())?;
-                conj = Some(match conj {
-                    Some(c) => Formula::And(Box::new(c), Box::new(set)),
-                    None => set,
-                });
-                new_args[i] = target;
-                names.push(fresh);
-            }
-        }
-        // Arity errors (if any) surface when the inner call lowers.
-        let inner = Formula::Call(name.to_string(), new_args, 0);
-        let body = match conj {
-            Some(c) => Formula::And(Box::new(c), Box::new(inner)),
-            None => inner,
-        };
-        if names.is_empty() {
-            return Ok(body);
-        }
-        Ok(Formula::Quant(
-            QuantKind::Some,
-            vec![Decl {
-                disj: false,
-                names,
-                expr: Expr::Name("EReal".to_string(), 0),
-                pos: 0,
-                is_var: false,
-            }],
-            Box::new(body),
-        ))
     }
 
     fn try_ordering_pred(
@@ -2511,7 +2457,7 @@ impl<'a> Ctx<'a> {
             }
             Expr::RealLit(..) => {
                 return Err(FrontError::Resolve(
-                    "decimal literals are only valid in EReal value positions (`=`, `!=`, `setEReal`, `erealAdd`/`erealSub`/`erealMul`/`erealDiv`/`erealExactEq`/`erealMayEq`/`erealCovers`/`erealLT`/`erealLTE`/`erealMayLTE`/`erealWellformed`/`erealDivGuard`)".to_string(),
+                    "decimal literals are only valid in EReal value positions (`=`, `!=`, `setEReal`, `erealAdd`/`erealSub`/`erealMul`/`erealDiv`/`erealExactEq`/`erealMayEq`/`erealCovers`/`erealLT`/`erealLTE`/`erealMayLTE`/`erealWellformed`/`erealDivGuard`/`erealValid`)".to_string(),
                 ));
             }
             Expr::Name(n, pos) => {
@@ -4192,6 +4138,34 @@ fn ereal_lit(v: i64) -> IntExpr {
     IntExpr::Lit(v, 0)
 }
 
+/// An `EReal` operand: either an atom-valued expression (lane joins) or a
+/// constant tuple (`ERealConstant`, the Kodkod `IntConstant` analogue: fixed
+/// `(m, e, p, k)` lanes, no universe atom, no scope consumed).
+#[derive(Clone, Copy)]
+enum ERealOp<'e> {
+    Ref(&'e Expr),
+    Const(Mepk),
+}
+
+/// Lane read through an operand: joins for atoms, literals for constants.
+/// Constant lanes always fit `i64` (converted at `ereal_max_p <= m_width-1`,
+/// same bound as `ereal_set` relies on).
+fn ereal_lane_of(op: &ERealOp, lane: &str) -> IntExpr {
+    match op {
+        ERealOp::Ref(e) => ereal_lane(e, lane),
+        ERealOp::Const(v) => {
+            let n = match lane {
+                "m" => v.m as i64,
+                "e" => v.e as i64,
+                "p" => v.p as i64,
+                "k" => v.k as i64,
+                _ => unreachable!("unknown EReal lane {lane}"),
+            };
+            ereal_lit(n)
+        }
+    }
+}
+
 fn ereal_sub(a: IntExpr, b: IntExpr) -> IntExpr {
     IntExpr::Bin(IntBinOp::Sub, Box::new(a), Box::new(b))
 }
@@ -4224,27 +4198,27 @@ fn ereal_min_eq(r: &IntExpr, x: &IntExpr, y: &IntExpr) -> Formula {
     ])
 }
 
-fn ereal_wellformed(x: &Expr) -> Formula {
+fn ereal_wellformed(x: &ERealOp) -> Formula {
     ereal_and_all(vec![
-        ereal_icmp(IntCmpOp::Gt, ereal_lane(x, "p"), ereal_lit(0)),
-        ereal_icmp(IntCmpOp::Gte, ereal_lane(x, "k"), ereal_lit(0)),
+        ereal_icmp(IntCmpOp::Gt, ereal_lane_of(x, "p"), ereal_lit(0)),
+        ereal_icmp(IntCmpOp::Gte, ereal_lane_of(x, "k"), ereal_lit(0)),
     ])
 }
 
-fn ereal_div_guard(d: &Expr) -> Formula {
-    ereal_icmp(IntCmpOp::Lt, ereal_lane(d, "k"), ereal_lane(d, "p"))
+fn ereal_div_guard(d: &ERealOp) -> Formula {
+    ereal_icmp(IntCmpOp::Lt, ereal_lane_of(d, "k"), ereal_lane_of(d, "p"))
 }
 
 /// Value identity: all four lanes agree (plus wellformedness, like the
 /// arithmetic predicates). `extends` siblings are disjoint as *sets*,
 /// so this is the usable equality for EReal values.
-fn ereal_exact_eq(a: &Expr, b: &Expr) -> Formula {
+fn ereal_exact_eq(a: &ERealOp, b: &ERealOp) -> Formula {
     let mut parts = vec![ereal_wellformed(a), ereal_wellformed(b)];
     for lane in ["m", "e", "p", "k"] {
         parts.push(ereal_icmp(
             IntCmpOp::Eq,
-            ereal_lane(a, lane),
-            ereal_lane(b, lane),
+            ereal_lane_of(a, lane),
+            ereal_lane_of(b, lane),
         ));
     }
     ereal_and_all(parts)
@@ -4261,28 +4235,28 @@ fn ereal_exact_eq(a: &Expr, b: &Expr) -> Formula {
 // already spans the problem bitwidth), hence the widening layer.
 
 /// `lsb(x) = e - p + 1`, exact widening arithmetic.
-fn ereal_lsb_wide(x: &Expr) -> IntExpr {
+fn ereal_lsb_wide(x: &ERealOp) -> IntExpr {
     IntExpr::Widen(
         WidenOp::Add,
         Box::new(IntExpr::Widen(
             WidenOp::Sub,
-            Box::new(ereal_lane(x, "e")),
-            Box::new(ereal_lane(x, "p")),
+            Box::new(ereal_lane_of(x, "e")),
+            Box::new(ereal_lane_of(x, "p")),
         )),
         Box::new(IntExpr::Lit(1, 0)),
     )
 }
 
 /// `r(x) = e - p + k`: exponent of the error radius (`R = 2^r`).
-fn ereal_r_exp(x: &Expr) -> IntExpr {
+fn ereal_r_exp(x: &ERealOp) -> IntExpr {
     IntExpr::Widen(
         WidenOp::Add,
         Box::new(IntExpr::Widen(
             WidenOp::Sub,
-            Box::new(ereal_lane(x, "e")),
-            Box::new(ereal_lane(x, "p")),
+            Box::new(ereal_lane_of(x, "e")),
+            Box::new(ereal_lane_of(x, "p")),
         )),
-        Box::new(ereal_lane(x, "k")),
+        Box::new(ereal_lane_of(x, "k")),
     )
 }
 
@@ -4310,7 +4284,7 @@ fn ereal_min(a: IntExpr, b: IntExpr) -> IntExpr {
 /// One scaled interval-edge comparison:
 /// `mA*2^lsbA + s1*2^rA  OP  mB*2^lsbB + s2*2^rB`
 /// with `s1, s2 ∈ {+1 (hi edge), -1 (lo edge)}` and `OP ∈ {Lt, Lte}`.
-fn ereal_scaled_cmp(a: &Expr, b: &Expr, s1: i64, s2: i64, op: IntCmpOp, wv: u32) -> Formula {
+fn ereal_scaled_cmp(a: &ERealOp, b: &ERealOp, s1: i64, s2: i64, op: IntCmpOp, wv: u32) -> Formula {
     let lsb_a = ereal_lsb_wide(a);
     let r_a = ereal_r_exp(a);
     let lsb_b = ereal_lsb_wide(b);
@@ -4328,14 +4302,14 @@ fn ereal_scaled_cmp(a: &Expr, b: &Expr, s1: i64, s2: i64, op: IntCmpOp, wv: u32)
             ereal_wsub(c, rad)
         }
     };
-    let lhs = edge(ereal_lane(a, "m"), lsb_a, r_a, s1);
-    let rhs = edge(ereal_lane(b, "m"), lsb_b, r_b, s2);
+    let lhs = edge(ereal_lane_of(a, "m"), lsb_a, r_a, s1);
+    let rhs = edge(ereal_lane_of(b, "m"), lsb_b, r_b, s2);
     Formula::IntCmp(op, lhs, rhs, 0)
 }
 
 /// Closed-interval overlap: `loA<=hiB and loB<=hiA` (endpoint contact
 /// counts).
-fn ereal_may_eq(a: &Expr, b: &Expr, wv: u32) -> Formula {
+fn ereal_may_eq(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
     ereal_and_all(vec![
         ereal_wellformed(a),
         ereal_wellformed(b),
@@ -4345,7 +4319,7 @@ fn ereal_may_eq(a: &Expr, b: &Expr, wv: u32) -> Formula {
 }
 
 /// Containment (A covers B, equal intervals count): `loA<=loB and hiB<=hiA`.
-fn ereal_covers(a: &Expr, b: &Expr, wv: u32) -> Formula {
+fn ereal_covers(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
     ereal_and_all(vec![
         ereal_wellformed(a),
         ereal_wellformed(b),
@@ -4355,7 +4329,7 @@ fn ereal_covers(a: &Expr, b: &Expr, wv: u32) -> Formula {
 }
 
 /// Strictly below: `hiA < loB`.
-fn ereal_lt(a: &Expr, b: &Expr, wv: u32) -> Formula {
+fn ereal_lt(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
     ereal_and_all(vec![
         ereal_wellformed(a),
         ereal_wellformed(b),
@@ -4364,7 +4338,7 @@ fn ereal_lt(a: &Expr, b: &Expr, wv: u32) -> Formula {
 }
 
 /// Below or touching: `hiA <= loB`.
-fn ereal_lte(a: &Expr, b: &Expr, wv: u32) -> Formula {
+fn ereal_lte(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
     ereal_and_all(vec![
         ereal_wellformed(a),
         ereal_wellformed(b),
@@ -4373,7 +4347,7 @@ fn ereal_lte(a: &Expr, b: &Expr, wv: u32) -> Formula {
 }
 
 /// A's upper end lies in B's range: `loB<=hiA<=hiB`.
-fn ereal_may_lte(a: &Expr, b: &Expr, wv: u32) -> Formula {
+fn ereal_may_lte(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
     ereal_and_all(vec![
         ereal_wellformed(a),
         ereal_wellformed(b),
@@ -4382,7 +4356,7 @@ fn ereal_may_lte(a: &Expr, b: &Expr, wv: u32) -> Formula {
     ])
 }
 
-fn ereal_needs_refine(x: &Expr, g: &Expr) -> Formula {
+fn ereal_needs_refine(x: &ERealOp, g: &Expr) -> Formula {
     // precisionLost (k >= p or tau = p-k-g <= 0) or a violated div guard.
     // The goal `g` must be an integer literal (Call args are `Expr`s;
     // threading a general IntExpr is out of scope for v1).
@@ -4391,14 +4365,14 @@ fn ereal_needs_refine(x: &Expr, g: &Expr) -> Formula {
         _ => 0,
     };
     let tau = ereal_sub(
-        ereal_sub(ereal_lane(x, "p"), ereal_lane(x, "k")),
+        ereal_sub(ereal_lane_of(x, "p"), ereal_lane_of(x, "k")),
         ereal_lit(glit),
     );
     ereal_or_all(vec![
         ereal_icmp(
             IntCmpOp::Gte,
-            ereal_lane(x, "k"),
-            ereal_lane(x, "p"),
+            ereal_lane_of(x, "k"),
+            ereal_lane_of(x, "p"),
         ),
         ereal_icmp(IntCmpOp::Lte, tau, ereal_lit(0)),
         Formula::Not(Box::new(ereal_div_guard(x))),
@@ -4413,10 +4387,10 @@ fn ereal_needs_refine(x: &Expr, g: &Expr) -> Formula {
 /// The `k'` path is end-to-end widening-exact (P2-2): `lsb`, `A`, and `B`
 /// never wrap at the problem bitwidth (a wrapped `ell` would pick the
 /// wrong alignment case and silently shrink `k'`).
-fn ereal_add_sub(a: &Expr, b: &Expr, r: &Expr, sign: i8, wv: u32, m_width: u32) -> Formula {
-    let (pa, ka) = (ereal_lane(a, "p"), ereal_lane(a, "k"));
-    let (pb, kb) = (ereal_lane(b, "p"), ereal_lane(b, "k"));
-    let (er, pr, kr) = (ereal_lane(r, "e"), ereal_lane(r, "p"), ereal_lane(r, "k"));
+fn ereal_add_sub(a: &ERealOp, b: &ERealOp, r: &ERealOp, sign: i8, wv: u32, m_width: u32) -> Formula {
+    let (pa, ka) = (ereal_lane_of(a, "p"), ereal_lane_of(a, "k"));
+    let (pb, kb) = (ereal_lane_of(b, "p"), ereal_lane_of(b, "k"));
+    let (er, pr, kr) = (ereal_lane_of(r, "e"), ereal_lane_of(r, "p"), ereal_lane_of(r, "k"));
     let la1 = ereal_lsb_wide(a);
     let la2 = ereal_lsb_wide(b);
     let b_exp = ereal_wsub(er, pr.clone());
@@ -4444,13 +4418,12 @@ fn ereal_add_sub(a: &Expr, b: &Expr, r: &Expr, sign: i8, wv: u32, m_width: u32) 
         ),
     ]);
     ereal_and_all(vec![
-        ereal_wellformed(a),
-        ereal_wellformed(b),
-        ereal_wellformed(r),
+        ereal_valid_core(a, wv, m_width),
+        ereal_valid_core(b, wv, m_width),
+        ereal_valid_core(r, wv, m_width),
         ereal_min_eq(&pr, &pa, &pb),
         ereal_or_all(vec![case1, case2]),
         ereal_add_window(a, b, r, sign, wv),
-        ereal_result_normalized(r, wv, m_width),
     ])
 }
 
@@ -4496,27 +4469,27 @@ fn ereal_wneg(a: IntExpr) -> IntExpr {
 /// every scaled interval still contains the true value whatever `e_r`
 /// the solver picks (`hi ≥ exact`, `lo ≤ exact`, since `R' ≥ 2·2^B`).
 /// Exact-centre rounding (`m_r = round(T)`) is a future tightening.
-fn ereal_add_window(a: &Expr, b: &Expr, r: &Expr, sign: i8, wv: u32) -> Formula {
+fn ereal_add_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, sign: i8, wv: u32) -> Formula {
     let lsb_a = ereal_lsb_wide(a);
     let lsb_b = ereal_lsb_wide(b);
     let lsb_r = ereal_lsb_wide(r);
     let b_exp = IntExpr::Widen(
         WidenOp::Sub,
-        Box::new(ereal_lane(r, "e")),
-        Box::new(ereal_lane(r, "p")),
+        Box::new(ereal_lane_of(r, "e")),
+        Box::new(ereal_lane_of(r, "p")),
     );
     let s0 = ereal_min(
         ereal_min(lsb_a.clone(), lsb_b.clone()),
         ereal_min(lsb_r.clone(), b_exp.clone()),
     );
-    let ca = ereal_wshl(ereal_lane(a, "m"), ereal_wsub(lsb_a, s0.clone()), wv);
-    let cb = ereal_wshl(ereal_lane(b, "m"), ereal_wsub(lsb_b, s0.clone()), wv);
+    let ca = ereal_wshl(ereal_lane_of(a, "m"), ereal_wsub(lsb_a, s0.clone()), wv);
+    let cb = ereal_wshl(ereal_lane_of(b, "m"), ereal_wsub(lsb_b, s0.clone()), wv);
     let s = if sign == 1 {
         ereal_wadd(ca, cb)
     } else {
         ereal_wsub(ca, cb)
     };
-    let cr = ereal_wshl(ereal_lane(r, "m"), ereal_wsub(lsb_r, s0.clone()), wv);
+    let cr = ereal_wshl(ereal_lane_of(r, "m"), ereal_wsub(lsb_r, s0.clone()), wv);
     let diff = ereal_wsub(cr, s);
     let bound = ereal_wshl(IntExpr::Lit(1, 0), ereal_wsub(b_exp, s0), wv);
     ereal_and_all(vec![
@@ -4526,9 +4499,9 @@ fn ereal_add_window(a: &Expr, b: &Expr, r: &Expr, sign: i8, wv: u32) -> Formula 
 }
 
 /// `2^p` and `2^(p-1)` as widening shifts (exact while `p ≤ m_width`;
-/// callers conjoin the cap; see `ereal_m_bounded`).
-fn ereal_pow2(x: &Expr, wv: u32) -> (IntExpr, IntExpr) {
-    let p = ereal_lane(x, "p");
+/// callers conjoin the cap; see `ereal_valid_core`).
+fn ereal_pow2(x: &ERealOp, wv: u32) -> (IntExpr, IntExpr) {
+    let p = ereal_lane_of(x, "p");
     let full = ereal_wshl(IntExpr::Lit(1, 0), p.clone(), wv);
     let half = ereal_wshl(
         IntExpr::Lit(1, 0),
@@ -4538,39 +4511,19 @@ fn ereal_pow2(x: &Expr, wv: u32) -> (IntExpr, IntExpr) {
     (full, half)
 }
 
-/// Mantissa upper bound for mul/div operands (doc §4–§5 assume
-/// `|c| < 2^(e+1)`, i.e. `|m| < 2^p`): `m == 0` or (`p ≤ m_width` and
-/// `−2^p < m < 2^p`). `p ≤ m_width` loses no legitimate model (a nonzero
-/// `m` in an `m_width`-bit lane has `p ≤ m_width`). Hand-made lanes
-/// violating this are rejected (UNSAT), like the `m == 0` denominator
-/// guard.
-fn ereal_m_bounded(x: &Expr, wv: u32, m_width: u32) -> Formula {
-    let m = ereal_lane(x, "m");
-    let (full, _) = ereal_pow2(x, wv);
-    ereal_or_all(vec![
-        ereal_icmp(IntCmpOp::Eq, m.clone(), ereal_lit(0)),
-        ereal_and_all(vec![
-            ereal_icmp(
-                IntCmpOp::Lte,
-                ereal_lane(x, "p"),
-                ereal_lit(m_width as i64),
-            ),
-            ereal_icmp(IntCmpOp::Gt, m.clone(), ereal_wneg(full.clone())),
-            ereal_icmp(IntCmpOp::Lt, m, full),
-        ]),
-    ])
-}
-
 /// Nonzero normalization: `2^(p−1) ≤ |m| < 2^p` with `p ≤ m_width`.
+/// `p ≤ m_width` loses no legitimate model (a nonzero `m` in an
+/// `m_width`-bit lane has `p ≤ m_width`). Hand-made lanes violating this
+/// are rejected (UNSAT), like the `m == 0` denominator guard.
 /// Downstream mul/div proofs (doc §4–§5) assume normalized inputs
 /// (`|c| < 2^(e+1)`, `|c| ≥ 2^e`); without the lower bound the `k < p`
 /// div guard is insufficient (a denormalized `m` can span zero at `k < p`).
-fn ereal_m_normalized_nz(x: &Expr, wv: u32, m_width: u32) -> Formula {
-    let m = ereal_lane(x, "m");
+fn ereal_m_normalized_nz(x: &ERealOp, wv: u32, m_width: u32) -> Formula {
+    let m = ereal_lane_of(x, "m");
     let (full, half) = ereal_pow2(x, wv);
     let cap = ereal_icmp(
         IntCmpOp::Lte,
-        ereal_lane(x, "p"),
+        ereal_lane_of(x, "p"),
         ereal_lit(m_width as i64),
     );
     ereal_or_all(vec![
@@ -4589,21 +4542,59 @@ fn ereal_m_normalized_nz(x: &Expr, wv: u32, m_width: u32) -> Formula {
 
 /// Result normalization for add/sub/mul/div: `m_r == 0` (exact
 /// cancellation) or nonzero normalization (see `ereal_m_normalized_nz`).
-fn ereal_result_normalized(r: &Expr, wv: u32, m_width: u32) -> Formula {
+fn ereal_result_normalized(r: &ERealOp, wv: u32, m_width: u32) -> Formula {
     ereal_or_all(vec![
-        ereal_icmp(IntCmpOp::Eq, ereal_lane(r, "m"), ereal_lit(0)),
+        ereal_icmp(IntCmpOp::Eq, ereal_lane_of(r, "m"), ereal_lit(0)),
         ereal_m_normalized_nz(r, wv, m_width),
     ])
 }
 
-/// Multiplication (§4): `C = e1+e2 + max(t1,t2,t3) + 2`, 3-way max split.
-/// Plus a centre window pin, operand upper bounds, and result
-/// normalization (Phase 2; see `ereal_mul_window`).
+/// Permanent `Valid` core (rev3 §1): `wellformed` (`p > 0`, `k >= 0`)
+/// plus `p <= m_width` and mantissa normalization (`m == 0` or
+/// `2^(p-1) <= |m| < 2^p`). `e`-consistency follows automatically from
+/// normalization (`|c| = |m|·2^(e-p+1)`); `m == 0` leaves `e` free (zero
+/// special, rev3 §10.1(a)). Conjoined on every operand and result of
+/// `erealAdd/Sub/Mul/Div`, so denormalized lanes are UNSAT at the point
+/// of use. `k < p` is NOT part of the core: intermediate precision loss
+/// (`k >= p`) must stay representable for `erealNeedsRefine`/CEGAR;
+/// only division denominators additionally require `k < p`
+/// (`ereal_div_guard`) plus `m != 0`.
+fn ereal_valid_core(x: &ERealOp, wv: u32, m_width: u32) -> Formula {
+    ereal_and_all(vec![
+        ereal_wellformed(x),
+        ereal_icmp(
+            IntCmpOp::Lte,
+            ereal_lane_of(x, "p"),
+            ereal_lit(m_width as i64),
+        ),
+        ereal_result_normalized(x, wv, m_width),
+    ])
+}
+
+/// Strict goal-state `Valid`: core plus `k < p` (rev3 §5). Exposed as the
+/// `erealValid` predicate for users who want to assert a fully-precise
+/// value; not conjoined internally (see `ereal_valid_core`).
+fn ereal_valid_strict(x: &ERealOp, wv: u32, m_width: u32) -> Formula {
+    ereal_and_all(vec![
+        ereal_valid_core(x, wv, m_width),
+        ereal_icmp(
+            IntCmpOp::Lt,
+            ereal_lane_of(x, "k"),
+            ereal_lane_of(x, "p"),
+        ),
+    ])
+}
+
+/// Multiplication (§4): `C = e1+e2 + M + extra` with B2 dominant-term
+/// tightening (`extra = 1` iff the dominant term leads both others by
+/// >= 2, else 2 — mirror of `int_ext::mul_c`), 3-way max split.
+/// Plus a centre window pin and Valid operands/results
+/// (Phase 2; see `ereal_mul_window`).
 /// The `k'` path is end-to-end widening-exact (P2-2; see `ereal_add_sub`).
-fn ereal_mul(a: &Expr, b: &Expr, r: &Expr, wv: u32, m_width: u32) -> Formula {
-    let (ea, pa, ka) = (ereal_lane(a, "e"), ereal_lane(a, "p"), ereal_lane(a, "k"));
-    let (eb, pb, kb) = (ereal_lane(b, "e"), ereal_lane(b, "p"), ereal_lane(b, "k"));
-    let (er, pr, kr) = (ereal_lane(r, "e"), ereal_lane(r, "p"), ereal_lane(r, "k"));
+fn ereal_mul(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32, m_width: u32) -> Formula {
+    let (ea, pa, ka) = (ereal_lane_of(a, "e"), ereal_lane_of(a, "p"), ereal_lane_of(a, "k"));
+    let (eb, pb, kb) = (ereal_lane_of(b, "e"), ereal_lane_of(b, "p"), ereal_lane_of(b, "k"));
+    let (er, pr, kr) = (ereal_lane_of(r, "e"), ereal_lane_of(r, "p"), ereal_lane_of(r, "k"));
     let t1 = ereal_wadd(ereal_wsub(ka.clone(), pa.clone()), ereal_lit(1));
     let t2 = ereal_wadd(ereal_wsub(kb.clone(), pb.clone()), ereal_lit(1));
     let t3 = ereal_wsub(
@@ -4612,43 +4603,76 @@ fn ereal_mul(a: &Expr, b: &Expr, r: &Expr, wv: u32, m_width: u32) -> Formula {
     );
     let base = ereal_wadd(ea.clone(), eb.clone());
     let b_exp = ereal_wsub(er, pr.clone());
-    let case = |dom: &IntExpr, lo1: Formula, lo2: Formula| {
-        ereal_and_all(vec![
-            lo1,
-            lo2,
-            ereal_combine_eq_wide(
-                &kr,
-                &ereal_wadd(ereal_wadd(base.clone(), dom.clone()), ereal_lit(2)),
-                &b_exp,
-            ),
+    let gap_ge2 = |x: &IntExpr, y: &IntExpr| {
+        ereal_icmp(
+            IntCmpOp::Gt,
+            ereal_wsub(x.clone(), y.clone()),
+            ereal_lit(1),
+        )
+    };
+    let gap_le1 = |x: &IntExpr, y: &IntExpr| {
+        ereal_icmp(
+            IntCmpOp::Lte,
+            ereal_wsub(x.clone(), y.clone()),
+            ereal_lit(1),
+        )
+    };
+    let case = |dom: &IntExpr, lo1: Formula, lo2: Formula, o1: &IntExpr, o2: &IntExpr| {
+        ereal_or_all(vec![
+            // Separated: both gaps >= 2, tight `+ 1`.
+            ereal_and_all(vec![
+                lo1.clone(),
+                lo2.clone(),
+                gap_ge2(dom, o1),
+                gap_ge2(dom, o2),
+                ereal_combine_eq_wide(
+                    &kr,
+                    &ereal_wadd(ereal_wadd(base.clone(), dom.clone()), ereal_lit(1)),
+                    &b_exp,
+                ),
+            ]),
+            // Close: some gap <= 1, conservative `+ 2`.
+            ereal_and_all(vec![
+                lo1,
+                lo2,
+                ereal_or_all(vec![gap_le1(dom, o1), gap_le1(dom, o2)]),
+                ereal_combine_eq_wide(
+                    &kr,
+                    &ereal_wadd(ereal_wadd(base.clone(), dom.clone()), ereal_lit(2)),
+                    &b_exp,
+                ),
+            ]),
         ])
     };
     ereal_and_all(vec![
-        ereal_wellformed(a),
-        ereal_wellformed(b),
-        ereal_wellformed(r),
+        ereal_valid_core(a, wv, m_width),
+        ereal_valid_core(b, wv, m_width),
+        ereal_valid_core(r, wv, m_width),
         ereal_min_eq(&pr, &pa, &pb),
         ereal_or_all(vec![
             case(
                 &t1,
                 ereal_icmp(IntCmpOp::Gte, t1.clone(), t2.clone()),
                 ereal_icmp(IntCmpOp::Gte, t1.clone(), t3.clone()),
+                &t2,
+                &t3,
             ),
             case(
                 &t2,
                 ereal_icmp(IntCmpOp::Gt, t2.clone(), t1.clone()),
                 ereal_icmp(IntCmpOp::Gte, t2.clone(), t3.clone()),
+                &t1,
+                &t3,
             ),
             case(
                 &t3,
                 ereal_icmp(IntCmpOp::Gt, t3.clone(), t1.clone()),
                 ereal_icmp(IntCmpOp::Gt, t3.clone(), t2.clone()),
+                &t1,
+                &t2,
             ),
         ]),
-        ereal_m_bounded(a, wv, m_width),
-        ereal_m_bounded(b, wv, m_width),
         ereal_mul_window(a, b, r, wv),
-        ereal_result_normalized(r, wv, m_width),
     ])
 }
 
@@ -4686,23 +4710,23 @@ fn ereal_combine_eq_wide(k: &IntExpr, a: &IntExpr, b: &IntExpr) -> Formula {
 /// `IntBinOp::Mul`).
 ///
 /// Soundness: `|x1·x2 − c_a·c_b| ≤ 2^C` (doc §4; needs `|m| < 2^p` on
-/// both operands, i.e. `ereal_m_bounded`) plus `|c_r − c_a·c_b| ≤ 2^B`
+/// both operands, i.e. `ereal_valid_core`) plus `|c_r − c_a·c_b| ≤ 2^B`
 /// (this constraint) give `|x1·x2 − c_r| ≤ 2^C + 2^B ≤ R'` with the
 /// unchanged `k' = combine_k(C, B)`.
-fn ereal_mul_window(a: &Expr, b: &Expr, r: &Expr, wv: u32) -> Formula {
+fn ereal_mul_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32) -> Formula {
     let lsb_ab = ereal_wadd(ereal_lsb_wide(a), ereal_lsb_wide(b));
     let lsb_r = ereal_lsb_wide(r);
     let b_exp = IntExpr::Widen(
         WidenOp::Sub,
-        Box::new(ereal_lane(r, "e")),
-        Box::new(ereal_lane(r, "p")),
+        Box::new(ereal_lane_of(r, "e")),
+        Box::new(ereal_lane_of(r, "p")),
     );
     let s0 = ereal_min(
         ereal_min(lsb_r.clone(), lsb_ab.clone()),
         b_exp.clone(),
     );
-    let prod = ereal_wmul(ereal_lane(a, "m"), ereal_lane(b, "m"));
-    let cr = ereal_wshl(ereal_lane(r, "m"), ereal_wsub(lsb_r, s0.clone()), wv);
+    let prod = ereal_wmul(ereal_lane_of(a, "m"), ereal_lane_of(b, "m"));
+    let cr = ereal_wshl(ereal_lane_of(r, "m"), ereal_wsub(lsb_r, s0.clone()), wv);
     let cp = ereal_wshl(prod, ereal_wsub(lsb_ab, s0.clone()), wv);
     let diff = ereal_wsub(cr, cp);
     let bound = ereal_wshl(IntExpr::Lit(1, 0), ereal_wsub(b_exp, s0), wv);
@@ -4712,8 +4736,10 @@ fn ereal_mul_window(a: &Expr, b: &Expr, r: &Expr, wv: u32) -> Formula {
     ])
 }
 
-/// Division (§5 + rev2 §9.1(a) + P0-1 Q-fix): `D = e1-e2 + max(u1,u2) + 3`
-/// with the `divGuard` conjunct plus an `m_b != 0` conjunct (violations are
+/// Division (§5 + rev2 §9.1(a) + P0-1 Q-fix + B3 tightening):
+/// `D = e1-e2 + max(u1,u2) + extra` with `extra = 2` iff `|u1-u2| >= 2`,
+/// else 3 (mirror of `int_ext::div_d`), split into two disjoint branches.
+/// Plus the `divGuard` conjunct and an `m_b != 0` conjunct (violations are
 /// UNSAT: no finite bound absorbs a denominator interval spanning zero;
 /// exact cancellation `m == 0` has infinite relative error even when
 /// `k < p` holds).
@@ -4723,20 +4749,22 @@ fn ereal_mul_window(a: &Expr, b: &Expr, r: &Expr, wv: u32) -> Formula {
 /// input-error budget `D' = max(D, Q) + 1` (`Q = q_lsb − 1` is the scaled
 /// pre-rounding exponent; omitting it is unsound — see `mepk_div`).
 /// `guard` is the caller's `MepkWidths::guard` as a literal.
-fn ereal_div(a: &Expr, b: &Expr, r: &Expr, wv: u32, m_width: u32, guard: u32) -> Formula {
-    let (ea, pa, ka) = (ereal_lane(a, "e"), ereal_lane(a, "p"), ereal_lane(a, "k"));
-    let (eb, pb, kb) = (ereal_lane(b, "e"), ereal_lane(b, "p"), ereal_lane(b, "k"));
-    let (er, pr, kr) = (ereal_lane(r, "e"), ereal_lane(r, "p"), ereal_lane(r, "k"));
-    // `D = base + max(u1, u2) + 3`, all widening-exact.
+fn ereal_div(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32, m_width: u32, guard: u32) -> Formula {
+    let (ea, pa, ka) = (ereal_lane_of(a, "e"), ereal_lane_of(a, "p"), ereal_lane_of(a, "k"));
+    let (eb, pb, kb) = (ereal_lane_of(b, "e"), ereal_lane_of(b, "p"), ereal_lane_of(b, "k"));
+    let (er, pr, kr) = (ereal_lane_of(r, "e"), ereal_lane_of(r, "p"), ereal_lane_of(r, "k"));
+    // B3: `D = base + max(u1, u2) + extra` with `extra = 2` iff
+    // `|u1 - u2| >= 2`, else 3 (mirror of `int_ext::div_d`),
+    // all widening-exact. Two disjoint branches (integers: either both
+    // diffs `<= 1`, or some diff `>= 2`), each with its own budget.
     let u1 = ereal_wsub(ka.clone(), pa.clone());
     let u2 = ereal_wsub(kb.clone(), pb.clone());
-    let d_exp = ereal_wadd(
-        ereal_wadd(
-            ereal_wsub(ea.clone(), eb.clone()),
-            ereal_max(u1, u2),
-        ),
-        ereal_lit(3),
+    let d_base = ereal_wadd(
+        ereal_wsub(ea.clone(), eb.clone()),
+        ereal_max(u1.clone(), u2.clone()),
     );
+    let d_tight = ereal_wadd(d_base.clone(), ereal_lit(2));
+    let d_loose = ereal_wadd(d_base, ereal_lit(3));
     // `D' = max(D, Q) + 1` with `Q = lsb_a − lsb_b − guard − 1`
     // (exact wide scales).
     let lsb_a = ereal_lsb_wide(a);
@@ -4749,22 +4777,62 @@ fn ereal_div(a: &Expr, b: &Expr, r: &Expr, wv: u32, m_width: u32, guard: u32) ->
         ),
         ereal_lit(1),
     );
-    let d_star = ereal_wadd(ereal_max(d_exp, q_exp), ereal_lit(1));
+    // `D' = max(D, Q) + 1` per branch (`Q = lsb_a − lsb_b − guard − 1`,
+    // exact wide scales); `k' = combine(D', B)` is pinned per branch.
+    let star = |d: &IntExpr| {
+        ereal_wadd(
+            ereal_max(d.clone(), q_exp.clone()),
+            ereal_lit(1),
+        )
+    };
+    let separated = ereal_or_all(vec![
+        ereal_icmp(
+            IntCmpOp::Gt,
+            ereal_wsub(u1.clone(), u2.clone()),
+            ereal_lit(1),
+        ),
+        ereal_icmp(
+            IntCmpOp::Gt,
+            ereal_wsub(u2.clone(), u1.clone()),
+            ereal_lit(1),
+        ),
+    ]);
+    let close = ereal_and_all(vec![
+        ereal_icmp(
+            IntCmpOp::Lte,
+            ereal_wsub(u1.clone(), u2.clone()),
+            ereal_lit(1),
+        ),
+        ereal_icmp(
+            IntCmpOp::Lte,
+            ereal_wsub(u2.clone(), u1.clone()),
+            ereal_lit(1),
+        ),
+    ]);
+    let k_branch = ereal_or_all(vec![
+        ereal_and_all(vec![
+            separated,
+            ereal_combine_eq_wide(&kr, &star(&d_tight), &b_wide),
+        ]),
+        ereal_and_all(vec![
+            close,
+            ereal_combine_eq_wide(&kr, &star(&d_loose), &b_wide),
+        ]),
+    ]);
     ereal_and_all(vec![
-        ereal_wellformed(a),
-        ereal_wellformed(b),
-        ereal_wellformed(r),
+        ereal_valid_core(a, wv, m_width),
+        // Denominator: Valid core (normalization makes the `k < p` guard
+        // sufficient — a denormalized `m` could span zero at `k < p`) plus
+        // the strict domain conjuncts below.
+        ereal_valid_core(b, wv, m_width),
+        ereal_valid_core(r, wv, m_width),
         ereal_div_guard(b),
         // rev2 §9.1(a): denominator centre exactly zero is always
         // out of domain, even when `k < p` holds.
-        ereal_icmp(IntCmpOp::Neq, ereal_lane(b, "m"), ereal_lit(0)),
+        ereal_icmp(IntCmpOp::Neq, ereal_lane_of(b, "m"), ereal_lit(0)),
         ereal_min_eq(&pr, &pa, &pb),
-        ereal_combine_eq_wide(&kr, &d_star, &b_wide),
-        ereal_m_bounded(a, wv, m_width),
-        ereal_m_bounded(b, wv, m_width),
-        ereal_m_normalized_nz(b, wv, m_width),
+        k_branch,
         ereal_div_window(a, b, r, wv),
-        ereal_result_normalized(r, wv, m_width),
     ])
 }
 
@@ -4775,19 +4843,19 @@ fn ereal_div(a: &Expr, b: &Expr, r: &Expr, wv: u32, m_width: u32, guard: u32) ->
 /// exact widening multiplication. `|m_b|` is `±m_b` by a case split on
 /// the denominator sign (`m_b ≠ 0` is conjoined separately).
 ///
-/// Soundness: `|x_a/x_b − c_a/c_b| ≤ 2^D` (doc §5; needs `|m| < 2^p` on
-/// both operands via `ereal_m_bounded`, a normalized nonzero denominator
-/// via `ereal_m_normalized_nz`, and `k_b < p_b`) plus the window bound
+/// Soundness: `|x_a/x_b − c_a/c_b| ≤ 2^D` (doc §5; needs `Valid` operands
+/// via `ereal_valid_core` — in particular a normalized nonzero
+/// denominator — and `k_b < p_b`) plus the window bound
 /// give `|x_a/x_b − c_r| ≤ 2^D + 2^B ≤ R'` with the unchanged
 /// `k' = combine_k(D, B)`.
-fn ereal_div_window(a: &Expr, b: &Expr, r: &Expr, wv: u32) -> Formula {
+fn ereal_div_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32) -> Formula {
     let lsb_a = ereal_lsb_wide(a);
     let lsb_b = ereal_lsb_wide(b);
     let lsb_rb = ereal_wadd(ereal_lsb_wide(r), lsb_b.clone());
     let b_exp = IntExpr::Widen(
         WidenOp::Sub,
-        Box::new(ereal_lane(r, "e")),
-        Box::new(ereal_lane(r, "p")),
+        Box::new(ereal_lane_of(r, "e")),
+        Box::new(ereal_lane_of(r, "p")),
     );
     let bl = ereal_wadd(b_exp.clone(), lsb_b.clone());
     let s0 = ereal_min(
@@ -4797,11 +4865,11 @@ fn ereal_div_window(a: &Expr, b: &Expr, r: &Expr, wv: u32) -> Formula {
     // `lhs = m_r·m_b·2^(lsb_r+lsb_b) − m_a·2^lsb_a` (sign-independent).
     let lhs = ereal_wsub(
         ereal_wshl(
-            ereal_wmul(ereal_lane(r, "m"), ereal_lane(b, "m")),
+            ereal_wmul(ereal_lane_of(r, "m"), ereal_lane_of(b, "m")),
             ereal_wsub(lsb_rb, s0.clone()),
             wv,
         ),
-        ereal_wshl(ereal_lane(a, "m"), ereal_wsub(lsb_a, s0.clone()), wv),
+        ereal_wshl(ereal_lane_of(a, "m"), ereal_wsub(lsb_a, s0.clone()), wv),
     );
     // `rhs = |m_b|·2^(B+lsb_b)`; one case per denominator sign.
     let window = |am2: IntExpr| {
@@ -4811,7 +4879,7 @@ fn ereal_div_window(a: &Expr, b: &Expr, r: &Expr, wv: u32) -> Formula {
             ereal_icmp(IntCmpOp::Lte, ereal_wneg(rhs), lhs.clone()),
         ])
     };
-    let m2 = ereal_lane(b, "m");
+    let m2 = ereal_lane_of(b, "m");
     ereal_or_all(vec![
         ereal_and_all(vec![
             ereal_icmp(IntCmpOp::Gt, m2.clone(), ereal_lit(0)),

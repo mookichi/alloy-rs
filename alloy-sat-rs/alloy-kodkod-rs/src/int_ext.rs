@@ -128,20 +128,34 @@ pub fn add_a(ell: i32, k1: i32, d1: i32, k2: i32, d2: i32) -> i32 {
     ell + (k1 + d1).max(k2 + d2)
 }
 
-/// §4 multiplication exponent:
-/// `C = e1 + e2 + max(k1-p1+1, k2-p2+1, k1+k2-p1-p2) + 2`.
+/// §4 multiplication exponent with dominant-term tightening (B2):
+/// `C = e1 + e2 + M + extra` where `M = max(t1, t2, t3)` and
+/// `extra = 1` iff the largest term leads the runner-up by ≥ 2
+/// (then the three error terms sum to `< 1.75·2^M < 2^(M+1)`), else 2
+/// (Lemma 2 worst case, all terms tied). The old unconditional `+ 2`
+/// is the `else` branch.
 #[inline]
 pub fn mul_c(e1: i32, e2: i32, k1: i32, p1: i32, k2: i32, p2: i32) -> i32 {
     let t1 = k1 - p1 + 1;
     let t2 = k2 - p2 + 1;
     let t3 = (k1 + k2) - (p1 + p2);
-    e1 + e2 + t1.max(t2).max(t3) + 2
+    let m = t1.max(t2).max(t3);
+    // Runner-up: largest term strictly below the max (== M on ties).
+    let second = t1.min(t2).max(t2.min(t3)).max(t1.min(t3));
+    let extra = if m - second >= 2 { 1 } else { 2 };
+    e1 + e2 + m + extra
 }
 
-/// §5 division exponent: `D = e1 - e2 + max(k1-p1, k2-p2) + 3`.
+/// §5 division exponent with dominant-term tightening (B3):
+/// `D = e1 - e2 + M + extra` where `M = max(u1, u2)` (`u_i = k_i - p_i`)
+/// and `extra = 2` iff `|u1 - u2| >= 2` (numerator terms sum to
+/// `< 1.25·2^(E+M)`, saving Lemma 2's +1; the denominator-`1/2` +1 stays),
+/// else 3.
 #[inline]
 pub fn div_d(e1: i32, e2: i32, k1: i32, p1: i32, k2: i32, p2: i32) -> i32 {
-    (e1 - e2) + (k1 - p1).max(k2 - p2) + 3
+    let (u1, u2) = (k1 - p1, k2 - p2);
+    let extra = if (u1 - u2).abs() >= 2 { 2 } else { 3 };
+    (e1 - e2) + u1.max(u2) + extra
 }
 
 /// §5 division precondition: denominator interval cannot span zero
@@ -155,6 +169,40 @@ pub fn div_guard(k2: i32, p2: i32) -> bool {
 #[inline]
 pub fn accuracy_tau(p: i32, k: i32, g: i32) -> i32 {
     (p - k) - g
+}
+
+/// Normalized mantissa: `m == 0` (exact-cancellation special, rev3 §10.1(a))
+/// or `2^(p-1) <= |m| < 2^p` (rev3 §1), i.e. `bit_len(|m|) == p`.
+#[inline]
+pub fn is_normalized(m: i128, p: u32) -> bool {
+    if p == 0 || p > 127 {
+        return false;
+    }
+    if m == 0 {
+        return true;
+    }
+    bit_len(m.unsigned_abs()) == p
+}
+
+/// Permanent `Valid` predicate (rev3 §1 + §5):
+/// `1 <= p <= 127`, `0 <= k < p`, normalized `m`, and `p <= m_width`
+/// when a lane cap is given. `e`-consistency (`2^e <= |c| < 2^(e+1)`)
+/// follows automatically from normalization since
+/// `|c| = |m|·2^(e-p+1)`; `m == 0` leaves `e` unconstrained (zero special).
+#[inline]
+pub fn is_valid(m: i128, _e: i32, p: u32, k: i32, m_width: Option<u32>) -> bool {
+    if p == 0 || p > 127 {
+        return false;
+    }
+    if k < 0 || k >= p as i32 {
+        return false;
+    }
+    if let Some(w) = m_width {
+        if p > w {
+            return false;
+        }
+    }
+    is_normalized(m, p)
 }
 
 #[cfg(test)]
@@ -173,6 +221,22 @@ mod tests {
                 assert!(b + k >= a);
             }
         }
+    }
+
+    #[test]
+    fn normalized_and_valid_shapes() {
+        assert!(is_normalized(0, 8));
+        assert!(is_normalized(128, 8) && is_normalized(255, 8));
+        assert!(!is_normalized(100, 8) && !is_normalized(127, 8));
+        assert!(!is_normalized(256, 8) && !is_normalized(1, 8));
+        assert!(!is_normalized(8, 0) && !is_normalized(8, 128));
+        assert!(is_valid(200, 5, 8, 1, None));
+        assert!(is_valid(0, -1000, 8, 0, None));
+        assert!(!is_valid(100, 6, 8, 1, None));
+        assert!(!is_valid(8, 2, 4, -1, None));
+        assert!(!is_valid(8, 2, 4, 4, None));
+        assert!(!is_valid(8, 2, 4, 0, Some(3)));
+        assert!(is_valid(8, 2, 4, 0, Some(4)));
     }
 
     #[test]
@@ -300,9 +364,15 @@ mod tests {
         // addA: ell + max(k1+d1, k2+d2).
         assert_eq!(add_a(-1, 1, 1, 2, 0), -1 + 2);
         // mulC/divD spot values cross-checked against MepkOpsTest.
+        // mul: t = (-6, -4, -12), runner-up -6, gap 2 -> tight +1.
         let c = mul_c(6, 5, 1, 8, 2, 7);
         let t = (1 - 8 + 1).max(2 - 7 + 1).max((1 + 2) - (8 + 7));
-        assert_eq!(c, 6 + 5 + t + 2);
+        assert_eq!(t, -4);
+        assert_eq!(c, 6 + 5 + t + 1);
+        // Tied maxima keep the conservative +2.
+        assert_eq!(mul_c(0, 0, 1, 8, 1, 8), 0 + 0 + (1 - 8 + 1) + 2);
+        // Near-tie (gap 1) also keeps +2.
+        assert_eq!(mul_c(0, 0, 0, 8, 1, 8), 0 + 0 + (1 - 8 + 1) + 2);
         assert_eq!(div_d(6, 5, 1, 8, 1, 8), (6 - 5) + (1 - 8).max(1 - 8) + 3);
         assert!(div_guard(1, 8));
         assert!(!div_guard(4, 4));

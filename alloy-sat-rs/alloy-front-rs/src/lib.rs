@@ -13,6 +13,7 @@
 
 pub mod cegis;
 pub mod cnf;
+pub mod display;
 pub mod incremental;
 pub mod partial;
 pub mod snippet;
@@ -792,12 +793,22 @@ pub fn parse_and_run_timed(src: &str, index: usize) -> TimedResult {
         }
     };
     let t1 = Instant::now();
+    let mut out = run_timed(&module, index);
+    out.parse = t1 - t0;
+    out
+}
+
+/// Timed run over an already-parsed module (parse time reported as ZERO).
+/// Used by `als --timing -e` so the eval command can inherit the executed
+/// command's scope before solving.
+pub fn run_timed(module: &Module, index: usize) -> TimedResult {
+    let t1 = Instant::now();
     let cmd = match module.commands.get(index) {
         Some(c) => c,
         None => {
             return TimedResult {
                 solution: Err(FrontError::Resolve(format!("no command #{index}"))),
-                parse: t1 - t0,
+                parse: Duration::ZERO,
                 lower: Duration::ZERO,
                 solve: Duration::ZERO,
             };
@@ -810,7 +821,7 @@ pub fn parse_and_run_timed(src: &str, index: usize) -> TimedResult {
             let t2 = Instant::now();
             return TimedResult {
                 solution: Err(e),
-                parse: t1 - t0,
+                parse: Duration::ZERO,
                 lower: t2 - t1,
                 solve: Duration::ZERO,
             };
@@ -834,7 +845,7 @@ pub fn parse_and_run_timed(src: &str, index: usize) -> TimedResult {
     let t3 = Instant::now();
     TimedResult {
         solution: solve_result.map_err(FrontError::Solve),
-        parse: t1 - t0,
+        parse: Duration::ZERO,
         lower: t2 - t1,
         solve: t3 - t2,
     }

@@ -38,6 +38,7 @@ pub const EREAL_OPS: &[&str] = &[
     "erealMul",
     "erealDiv",
     "erealWellformed",
+    "erealValid",
     "erealDivGuard",
     "erealNeedsRefine",
     "erealCombineK",

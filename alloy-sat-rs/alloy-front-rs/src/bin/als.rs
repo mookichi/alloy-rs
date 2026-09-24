@@ -1,8 +1,46 @@
 use std::process;
 
 use alloy_front_rs::{
-    parse_and_run_timed, parse_module, run_command, run_opt_command, CommandKind,
+    check as build_check_cnf,
+    display::{format_instance, format_query_value, query_exit_ok},
+    parse_and_run_timed, parse_module,
+    run as build_run_cnf,
+    run_command, run_opt_command,
+    snippet::{query_value, QueryValue},
+    CnfKind, CommandKind, Instance, Module, Scope,
 };
+
+/// Print a solved instance with EReal decoding.
+fn print_solution(inst: &Instance) {
+    println!("    {}", format_instance(inst));
+}
+
+/// Query `-e` against an already-solved instance (`:query` semantics: no
+/// re-solve, so the answer always belongs to the displayed solution).
+/// Rebuilds the command's Cnf as query context (lowering scratch + int
+/// bounds + bitwidth only). Returns the rendered value and whether the
+/// process should exit 0 (`false` solely for `false` answers, mirroring
+/// the old `run {expr}` UNSAT exit code so `-e` keeps working as a
+/// scripted assertion).
+fn query_last(
+    module: &Module,
+    idx: usize,
+    kind: CnfKind,
+    inst: &Instance,
+    expr_src: &str,
+) -> Result<(String, bool), alloy_front_rs::FrontError> {
+    let cnf = match kind {
+        CnfKind::Run => build_run_cnf(module, idx)?,
+        _ => build_check_cnf(module, idx)?,
+    };
+    let scope = module
+        .commands
+        .get(idx)
+        .map(|c| &c.scope)
+        .ok_or_else(|| alloy_front_rs::FrontError::Resolve(format!("no command #{idx}")))?;
+    let v: QueryValue = query_value(module, scope, &cnf, expr_src, inst)?;
+    Ok((format_query_value(inst, &v), query_exit_ok(&v)))
+}
 use clap::Parser as ClapParser;
 
 #[derive(ClapParser)]
@@ -15,7 +53,9 @@ struct Cli {
     #[arg(short = 'c')]
     code: Option<String>,
 
-    /// Evaluate expression after solving (wraps in `run { expr }`)
+    /// Query expression against the last solution (`:query`; falls back to
+    /// `run { expr }` when no plain static solution exists). A `false`
+    /// answer exits 1, so `-e` doubles as a scripted assertion.
     #[arg(short = 'e')]
     eval: Option<String>,
 
@@ -93,11 +133,28 @@ fn fmt_dur(d: std::time::Duration) -> String {
     }
 }
 
+
+/// Give the trailing `-e` eval command the last executed command's scope so
+/// ad-hoc evaluation solves under an identical profile (widths/atoms).
+fn inherit_eval_scope(eval_module: &mut Module, scope: &Option<Scope>) {
+    if let (Some(s), Some(cmd)) = (scope, eval_module.commands.last_mut()) {
+        cmd.scope = s.clone();
+    }
+}
+
 fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
     let pick = cli.command.as_deref();
     let mut last_solution = None;
     let mut last_opt_sat = false;
     let mut ran_any = false;
+    // Profile for `-e`: the last executed command's scope, so ad-hoc
+    // evaluation solves under identical widths/atoms (same precedent as
+    // REPL `:eval` inheriting the default Cnf's scope).
+    let mut last_scope: Option<Scope> = None;
+    // Target for `-e` query semantics: the last plain (non-opt) command
+    // with a static satisfiable instance. Opt/temporal/UNSAT commands
+    // clear it, falling back to `run {expr}`.
+    let mut last_plain: Option<(usize, CnfKind, Instance)> = None;
     let mut total_parse = std::time::Duration::ZERO;
     let mut total_lower = std::time::Duration::ZERO;
     let mut total_solve = std::time::Duration::ZERO;
@@ -121,6 +178,7 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
         }
 
         ran_any = true;
+        last_scope = Some(module.commands[i].scope.clone());
         if is_opt_command(cmd) || alloy_front_rs::command_needs_opt(&module, i) {
             let t0 = std::time::Instant::now();
             let result = run_opt_command(&module, i);
@@ -136,7 +194,7 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
                         .unwrap_or_default();
                     println!("{i:02}. {kind:<8} {name:<20} {models} {tag}{cost}  solve={}", fmt_dur(dt));
                     if let Some(ref inst) = sol.instance {
-                        println!("    {inst}");
+                        print_solution(inst);
                     }
                     if sol.satisfiable {
                         last_opt_sat = true;
@@ -146,6 +204,7 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
                     println!("{i:02}. {kind:<8} {name:<20} !{e}");
                 }
             }
+            last_plain = None;
             continue;
         }
         let timed = parse_and_run_timed(source, i);
@@ -165,7 +224,7 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
                 );
                 if sol.satisfiable {
                     if let Some(ref inst) = sol.instance {
-                        println!("    {inst}");
+                        print_solution(inst);
                     }
                     if let Some(ref ti) = sol.temporal {
                         for (s, state) in ti.states().iter().enumerate() {
@@ -174,6 +233,16 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
                         }
                     }
                 }
+                last_plain = match (&sol.instance, &sol.temporal) {
+                    (Some(inst), None) => {
+                        let cnf_kind = match &cmd.kind {
+                            CommandKind::Run(_) => CnfKind::Run,
+                            _ => CnfKind::Check,
+                        };
+                        Some((i, cnf_kind, inst.clone()))
+                    }
+                    _ => None,
+                };
                 last_solution = Some(sol);
             }
             Err(e) => {
@@ -196,8 +265,26 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
         process::exit(1);
     }
 
-    // -e: evaluate expression
+    // -e: query against the last solution when one exists (`:query`
+    // semantics: no re-solve), else solve `run {expr}` (`:eval` fallback).
     if let Some(expr_src) = &cli.eval {
+        if let Some((idx, cnf_kind, ref inst)) = last_plain {
+            let t0 = std::time::Instant::now();
+            let q = query_last(&module, idx, cnf_kind, inst, expr_src);
+            let dur = t0.elapsed();
+            match q {
+                Ok((rendered, ok)) => {
+                    println!("query: {expr_src} = {rendered}  eval={}", fmt_dur(dur));
+                    if !ok {
+                        process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("eval error: {e}");
+                    process::exit(1);
+                }
+            }
+        } else {
         let eval_src = if let Some(code) = &cli.code {
             format!("{code}\nrun {{ {expr_src} }}")
         } else if let Some(path) = &cli.file {
@@ -207,14 +294,18 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
             format!("run {{ {expr_src} }}")
         };
 
-        let eval_idx = parse_module(&eval_src).map(|m| {
-            let idx = m.commands.len() - 1;
-            (m, idx)
+        let t0 = std::time::Instant::now();
+        let eval_parsed = parse_module(&eval_src).map(|mut m| {
+            inherit_eval_scope(&mut m, &last_scope);
+            m
         });
+        let parse_dur = t0.elapsed();
 
-        match eval_idx {
-            Ok((_, idx)) => {
-                let timed = parse_and_run_timed(&eval_src, idx);
+        match eval_parsed {
+            Ok(m) => {
+                let idx = m.commands.len() - 1;
+                let mut timed = alloy_front_rs::run_timed(&m, idx);
+                timed.parse = parse_dur;
                 match timed.solution {
                     Ok(sol) => {
                         let tag = if sol.satisfiable { "true" } else { "false" };
@@ -226,7 +317,7 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
                         );
                         if sol.satisfiable {
                             if let Some(ref inst) = sol.instance {
-                                println!("    {inst}");
+                                print_solution(inst);
                             }
                         }
                         last_solution = Some(sol);
@@ -242,6 +333,7 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
                 process::exit(1);
             }
         }
+        } // end fallback (no queryable solution)
     }
 
     match last_solution {
@@ -266,6 +358,12 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
     let mut last_solution = None;
     let mut last_opt_sat = false;
     let mut ran_any = false;
+    // Profile for `-e`: the last executed command's scope, so ad-hoc
+    // evaluation solves under identical widths/atoms (same precedent as
+    // REPL `:eval` inheriting the default Cnf's scope).
+    let mut last_scope: Option<Scope> = None;
+    // Target for `-e` query semantics (see `run_with_timing`).
+    let mut last_plain: Option<(usize, CnfKind, Instance)> = None;
 
     for (i, cmd) in module.commands.iter().enumerate() {
         let (name, kind) = command_label(cmd, i);
@@ -277,6 +375,7 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
         }
 
         ran_any = true;
+        last_scope = Some(module.commands[i].scope.clone());
         if is_opt_command(cmd) || alloy_front_rs::command_needs_opt(&module, i) {
             match run_opt_command(&module, i) {
                 Ok(sol) => {
@@ -288,7 +387,7 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
                         .unwrap_or_default();
                     println!("{i:02}. {kind:<8} {name:<20} {models} {tag}{cost}");
                     if let Some(ref inst) = sol.instance {
-                        println!("    {inst}");
+                        print_solution(inst);
                     }
                     if sol.satisfiable {
                         last_opt_sat = true;
@@ -298,6 +397,7 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
                     println!("{i:02}. {kind:<8} {name:<20} !{e}");
                 }
             }
+            last_plain = None;
             continue;
         }
         match run_command(&module, i) {
@@ -307,7 +407,7 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
                 println!("{i:02}. {kind:<6} {name:<20} {models} {tag}");
                 if sol.satisfiable {
                     if let Some(ref inst) = sol.instance {
-                        println!("    {inst}");
+                        print_solution(inst);
                     }
                     if let Some(ref ti) = sol.temporal {
                         for (s, state) in ti.states().iter().enumerate() {
@@ -316,6 +416,16 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
                         }
                     }
                 }
+                last_plain = match (&sol.instance, &sol.temporal) {
+                    (Some(inst), None) => {
+                        let cnf_kind = match &cmd.kind {
+                            CommandKind::Run(_) => CnfKind::Run,
+                            _ => CnfKind::Check,
+                        };
+                        Some((i, cnf_kind, inst.clone()))
+                    }
+                    _ => None,
+                };
                 last_solution = Some(sol);
             }
             Err(e) => {
@@ -331,8 +441,23 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
         process::exit(1);
     }
 
-    // -e: evaluate expression
+    // -e: query against the last solution when one exists (`:query`
+    // semantics: no re-solve), else solve `run {expr}` (`:eval` fallback).
     if let Some(expr_src) = &cli.eval {
+        if let Some((idx, cnf_kind, ref inst)) = last_plain {
+            match query_last(&module, idx, cnf_kind, inst, expr_src) {
+                Ok((rendered, ok)) => {
+                    println!("query: {expr_src} = {rendered}");
+                    if !ok {
+                        process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("eval error: {e}");
+                    process::exit(1);
+                }
+            }
+        } else {
         let eval_src = if let Some(code) = &cli.code {
             format!("{code}\nrun {{ {expr_src} }}")
         } else if let Some(path) = &cli.file {
@@ -342,13 +467,14 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
             format!("run {{ {expr_src} }}")
         };
 
-        let eval_module = match parse_module(&eval_src) {
+        let mut eval_module = match parse_module(&eval_src) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("eval parse error: {e}");
                 process::exit(1);
             }
         };
+        inherit_eval_scope(&mut eval_module, &last_scope);
 
         let eval_idx = eval_module.commands.len() - 1;
         match run_command(&eval_module, eval_idx) {
@@ -357,7 +483,7 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
                 println!("eval: {tag}");
                 if sol.satisfiable {
                     if let Some(ref inst) = sol.instance {
-                        println!("    {inst}");
+                        print_solution(inst);
                     }
                 }
                 last_solution = Some(sol);
@@ -367,11 +493,36 @@ fn run_normal(source: &str, source_desc: &str, cli: &Cli) {
                 process::exit(1);
             }
         }
+        } // end fallback (no queryable solution)
     }
 
     match last_solution {
         Some(sol) if sol.satisfiable => process::exit(0),
         _ if last_opt_sat => process::exit(0),
         _ => process::exit(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_inherits_command_scope() {
+        let src = "one sig x extends EReal {} run for 10 int";
+        let module = parse_module(src).expect("parse");
+        assert_eq!(module.commands.len(), 1);
+        let eval_src = format!("{src}\nrun {{ x }}");
+        let mut eval_module = parse_module(&eval_src).expect("parse");
+        assert_eq!(eval_module.commands.len(), 2);
+        // Default scope before inheritance.
+        inherit_eval_scope(&mut eval_module, &None);
+        // Inherit the executed command's profile.
+        let scope = Some(module.commands[0].scope.clone());
+        inherit_eval_scope(&mut eval_module, &scope);
+        assert_eq!(
+            format!("{:?}", eval_module.commands[1].scope),
+            format!("{:?}", module.commands[0].scope)
+        );
     }
 }

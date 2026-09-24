@@ -55,7 +55,7 @@ fn ereal_add_is_satisfiable() {
 fn add_result_centre_is_pinned() {
     // Phase 1 window-pin: 0.5+0.5 = 1.0, so `c < 0.0` is UNSAT.
     // (With free centres both directions were SAT.)
-    // Scopes allow room for hoisted literals (a, b, c + `$elit`).
+    // Literals are ERealConstants (no witness atoms needed).
     unsat("pred p { some a, b, c: EReal | setEReal[a, 0.5] and setEReal[b, 0.5] and erealAdd[a, b, c] and erealLT[c, 0.0] }\nrun p for 5 EReal");
     // Control: the true direction stays SAT.
     sat("pred p { some a, b, c: EReal | setEReal[a, 0.5] and setEReal[b, 0.5] and erealAdd[a, b, c] and erealLT[0.0, c] }\nrun p for 5 EReal");
@@ -121,6 +121,41 @@ fn wellformed_rejects_bad_precision() {
 }
 
 #[test]
+fn valid_is_permanent_on_operands() {
+    // Denormalized add/sub operands are UNSAT at the point of use
+    // (previously only results and div denominators were pinned).
+    unsat("pred p { some a, b, c: EReal | a.m = 1 and a.p = 4 and a.k = 0 and erealWellformed[a] and erealAdd[a, b, c] }\nrun p for 4 EReal");
+    unsat("pred p { some a, b, c: EReal | a.m = 1 and a.p = 4 and a.k = 0 and erealWellformed[a] and erealSub[a, b, c] }\nrun p for 4 EReal");
+    // Precision beyond the mantissa lane is rejected too
+    // (default `for 4 Int` widths: m_width = 5, so p = 6 is out of range).
+    unsat("pred p { some a, b, c: EReal | a.m = 32 and a.p = 6 and a.k = 0 and erealWellformed[a] and erealAdd[a, b, c] }\nrun p for 4 EReal");
+    // Control: the normalized shape (m = 8 in [2^3, 2^4)) stays SAT.
+    sat("pred p { some a, b, c: EReal | a.m = 8 and a.p = 4 and a.k = 0 and erealWellformed[a] and erealAdd[a, b, c] }\nrun p for 4 EReal");
+}
+
+#[test]
+fn literals_need_no_witness_atoms() {
+    // ERealConstant: decimal literals consume no scope atoms (previously
+    // hoisted to `$elit` witnesses). With zero `EReal` atoms the hoisted
+    // form is UNSAT; the constant form stays SAT.
+    sat("pred p { erealWellformed[0.5] }\nrun p for 0 EReal");
+    sat("pred p { erealValid[0.5] }\nrun p for 0 EReal");
+    sat("pred p { erealLT[0.25, 0.5] }\nrun p for 0 EReal");
+}
+
+#[test]
+fn ereal_valid_predicate() {
+    // Strict goal-state Valid (core + k < p): converted literals satisfy it.
+    sat("pred p { some x: EReal | setEReal[x, 0.5] and erealValid[x] }\nrun p for 2 EReal");
+    // Precision loss (k >= p) fails the strict predicate but stays
+    // representable for erealNeedsRefine.
+    unsat("pred p { some x: EReal | x.m = 8 and x.p = 4 and x.k = 4 and erealValid[x] }\nrun p for 2 EReal");
+    sat("pred p { some x: EReal | x.m = 8 and x.p = 4 and x.k = 4 and erealWellformed[x] }\nrun p for 2 EReal");
+    // Denormalized lanes fail it too.
+    unsat("pred p { some x: EReal | x.m = 1 and x.p = 4 and x.k = 0 and erealValid[x] }\nrun p for 2 EReal");
+}
+
+#[test]
 fn ereal_in_user_sig_fields() {
     // User sigs may hold EReal values; joins chain through lanes.
     sat("sig A { x: EReal }\npred p { some a: A | a.x.m = 3 }\nrun p for 2 A, 2 EReal");
@@ -139,12 +174,15 @@ fn in_ereal_accepted_extends_rejected() {
 fn extends_ereal_partitions() {
     // A lone extender covers the parent.
     sat("sig X extends EReal {}\npred p { some X }\nrun p for 2 EReal");
-    // `EReal` is a non-abstract value sort (like `Int`): extenders are
-    // proper subsets, siblings are disjoint, but the parent may hold
-    // direct atoms outside its extenders (room for literal witnesses
-    // and free values; `for N EReal` is honored).
-    sat("sig X extends EReal {}\npred p { some EReal - X }\nrun p for 2 EReal");
-    sat("one sig X extends EReal {}\npred p { some EReal - X }\nrun p for 2 EReal");
+    // `EReal` is abstract: extenders are proper subsets, siblings are
+    // disjoint, and the parent is covered by its extenders (decimal
+    // literals are `ERealConstant` tuples needing no witness atoms, so
+    // no spare room is required; `for N EReal` caps the population).
+    // A lone extender covers the parent: nothing sits outside it.
+    unsat("sig X extends EReal {}\npred p { some EReal - X }\nrun p for 2 EReal");
+    unsat("one sig X extends EReal {}\npred p { some EReal - X }\nrun p for 2 EReal");
+    // Parent collapses onto a `one` extender regardless of scope.
+    unsat("one sig X extends EReal {}\npred p { #EReal = 2 }\nrun p for 3 EReal");
     // Lanes work through extenders.
     sat("sig X extends EReal {}\npred p { some x: X | setEReal[x, 0.5] }\nrun p for 2 EReal");
     // Siblings are disjoint: one atom cannot host both.

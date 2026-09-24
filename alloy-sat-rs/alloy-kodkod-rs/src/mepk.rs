@@ -194,6 +194,23 @@ impl Mepk {
         Some(Mepk { m, e, p, k })
     }
 
+    /// Permanent `Valid` predicate (rev3 §1 + §5): `0 <= k < p`,
+    /// normalized `m` (`m == 0` allowed, `e` free), `p <= m_width` when given.
+    pub fn is_valid(&self, m_width: Option<u32>) -> bool {
+        int_ext::is_valid(self.m, self.e, self.p, self.k, m_width)
+    }
+
+    /// Validating constructor: `None` unless [`Self::is_valid`] holds
+    /// (uncapped width when `m_width` is `None`).
+    pub fn new_valid(m: i128, e: i32, p: u32, k: i32, m_width: Option<u32>) -> Option<Self> {
+        let v = Self::new(m, e, p, k)?;
+        if v.is_valid(m_width) {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
     /// Weight of the least significant bit: `lsb = e - p + 1`.
     pub fn lsb(&self) -> i32 {
         int_ext::lsb(self.e, self.p as i32)
@@ -313,10 +330,23 @@ fn decimal_of_scaled(m: i128, lsb: i32, frac_cap: Option<usize>) -> String {
     }
 }
 
+/// Weak-input gate for the oracle: normalized `m` (`m == 0` allowed),
+/// `p` in range, `k >= 0`. `k >= p` (precision loss) is allowed through
+/// so CEGAR can observe it; full `Valid` (`k < p`) is enforced by
+/// [`Mepk::new_valid`] at construction and by the solver lowering.
+fn valid_input(v: &Mepk) -> bool {
+    int_ext::is_normalized(v.m, v.p) && v.k >= 0
+}
+
 /// Addition / subtraction (§3). `sign` is +1 (add) or -1 (sub).
-/// `None` on overflow or bad precision.
+/// `None` on overflow, bad precision, or non-`Valid` (denormalized /
+/// `k < 0`) inputs. Outputs are always normalized; `k' >= p'` is
+/// returned as-is (precision loss, CEGAR-refineable) rather than `None`.
 pub fn mepk_add(x1: &Mepk, x2: &Mepk, sign: i8) -> Option<Mepk> {
     if sign != 1 && sign != -1 {
+        return None;
+    }
+    if !valid_input(x1) || !valid_input(x2) {
         return None;
     }
     let ell = x1.lsb().min(x2.lsb());
@@ -336,8 +366,12 @@ pub fn mepk_add(x1: &Mepk, x2: &Mepk, sign: i8) -> Option<Mepk> {
     Mepk::new(m_new, e_new, p_new, int_ext::combine_k(a, b))
 }
 
-/// Multiplication (§4). `None` on overflow or bad precision.
+/// Multiplication (§4). `None` on overflow, bad precision, or
+/// non-`Valid` inputs (see [`mepk_add`]).
 pub fn mepk_mul(x1: &Mepk, x2: &Mepk) -> Option<Mepk> {
+    if !valid_input(x1) || !valid_input(x2) {
+        return None;
+    }
     let p_new = x1.p.min(x2.p);
     let prod = x1.m.checked_mul(x2.m)?;
     let raw_lsb = x1.lsb().checked_add(x2.lsb())?;
@@ -378,6 +412,9 @@ pub fn mepk_mul(x1: &Mepk, x2: &Mepk) -> Option<Mepk> {
 /// `guard` is a tightness knob only (larger guard shrinks `Q` and the
 /// zero-quotient threshold); soundness holds for every `guard ≥ 0`.
 pub fn mepk_div(x1: &Mepk, x2: &Mepk, guard: u32) -> Option<Mepk> {
+    if !valid_input(x1) || !valid_input(x2) {
+        return None;
+    }
     if !x2.div_guard() {
         return None;
     }
@@ -824,14 +861,24 @@ pub fn mepk_mul_c(x1: &MepkCircuit, x2: &MepkCircuit, w: &MepkWidths) -> MepkCir
     let prod = x1.m.widen_mul(&x2.m);
     let raw_lsb = x1.lsb_c(w).add(&x2.lsb_c(w), ew);
     let p_new = x1.p.min_c(&x2.p);
-    // `C = e1 + e2 + max(k1-p1+1, k2-p2+1, k1+k2-p1-p2) + 2`.
+    // B2: `C = e1 + e2 + M + extra` with `M = max(t1, t2, t3)` and
+    // `extra = 1` iff `M` leads the runner-up by >= 2 (mirror of
+    // `int_ext::mul_c`). Runner-up = median = max of pairwise mins
+    // (choice-based, exact); `== M` on ties, hence conservative there.
     let one = IntCircuit::constant(1, ew, &ctx);
-    let two = IntCircuit::constant(2, ew, &ctx);
+    let zero = IntCircuit::constant(0, ew, &ctx);
     let u1 = x1.k.sub(&x1.p, ew).add(&one, ew);
     let u2 = x2.k.sub(&x2.p, ew).add(&one, ew);
     let u3 = x1.k.add(&x2.k, ew).sub(&x1.p.add(&x2.p, ew), ew);
     let mx = u1.max_c(&u2).max_c(&u3);
-    let c_exp = x1.e.add(&x2.e, ew).add(&mx, ew).add(&two, ew);
+    let second = u1.min_c(&u2).max_c(&u2.min_c(&u3)).max_c(&u1.min_c(&u3));
+    let gap = mx.widen_sub(&second);
+    // `close` ⟺ gap ≤ 1 ⟺ gap < 2 (mirror of `m - second >= 2`).
+    let close = gap.lt(&IntCircuit::constant(2, gap.width() as u32, &ctx));
+    // `close ? 2 : 1`: bit is 1 exactly when the +2 fallback applies.
+    let bit = one.choice(close, &zero);
+    let extra = one.add(&bit, ew);
+    let c_exp = x1.e.add(&x2.e, ew).add(&mx, ew).add(&extra, ew);
     let (e_new, k_new) = finish_c(&prod, &raw_lsb, &p_new, &c_exp, w);
     let mut res = MepkCircuit::free(w, &ctx);
     res.p = resize(&p_new, w.p_width);
@@ -868,15 +915,25 @@ pub fn mepk_div_c(
     // `e'` from the wide quotient's bit-length (zero case handled inside).
     let p_new = x1.p.min_c(&x2.p);
     let e_new = result_exp_c(&_q_wide, &q_lsb, &p_new, w);
-    // `D = e1 - e2 + max(k1-p1, k2-p2) + 3`.
-    let three = IntCircuit::constant(3, ew, &ctx);
+    // B3: `D = e1 - e2 + M + extra` with `M = max(u1, u2)` and
+    // `extra = 2` iff `|u1 - u2| >= 2`, else 3 (mirror of `int_ext::div_d`).
+    // `close` ⟺ both diffs ≤ 1.
+    let two_ew = IntCircuit::constant(2, ew, &ctx);
+    let three_ew = IntCircuit::constant(3, ew, &ctx);
     let v1 = x1.k.sub(&x1.p, ew);
     let v2 = x2.k.sub(&x2.p, ew);
+    let d12 = v1.widen_sub(&v2);
+    let d21 = v2.widen_sub(&v1);
+    let close = ctx.and(&[
+        d12.lt(&IntCircuit::constant(2, d12.width() as u32, &ctx)),
+        d21.lt(&IntCircuit::constant(2, d21.width() as u32, &ctx)),
+    ]);
+    let extra = three_ew.choice(close, &two_ew);
     let d_exp = x1
         .e
         .sub(&x2.e, ew)
         .add(&v1.max_c(&v2), ew)
-        .add(&three, ew);
+        .add(&extra, ew);
     // P0-1: `D' = max(D, Q) + 1` with `Q = q_lsb - 1` (pre-rounding
     // exponent folded into the input-error budget); `k' = combine_k(D', B)`.
     let b = e_new.sub(&p_new, ew);
@@ -918,22 +975,59 @@ mod tests {
     }
 
     #[test]
+    fn valid_predicate() {
+        // Normalized inputs are Valid; zero allows any e.
+        assert!(Mepk::new(200, 5, 8, 1).unwrap().is_valid(None));
+        assert!(Mepk::new(0, 99, 8, 1).unwrap().is_valid(None));
+        // Denormalized (|m| outside [2^(p-1), 2^p)), k < 0, k >= p reject.
+        assert!(!Mepk::new(100, 6, 8, 1).unwrap().is_valid(None));
+        assert!(!Mepk::new(16, 2, 4, 0).unwrap().is_valid(None));
+        assert!(!Mepk::new(8, 2, 4, -1).unwrap().is_valid(None));
+        assert!(!Mepk::new(8, 2, 4, 4).unwrap().is_valid(None));
+        // Lane cap.
+        assert!(!Mepk::new(200, 5, 8, 1).unwrap().is_valid(Some(5)));
+        assert!(Mepk::new(200, 5, 8, 1).unwrap().is_valid(Some(8)));
+        // Validating constructor agrees.
+        assert!(Mepk::new_valid(200, 5, 8, 1, None).is_some());
+        assert!(Mepk::new_valid(100, 6, 8, 1, None).is_none());
+        assert!(Mepk::new_valid(8, 2, 4, 4, None).is_none());
+    }
+
+    #[test]
+    fn oracle_rejects_non_valid_inputs() {
+        // Denormalized inputs are refused (GIGO-as-None); outputs stay
+        // normalized even on precision loss (k' >= p' is returned, not None).
+        let bad = Mepk::new(100, 6, 8, 1).unwrap();
+        let ok = Mepk::new(200, 3, 8, 1).unwrap();
+        assert!(mepk_add(&bad, &ok, 1).is_none());
+        assert!(mepk_mul(&bad, &ok).is_none());
+        assert!(mepk_div(&ok, &bad, 4).is_none());
+        // k >= p inputs flow through so CEGAR can observe precision loss.
+        let loose = Mepk::new(200, 5, 8, 8).unwrap();
+        let r = mepk_add(&loose, &ok, 1).unwrap();
+        assert!(int_ext::is_normalized(r.m, r.p));
+    }
+
+    #[test]
     fn concrete_add_matches_java_oracle() {
-        // MepkOpsTest.addSubKRule: x1=(100,6,8,1), x2=(50,5,8,2).
-        let x1 = Mepk::new(100, 6, 8, 1).unwrap();
-        let x2 = Mepk::new(50, 5, 8, 2).unwrap();
+        // Valid-normalized form of MepkOpsTest.addSubKRule
+        // (denormalized (100,6,8,1)/(50,5,8,2) scaled to p=8 range):
+        // x1=(200,5,8,1) centre 50, x2=(200,3,8,2) centre 12.5.
+        let x1 = Mepk::new(200, 5, 8, 1).unwrap();
+        let x2 = Mepk::new(200, 3, 8, 2).unwrap();
+        assert!(x1.is_valid(None) && x2.is_valid(None));
         let s = mepk_add(&x1, &x2, 1).unwrap();
-        // lsb1 = -1, lsb2 = -2, ell = -2, d1 = 1, d2 = 0.
-        // total = 200 + 50 = 250, p' = 8.
+        // lsb1 = -2, lsb2 = -4, ell = -4, d1 = 2, d2 = 0.
+        // total = 800 + 200 = 1000, p' = 8.
         assert_eq!(s.p, 8);
-        // A = ell + max(k1+d1, k2+d2) = -2 + max(2, 2).
-        let a = -2 + 2;
+        // A = ell + max(k1+d1, k2+d2) = -4 + max(3, 2).
+        let a = -4 + 3;
         let b = s.e - 8;
         assert_eq!(s.k, int_ext::combine_k(a, b));
         // Centre within rounding error of the exact sum (both in 2^ell
         // units; the Lemma 1 bound in the same units is 2^(e'-p'-ell)).
-        let ell = -2;
-        let exact = 100i128 * 2 + 50;
+        let ell = -4;
+        let exact = 200i128 * 4 + 200;
         let got = s.m << ((s.e - 8 + 1) - ell);
         let err = (exact - got).abs();
         let exp = (s.e - 8) - ell;
@@ -942,16 +1036,20 @@ mod tests {
 
     #[test]
     fn concrete_div_rejects_bad_denominator() {
-        let num = Mepk::new(100, 6, 8, 1).unwrap();
+        let num = Mepk::new(200, 5, 8, 1).unwrap();
+        // Intentionally non-Valid denominator (denormalized, k >= p):
+        // division must refuse it.
         let bad = Mepk::new(50, 5, 4, 4).unwrap();
+        assert!(!bad.is_valid(None));
         assert!(mepk_div(&num, &bad, 4).is_none());
-        let ok = Mepk::new(50, 5, 8, 1).unwrap();
+        assert!(Mepk::new_valid(50, 5, 4, 4, None).is_none());
+        let ok = Mepk::new(200, 3, 8, 1).unwrap();
         let r = mepk_div(&num, &ok, 4).unwrap();
-        // D = (e1-e2) + max(k1-p1, k2-p2) + 3 = 1 + (-7) + 3 = -3;
-        // Q = q_lsb - 1 = (lsb1-lsb2-guard) - 1 = (-1+2-4) - 1 = -4;
-        // D' = max(D, Q) + 1 = -2.
-        let d_star = (6 - 5) + (1 - 8).max(1 - 8) + 3;
-        let d_star = d_star.max(-1 + 2 - 4 - 1) + 1;
+        // D = (e1-e2) + max(k1-p1, k2-p2) + 3 = 2 + (-7) + 3 = -2;
+        // Q = q_lsb - 1 = (lsb1-lsb2-guard) - 1 = (-2+4-4) - 1 = -3;
+        // D' = max(D, Q) + 1 = -1.
+        let d_star = (5 - 3) + (1 - 8).max(1 - 8) + 3;
+        let d_star = d_star.max(-2 + 4 - 4 - 1) + 1;
         assert_eq!(r.k, int_ext::combine_k(d_star, r.e - r.p as i32));
     }
 
@@ -1024,6 +1122,8 @@ mod tests {
         let mut min_slack = i32::MAX;
         let mut guard_seen = [false; 7];
         let mut checked = 0u32;
+        // B3 coverage: tight branch (`|u1-u2| >= 2`) must fire.
+        let mut tight_fired = 0u32;
         for _ in 0..30000 {
             let p1 = 1 + (next() % 6) as u32;
             let p2 = 1 + (next() % 6) as u32;
@@ -1062,6 +1162,9 @@ mod tests {
             };
             guard_seen[g as usize] = true;
             checked += 1;
+            if ((x1.k - x1.p as i32) - (x2.k - x2.p as i32)).abs() >= 2 {
+                tight_fired += 1;
+            }
             if r.m != 0 {
                 let d = int_ext::div_d(x1.e, x2.e, x1.k, x1.p as i32, x2.k, x2.p as i32);
                 min_slack = min_slack.min(d - (r.e - r.p as i32));
@@ -1122,6 +1225,110 @@ mod tests {
         assert!(
             min_slack <= 3,
             "near-tight slack region (D-B <= 3) not exercised: min={min_slack}"
+        );
+        assert!(
+            tight_fired > checked / 4,
+            "B3 tight branch under-exercised: {tight_fired}/{checked}"
+        );
+    }
+
+    /// B2 soundness fuzz: `|x1·x2 − c'| ≤ R'` over the four boundary
+    /// corners (`δ = ±R`), mirroring [`div_two_stage_sound_fuzz`].
+    /// `|x1s·x2s − K·2^-lo| ≤ 2^(rn−2lo)` with `K = m·2^(lsb'−lo)`
+    /// (all shifts non-negative: `lo ≤ 0` forced, overflow samples skipped).
+    /// Also gates B2 coverage: the tight branch must fire.
+    #[test]
+    fn mul_tight_sound_fuzz() {
+        let mut s: u64 = 0xB2C4D2;
+        let mut next = move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s = s.wrapping_mul(0x2545F4914F6CDD1D);
+            s
+        };
+        let (mut checked, mut tight_fired) = (0u32, 0u32);
+        for _ in 0..30000 {
+            let p1 = 1 + (next() % 6) as u32;
+            let p2 = 1 + (next() % 6) as u32;
+            let e1 = (next() % 7) as i32 - 3;
+            let e2 = (next() % 7) as i32 - 3;
+            let mag1 = if next() & 7 == 0 {
+                0
+            } else {
+                (1u128 << (p1 - 1)) + (next() as u128 % (1u128 << (p1 - 1)))
+            };
+            let mag2 = if next() & 7 == 0 {
+                0
+            } else {
+                (1u128 << (p2 - 1)) + (next() as u128 % (1u128 << (p2 - 1)))
+            };
+            let m1 = if next() & 1 == 1 { -(mag1 as i128) } else { mag1 as i128 };
+            let m2 = if next() & 1 == 1 { -(mag2 as i128) } else { mag2 as i128 };
+            // Huge-error shapes allowed (`k` may exceed `p`).
+            let k1 = (next() % (p1 as u64 + 3)) as i32;
+            let k2 = (next() % (p2 as u64 + 3)) as i32;
+            let (x1, x2) = match (Mepk::new(m1, e1, p1, k1), Mepk::new(m2, e2, p2, k2)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue,
+            };
+            let r = match mepk_mul(&x1, &x2) {
+                Some(v) => v,
+                None => continue,
+            };
+            checked += 1;
+            let t1 = x1.k - x1.p as i32 + 1;
+            let t2 = x2.k - x2.p as i32 + 1;
+            let t3 = (x1.k + x2.k) - (x1.p as i32 + x2.p as i32);
+            let m = t1.max(t2).max(t3);
+            let second = t1.min(t2).max(t2.min(t3)).max(t1.min(t3));
+            if m - second >= 2 {
+                tight_fired += 1;
+            }
+            let (lsb1, r1, lsb2, r2) = (x1.lsb(), x1.radius_exp(), x2.lsb(), x2.radius_exp());
+            let lsbn = r.e - r.p as i32 + 1;
+            let rn = r.e - r.p as i32 + r.k;
+            let lo = 0.min(lsb1).min(r1).min(lsb2).min(r2).min(lsbn).min(rn);
+            let sc = |v: i128, e: i32| v.checked_shl((e - lo) as u32);
+            let (Some(m1s), Some(r1s), Some(m2s), Some(r2s), Some(k)) =
+                (sc(m1, lsb1), sc(1, r1), sc(m2, lsb2), sc(1, r2), sc(r.m, lsbn))
+            else {
+                continue;
+            };
+            let unscale = (-lo) as u32;
+            let rhs_pow = rn.checked_sub(2 * lo);
+            let (Some(k_un), Some(rhs_p)) = (k.checked_shl(unscale), rhs_pow.and_then(|p| {
+                if p >= 0 {
+                    1i128.checked_shl(p as u32)
+                } else {
+                    None
+                }
+            })) else {
+                continue;
+            };
+            for s1 in [-1i128, 1] {
+                for s2 in [-1i128, 1] {
+                    let (x1s, x2s) = (m1s + s1 * r1s, m2s + s2 * r2s);
+                    // `|x1s·x2s − k_un|` with `k_un = K·2^-lo`.
+                    let Some(diff) = x1s
+                        .checked_mul(x2s)
+                        .and_then(|p| p.checked_sub(k_un))
+                        .map(|d| d.abs())
+                    else {
+                        continue;
+                    };
+                    assert!(
+                        diff <= rhs_p,
+                        "mul unsound: x1=({m1},{e1},{p1},{k1}) x2=({m2},{e2},{p2},{k2}) r=({},{},{},{}) s1={s1} s2={s2}",
+                        r.m, r.e, r.p, r.k,
+                    );
+                }
+            }
+        }
+        assert!(checked > 20000, "fuzz sampled too few points");
+        assert!(
+            tight_fired > checked / 4,
+            "B2 tight branch under-exercised: {tight_fired}/{checked}"
         );
     }
 
