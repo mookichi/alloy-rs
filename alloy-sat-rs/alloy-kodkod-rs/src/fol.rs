@@ -747,6 +747,20 @@ impl<'a> FolTranslator<'a> {
                     IntBinOp::Xor => l.bit_xor(&r),
                     IntBinOp::Shl => l.shl(&r, bw),
                     IntBinOp::Shr => l.shr(&r, bw),
+                    IntBinOp::Min => l.min_c(&r),
+                    IntBinOp::Max => l.max_c(&r),
+                }
+            }
+            IntNode::Widen { op, left, right } => {
+                let l = self.int_expr(arena, left, env)?;
+                let r = self.int_expr(arena, right, env)?;
+                match op {
+                    // Exact widening arithmetic for scaled (interval)
+                    // comparisons: no truncation, no overflow flags (the
+                    // frontend sizes `Shl` widths from static lane ranges).
+                    crate::ast::WidenOp::Add => l.widen_add(&r),
+                    crate::ast::WidenOp::Sub => l.widen_sub(&r),
+                    crate::ast::WidenOp::Shl(width) => l.shl(&r, width),
                 }
             }
             IntNode::If { cond, then, els } => {

@@ -269,25 +269,36 @@ impl<'m> Lowerer<'m> {
                                 )?);
                             }
                         }
-                        // coverage: parent in union(kids)
-                        let mut union = {
-                            let first = rel_of(ctx, &kids[0])?;
-                            arena.expr_relation(first)
-                        };
-                        for k in &kids[1..] {
-                            let ke = arena.expr_relation(rel_of(ctx, k)?);
-                            union = arena
-                                .binary_expr(kk::BinaryOp::Union, union, ke)
+                        // coverage: parent in union(kids).
+                        // The builtin `EReal` is exempt: it is a
+                        // non-abstract value sort (like `Int`), so it may
+                        // hold direct atoms outside its extenders. Without
+                        // this, `one sig R extends EReal` plus a scope
+                        // would collapse `EReal` onto the extenders and
+                        // leave no room for literal witnesses or free
+                        // values (`for N EReal` would be silently
+                        // ignored). Abstract parents keep coverage (Java
+                        // parity); subset/disjoint apply everywhere.
+                        if p != "EReal" {
+                            let mut union = {
+                                let first = rel_of(ctx, &kids[0])?;
+                                arena.expr_relation(first)
+                            };
+                            for k in &kids[1..] {
+                                let ke = arena.expr_relation(rel_of(ctx, k)?);
+                                union = arena
+                                    .binary_expr(kk::BinaryOp::Union, union, ke)
+                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            }
+                            let pe2 = arena.expr_relation(pe);
+                            let diff = arena
+                                .binary_expr(kk::BinaryOp::Difference, pe2, union)
                                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            let some_diff = arena
+                                .multiplicity_formula(Multiplicity::Some, diff)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            parts.push(arena.not(some_diff));
                         }
-                        let pe2 = arena.expr_relation(pe);
-                        let diff = arena
-                            .binary_expr(kk::BinaryOp::Difference, pe2, union)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        let some_diff = arena
-                            .multiplicity_formula(Multiplicity::Some, diff)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        parts.push(arena.not(some_diff));
                     }
                     // Sig multiplicities on the shared EReal population are
                     // cardinality formulas (Java `BoundsComputer`: `one` /
@@ -1332,6 +1343,26 @@ impl<'a> Ctx<'a> {
         args: &[Expr],
         env: &mut Env,
     ) -> LResult<Option<FormulaId>> {
+        // Decimal literals in EReal value positions (`erealAdd[a, 2.5, c]`):
+        // hoist each literal to a fresh witness pinned by `setEReal`.
+        // `erealNeedsRefine` takes an integer goal second, so only its
+        // first arg hoists; `setEReal` keeps its literal second arg.
+        let hoist: &[usize] = match name {
+            "erealAdd" | "erealSub" | "erealMul" | "erealDiv" => &[0, 1, 2],
+            "erealExactEq" | "erealMayEq" | "erealCovers" | "erealLT" | "erealLTE"
+            | "erealMayLTE" => &[0, 1],
+            "erealWellformed" | "erealDivGuard" => &[0],
+            "erealNeedsRefine" => &[0],
+            _ => &[],
+        };
+        if !hoist.is_empty()
+            && hoist
+                .iter()
+                .any(|&i| i < args.len() && matches!(args[i], Expr::RealLit(..)))
+        {
+            let wrapped = self.wrap_ereal_lit_args(name, args, hoist)?;
+            return Ok(Some(self.lower_formula(arena, &wrapped, env)?));
+        }
         let body = match name {
             "erealAdd" | "erealSub" => {
                 if args.len() != 3 {
@@ -1369,18 +1400,142 @@ impl<'a> Ctx<'a> {
                 }
                 ereal_needs_refine(&args[0], &args[1])
             }
+            "erealExactEq" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
+                }
+                ereal_exact_eq(&args[0], &args[1])
+            }
+            "erealMayEq" | "erealCovers" | "erealLT" | "erealLTE" | "erealMayLTE" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
+                }
+                let wv = self.ereal_shift_width()?;
+                match name {
+                    "erealMayEq" => ereal_may_eq(&args[0], &args[1], wv),
+                    "erealCovers" => ereal_covers(&args[0], &args[1], wv),
+                    "erealLT" => ereal_lt(&args[0], &args[1], wv),
+                    "erealLTE" => ereal_lte(&args[0], &args[1], wv),
+                    _ => ereal_may_lte(&args[0], &args[1], wv),
+                }
+            }
             "setEReal" => {
                 if args.len() != 2 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
                 }
                 // Precision cap from the active widths (same default as
                 // `:mepk lit`: usable mantissa precision).
-                let max_p = self.res.mepk_widths.m_width.saturating_sub(1).max(1);
-                ereal_set(&args[0], &args[1], max_p)?
+                ereal_set(&args[0], &args[1], self.ereal_max_p())?
             }
             _ => return Ok(None),
         };
         Ok(Some(self.lower_formula(arena, &body, env)?))
+    }
+
+    /// Precision cap for decimal conversions (usable mantissa precision;
+    /// same default as `:mepk lit`).
+    fn ereal_max_p(&self) -> u32 {
+        self.res.mepk_widths.m_width.saturating_sub(1).max(1)
+    }
+
+    /// Static barrel width for scaled interval comparisons:
+    /// `wv = m_width + scale_spread + 2`, where `scale_spread` is the
+    /// widest representable gap between the `lsb`/`r` scale exponents
+    /// (from the lane-width ranges). Shift amounts never exceed the
+    /// spread and mantissae never exceed `m` bits, so every scaled edge
+    /// fits with sign room to spare. Absurdly wide lane configurations
+    /// fail loudly instead of hanging the solver.
+    fn ereal_shift_width(&self) -> LResult<u32> {
+        let w = &self.res.mepk_widths;
+        // Signed lane range for width n: [-2^(n-1), 2^(n-1)-1].
+        let range = |n: u32| -> (i128, i128) {
+            if n == 0 {
+                return (0, 0);
+            }
+            if n > 120 {
+                return (i128::MIN, i128::MAX);
+            }
+            let h = 1i128 << (n - 1);
+            (-h, h - 1)
+        };
+        let (e_lo, e_hi) = range(w.e_width);
+        let (p_lo, p_hi) = range(w.p_width);
+        let (k_lo, k_hi) = range(w.k_width);
+        // lsb = e-p+1, r = e-p+k.
+        let lo = (e_lo - p_hi + 1).min(e_lo - p_hi + k_lo);
+        let hi = (e_hi - p_lo + 1).max(e_hi - p_lo + k_hi);
+        let spread = (hi - lo).max(0) as u64;
+        let wv = (w.m_width as u64).saturating_add(spread).saturating_add(2);
+        if wv > 256 {
+            return Err(FrontError::Resolve(format!(
+                "interval comparison needs {wv}-bit shifts (m={}, scale spread={spread}); narrow MEPK_*_WIDTH so that m_width + spread + 2 <= 256",
+                w.m_width,
+            )));
+        }
+        Ok(wv as u32)
+    }
+
+    /// Mint a collision-free witness name (`$` is banned in user bindings).
+    fn fresh_elit(&self) -> String {
+        let n = self.pin_seq.get();
+        self.pin_seq.set(n + 1);
+        format!("$elit{n}")
+    }
+
+    /// Rewrite `pred[.., lit, ..]` to
+    /// `some $elitN: EReal | setEReal[$elitN, lit] and ... and pred[..]`
+    /// for each literal at a hoistable position. The re-emitted call goes
+    /// back through lowering (one level; the inner call holds no literals
+    /// and terminates in the predicate desugar below).
+    fn wrap_ereal_lit_args(
+        &self,
+        name: &str,
+        args: &[Expr],
+        hoist: &[usize],
+    ) -> LResult<Formula> {
+        let mut conj: Option<Formula> = None;
+        let mut new_args = args.to_vec();
+        // Minted witnesses, in first-seen order (flat single decl works
+        // since every minted name is unique).
+        let mut names: Vec<String> = Vec::new();
+        for &i in hoist {
+            if i >= new_args.len() {
+                continue;
+            }
+            if let Expr::RealLit(s, _) = &new_args[i] {
+                let fresh = self.fresh_elit();
+                let target = Expr::Name(fresh.clone(), 0);
+                let lit = Expr::RealLit(s.clone(), 0);
+                // Out-of-range literals fail loudly here, as in `setEReal`.
+                let set = ereal_set(&target, &lit, self.ereal_max_p())?;
+                conj = Some(match conj {
+                    Some(c) => Formula::And(Box::new(c), Box::new(set)),
+                    None => set,
+                });
+                new_args[i] = target;
+                names.push(fresh);
+            }
+        }
+        // Arity errors (if any) surface when the inner call lowers.
+        let inner = Formula::Call(name.to_string(), new_args, 0);
+        let body = match conj {
+            Some(c) => Formula::And(Box::new(c), Box::new(inner)),
+            None => inner,
+        };
+        if names.is_empty() {
+            return Ok(body);
+        }
+        Ok(Formula::Quant(
+            QuantKind::Some,
+            vec![Decl {
+                disj: false,
+                names,
+                expr: Expr::Name("EReal".to_string(), 0),
+                pos: 0,
+                is_var: false,
+            }],
+            Box::new(body),
+        ))
     }
 
     fn try_ordering_pred(
@@ -2048,6 +2203,58 @@ impl<'a> Ctx<'a> {
         Ok(None)
     }
 
+    /// Decimal-literal value equality: `R = 1.2` / `R != 1.2` rewrite to
+    /// the lane equalities (`setEReal`), since `extends` siblings are
+    /// disjoint as sets and atom identity could never hold. Literal-vs-
+    /// literal compares oracle conversions directly. A literal against an
+    /// integer lane read (`x.m = 3.14`) stays a loud error: lanes hold
+    /// integers. Returns None when neither side is a decimal literal.
+    fn rewrite_ereal_lit_cmp(
+        &self,
+        kind: &CmpKind,
+        l: &Expr,
+        r: &Expr,
+    ) -> LResult<Option<Formula>> {
+        let neg = match kind {
+            CmpKind::Eq => false,
+            CmpKind::Neq => true,
+            _ => return Ok(None),
+        };
+        let max_p = self.ereal_max_p();
+        match (l, r) {
+            (Expr::RealLit(s1, _), Expr::RealLit(s2, _)) => {
+                let c1 = decimal_to_mepk(s1, max_p).ok_or_else(|| {
+                    FrontError::Resolve(format!(
+                        "cannot convert {s1:?} (malformed or outside the i128 oracle range)"
+                    ))
+                })?;
+                let c2 = decimal_to_mepk(s2, max_p).ok_or_else(|| {
+                    FrontError::Resolve(format!(
+                        "cannot convert {s2:?} (malformed or outside the i128 oracle range)"
+                    ))
+                })?;
+                let eq = c1.v == c2.v;
+                Ok(Some(Formula::Const(if neg { !eq } else { eq })))
+            }
+            (Expr::RealLit(..), other) | (other, Expr::RealLit(..)) => {
+                let lit = if matches!(l, Expr::RealLit(..)) { l } else { r };
+                if self.lane_group_of(other).is_some() {
+                    return Err(FrontError::Resolve(
+                        "type mismatch: decimal literals cannot appear in integer lane position (e.g. `x.m = 3.14`); compare EReal values instead"
+                            .to_string(),
+                    ));
+                }
+                let body = ereal_set(other, lit, max_p)?;
+                Ok(Some(if neg {
+                    Formula::Not(Box::new(body))
+                } else {
+                    body
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn field_int_flavored(&self, e: &Expr) -> Option<SetKind> {
         let field = trailing_field_name(e)?;
         if field == "int" || field == "Int" || field == "Signed" || field == "MSB" {
@@ -2267,7 +2474,7 @@ impl<'a> Ctx<'a> {
             }
             Expr::RealLit(..) => {
                 return Err(FrontError::Resolve(
-                    "decimal literals are only valid inside `setEReal`".to_string(),
+                    "decimal literals are only valid in EReal value positions (`=`, `!=`, `setEReal`, `erealAdd`/`erealSub`/`erealMul`/`erealDiv`/`erealExactEq`/`erealMayEq`/`erealCovers`/`erealLT`/`erealLTE`/`erealMayLTE`/`erealWellformed`/`erealDivGuard`)".to_string(),
                 ));
             }
             Expr::Name(n, pos) => {
@@ -2728,8 +2935,21 @@ impl<'a> Ctx<'a> {
                     IntBinOp::Mul => kk::IntBinOp::Times,
                     IntBinOp::Div => kk::IntBinOp::Divide,
                     IntBinOp::Rem => kk::IntBinOp::Modulo,
+                    IntBinOp::Min => kk::IntBinOp::Min,
+                    IntBinOp::Max => kk::IntBinOp::Max,
+                    IntBinOp::Shl => kk::IntBinOp::Shl,
                 };
                 arena.binary_int(kop, ia, ib)
+            }
+            IntExpr::Widen(op, a, b) => {
+                let ia = self.lower_int(arena, a, env)?;
+                let ib = self.lower_int(arena, b, env)?;
+                let kop = match op {
+                    WidenOp::Add => kk::WidenOp::Add,
+                    WidenOp::Sub => kk::WidenOp::Sub,
+                    WidenOp::Shl(w) => kk::WidenOp::Shl(*w),
+                };
+                arena.widen_int(kop, ia, ib)
             }
         })
     }
@@ -3098,12 +3318,16 @@ impl<'a> Ctx<'a> {
                 arena.bool_formula(true)
             }
             Formula::Cmp(kind, l, r, _) => {
-                // Lane-vs-literal equality (`x.m = 3`): the parser reads
-                // this relationally (literal as an Int-atom bitset, whose
-                // domain never meets the lane atoms), so rewrite to the
-                // integer reading (`BitsIn` vs literal). Other shapes keep
-                // the legacy relational reading.
+                // Decimal-literal value equality (`R = 1.2`): the literal
+                // denotes an EReal *value* (lane equalities, i.e.
+                // `setEReal`), since `extends` siblings are disjoint as
+                // sets. Lane-vs-literal (`x.m = 3`) keeps the integer
+                // reading below; other shapes keep the legacy relational
+                // reading.
                 if matches!(kind, CmpKind::Eq | CmpKind::Neq) {
+                    if let Some(rw) = self.rewrite_ereal_lit_cmp(kind, l, r)? {
+                        return self.lower_formula(arena, &rw, env);
+                    }
                     if let Some(rw) = self.rewrite_lane_lit_cmp(kind, l, r)? {
                         return self.lower_formula(arena, &rw, env);
                     }
@@ -3607,6 +3831,11 @@ fn subst_int(i: &IntExpr, from: &str, to: &str) -> IntExpr {
             Box::new(subst_int(a, from, to)),
             Box::new(subst_int(b, from, to)),
         ),
+        IntExpr::Widen(op, a, b) => IntExpr::Widen(
+            *op,
+            Box::new(subst_int(a, from, to)),
+            Box::new(subst_int(b, from, to)),
+        ),
         IntExpr::Val(e, p) => IntExpr::Val(Box::new(subst_expr(e, from, to)), *p),
         IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(subst_expr(e, from, to)), *p),
         IntExpr::BitsVal(e, p) => IntExpr::BitsVal(Box::new(subst_expr(e, from, to)), *p),
@@ -3878,6 +4107,10 @@ fn scan_total_order_intexpr(e: &IntExpr, out: &mut Vec<(String, String)>) {
             scan_total_order_intexpr(a, out);
             scan_total_order_intexpr(b, out);
         }
+        IntExpr::Widen(_, a, b) => {
+            scan_total_order_intexpr(a, out);
+            scan_total_order_intexpr(b, out);
+        }
         IntExpr::Sum(ds, body, _) => {
             for d in ds {
                 scan_total_order_expr(&d.expr, out);
@@ -4006,6 +4239,148 @@ fn ereal_wellformed(x: &Expr) -> Formula {
 
 fn ereal_div_guard(d: &Expr) -> Formula {
     ereal_icmp(IntCmpOp::Lt, ereal_lane(d, "k"), ereal_lane(d, "p"))
+}
+
+/// Value identity: all four lanes agree (plus wellformedness, like the
+/// arithmetic predicates). `extends` siblings are disjoint as *sets*,
+/// so this is the usable equality for EReal values.
+fn ereal_exact_eq(a: &Expr, b: &Expr) -> Formula {
+    let mut parts = vec![ereal_wellformed(a), ereal_wellformed(b)];
+    for lane in ["m", "e", "p", "k"] {
+        parts.push(ereal_icmp(
+            IntCmpOp::Eq,
+            ereal_lane(a, lane),
+            ereal_lane(b, lane),
+        ));
+    }
+    ereal_and_all(parts)
+}
+
+// ---- scaled interval comparisons ----------------------------------------
+// An EReal value denotes the closed interval `[lo, hi]` with centre
+// `c = m*2^lsb` (`lsb = e-p+1`) and radius `R = 2^r` (`r = e-p+k`).
+// Comparing edges (`hiA <= loB`, ...) needs a common binary point: both
+// sides are scaled by `2^s0` (`s0` = min of the four scale exponents) so
+// every shift amount is non-negative. Shifts run in a statically-sized
+// barrel (`wv = m_width + scale_spread + 2`, guarded below); sums grow
+// exactly. Fixed-width circuits could never hold this (a mantissa
+// already spans the problem bitwidth), hence the widening layer.
+
+/// `lsb(x) = e - p + 1`, exact widening arithmetic.
+fn ereal_lsb_wide(x: &Expr) -> IntExpr {
+    IntExpr::Widen(
+        WidenOp::Add,
+        Box::new(IntExpr::Widen(
+            WidenOp::Sub,
+            Box::new(ereal_lane(x, "e")),
+            Box::new(ereal_lane(x, "p")),
+        )),
+        Box::new(IntExpr::Lit(1, 0)),
+    )
+}
+
+/// `r(x) = e - p + k`: exponent of the error radius (`R = 2^r`).
+fn ereal_r_exp(x: &Expr) -> IntExpr {
+    IntExpr::Widen(
+        WidenOp::Add,
+        Box::new(IntExpr::Widen(
+            WidenOp::Sub,
+            Box::new(ereal_lane(x, "e")),
+            Box::new(ereal_lane(x, "p")),
+        )),
+        Box::new(ereal_lane(x, "k")),
+    )
+}
+
+fn ereal_wadd(a: IntExpr, b: IntExpr) -> IntExpr {
+    IntExpr::Widen(WidenOp::Add, Box::new(a), Box::new(b))
+}
+
+fn ereal_wsub(a: IntExpr, b: IntExpr) -> IntExpr {
+    IntExpr::Widen(WidenOp::Sub, Box::new(a), Box::new(b))
+}
+
+fn ereal_wshl(v: IntExpr, d: IntExpr, wv: u32) -> IntExpr {
+    IntExpr::Widen(WidenOp::Shl(wv), Box::new(v), Box::new(d))
+}
+
+fn ereal_min(a: IntExpr, b: IntExpr) -> IntExpr {
+    IntExpr::Bin(IntBinOp::Min, Box::new(a), Box::new(b))
+}
+
+/// One scaled interval-edge comparison:
+/// `mA*2^lsbA + s1*2^rA  OP  mB*2^lsbB + s2*2^rB`
+/// with `s1, s2 ∈ {+1 (hi edge), -1 (lo edge)}` and `OP ∈ {Lt, Lte}`.
+fn ereal_scaled_cmp(a: &Expr, b: &Expr, s1: i64, s2: i64, op: IntCmpOp, wv: u32) -> Formula {
+    let lsb_a = ereal_lsb_wide(a);
+    let r_a = ereal_r_exp(a);
+    let lsb_b = ereal_lsb_wide(b);
+    let r_b = ereal_r_exp(b);
+    let s0 = ereal_min(
+        ereal_min(lsb_a.clone(), r_a.clone()),
+        ereal_min(lsb_b.clone(), r_b.clone()),
+    );
+    let edge = |m: IntExpr, lsb: IntExpr, r: IntExpr, s: i64| {
+        let c = ereal_wshl(m, ereal_wsub(lsb, s0.clone()), wv);
+        let rad = ereal_wshl(IntExpr::Lit(1, 0), ereal_wsub(r, s0.clone()), wv);
+        if s > 0 {
+            ereal_wadd(c, rad)
+        } else {
+            ereal_wsub(c, rad)
+        }
+    };
+    let lhs = edge(ereal_lane(a, "m"), lsb_a, r_a, s1);
+    let rhs = edge(ereal_lane(b, "m"), lsb_b, r_b, s2);
+    Formula::IntCmp(op, lhs, rhs, 0)
+}
+
+/// Closed-interval overlap: `loA<=hiB and loB<=hiA` (endpoint contact
+/// counts).
+fn ereal_may_eq(a: &Expr, b: &Expr, wv: u32) -> Formula {
+    ereal_and_all(vec![
+        ereal_wellformed(a),
+        ereal_wellformed(b),
+        ereal_scaled_cmp(a, b, -1, 1, IntCmpOp::Lte, wv),
+        ereal_scaled_cmp(b, a, -1, 1, IntCmpOp::Lte, wv),
+    ])
+}
+
+/// Containment (A covers B, equal intervals count): `loA<=loB and hiB<=hiA`.
+fn ereal_covers(a: &Expr, b: &Expr, wv: u32) -> Formula {
+    ereal_and_all(vec![
+        ereal_wellformed(a),
+        ereal_wellformed(b),
+        ereal_scaled_cmp(a, b, -1, -1, IntCmpOp::Lte, wv),
+        ereal_scaled_cmp(b, a, 1, 1, IntCmpOp::Lte, wv),
+    ])
+}
+
+/// Strictly below: `hiA < loB`.
+fn ereal_lt(a: &Expr, b: &Expr, wv: u32) -> Formula {
+    ereal_and_all(vec![
+        ereal_wellformed(a),
+        ereal_wellformed(b),
+        ereal_scaled_cmp(a, b, 1, -1, IntCmpOp::Lt, wv),
+    ])
+}
+
+/// Below or touching: `hiA <= loB`.
+fn ereal_lte(a: &Expr, b: &Expr, wv: u32) -> Formula {
+    ereal_and_all(vec![
+        ereal_wellformed(a),
+        ereal_wellformed(b),
+        ereal_scaled_cmp(a, b, 1, -1, IntCmpOp::Lte, wv),
+    ])
+}
+
+/// A's upper end lies in B's range: `loB<=hiA<=hiB`.
+fn ereal_may_lte(a: &Expr, b: &Expr, wv: u32) -> Formula {
+    ereal_and_all(vec![
+        ereal_wellformed(a),
+        ereal_wellformed(b),
+        ereal_scaled_cmp(b, a, -1, 1, IntCmpOp::Lte, wv),
+        ereal_scaled_cmp(a, b, 1, 1, IntCmpOp::Lte, wv),
+    ])
 }
 
 fn ereal_needs_refine(x: &Expr, g: &Expr) -> Formula {
@@ -4703,6 +5078,11 @@ fn replace_var_int(i: &IntExpr, from: &str, to: &Expr) -> IntExpr {
             *p,
         ),
         IntExpr::Bin(op, a, b) => IntExpr::Bin(
+            *op,
+            Box::new(replace_var_int(a, from, to)),
+            Box::new(replace_var_int(b, from, to)),
+        ),
+        IntExpr::Widen(op, a, b) => IntExpr::Widen(
             *op,
             Box::new(replace_var_int(a, from, to)),
             Box::new(replace_var_int(b, from, to)),

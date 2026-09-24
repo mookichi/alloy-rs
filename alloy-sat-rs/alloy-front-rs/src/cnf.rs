@@ -221,6 +221,10 @@ pub fn unconstrained_relations(
                     self.int(left);
                     self.int(right);
                 }
+                IntNode::Widen { left, right, .. } => {
+                    self.int(left);
+                    self.int(right);
+                }
                 IntNode::If { cond, then, els } => {
                     self.formula(cond);
                     self.int(then);

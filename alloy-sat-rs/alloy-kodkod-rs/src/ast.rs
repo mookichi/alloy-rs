@@ -112,6 +112,9 @@ pub enum IntBinOp {
     Xor,
     Shl,
     Shr,
+    /// Signed minimum/maximum (choice-based, width-preserving).
+    Min,
+    Max,
 }
 
 impl IntBinOp {
@@ -127,6 +130,8 @@ impl IntBinOp {
             IntBinOp::Xor => "^",
             IntBinOp::Shl => "<<",
             IntBinOp::Shr => ">>>",
+            IntBinOp::Min => "min",
+            IntBinOp::Max => "max",
         }
     }
 }
@@ -340,6 +345,16 @@ pub enum IntNode {
         left: IntId,
         right: IntId,
     },
+    /// Exact widening integer operation for scaled (interval) arithmetic.
+    /// Unlike [`IntNode::Binary`] (fixed problem-bitwidth, wrapping),
+    /// `Add`/`Sub` grow exactly (`max(w1, w2) + 1` bits) and `Shl` builds
+    /// a `width`-bit barrel shift (exact when the true value fits, which
+    /// the frontend guarantees by construction from static lane ranges).
+    Widen {
+        op: WidenOp,
+        left: IntId,
+        right: IntId,
+    },
     If {
         cond: FormulaId,
         then: IntId,
@@ -349,6 +364,15 @@ pub enum IntNode {
         decls: DeclsId,
         body: IntId,
     },
+}
+
+/// Widening integer operator (see [`IntNode::Widen`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WidenOp {
+    Add,
+    Sub,
+    /// Variable shift-left with explicit exact output width in bits.
+    Shl(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -784,6 +808,12 @@ impl AstArena {
         id
     }
 
+    pub fn widen_int(&mut self, op: WidenOp, left: IntId, right: IntId) -> IntId {
+        let id = IntId(self.ints.len() as u32);
+        self.ints.push(IntNode::Widen { op, left, right });
+        id
+    }
+
     pub fn if_int(&mut self, cond: FormulaId, then: IntId, els: IntId) -> IntId {
         let id = IntId(self.ints.len() as u32);
         self.ints.push(IntNode::If { cond, then, els });
@@ -931,6 +961,11 @@ pub fn subst_relation_int(
             let l = subst_relation_int(arena, left, map);
             let r = subst_relation_int(arena, right, map);
             arena.binary_int(op, l, r)
+        }
+        IntNode::Widen { op, left, right } => {
+            let l = subst_relation_int(arena, left, map);
+            let r = subst_relation_int(arena, right, map);
+            arena.widen_int(op, l, r)
         }
         IntNode::If { cond, then, els } => {
             let c = subst_relation_formula(arena, cond, map);

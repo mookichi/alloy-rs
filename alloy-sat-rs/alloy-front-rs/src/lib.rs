@@ -511,6 +511,10 @@ fn collect_opt_relations(
                 int(arena, left, out);
                 int(arena, right, out);
             }
+            IntNode::Widen { left, right, .. } => {
+                int(arena, left, out);
+                int(arena, right, out);
+            }
             IntNode::If { cond, then, els } => {
                 formula(arena, cond, out);
                 int(arena, then, out);

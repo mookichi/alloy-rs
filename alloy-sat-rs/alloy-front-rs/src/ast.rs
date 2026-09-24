@@ -68,8 +68,9 @@ pub enum Expr {
     /// the E-bit wrap of n is set}`, so `Bits(7)` is `{0, 1, 2}`. Built by
     /// the parser for `=`/`!=` with a numeric-literal side.
     Bits(i64, usize),
-    /// Decimal real literal: exact source text (e.g. `3.14`), only valid
-    /// inside `setEReal` (rejected at lowering elsewhere). Never rounded.
+    /// Decimal real literal: exact source text (e.g. `3.14`), denoting an
+    /// EReal *value* in `=`/`!=`, `setEReal`, and the `ereal*` predicates
+    /// (rejected at lowering elsewhere). Never rounded.
     RealLit(String, usize),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Transpose(Box<Expr>),
@@ -134,6 +135,22 @@ pub enum IntBinOp {
     Mul,
     Div,
     Rem,
+    /// Signed minimum / maximum (desugar-internal; lowers to the
+    /// choice-based circuit, never wraps).
+    Min,
+    Max,
+    /// Variable shift-left (desugar-internal; lowers to the barrel
+    /// shifter at the problem bitwidth).
+    Shl,
+}
+
+/// Widening integer operator (see [`IntExpr::Widen`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WidenOp {
+    Add,
+    Sub,
+    /// Variable shift-left with explicit exact output width in bits.
+    Shl(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -152,6 +169,10 @@ pub enum IntExpr {
     Card(Box<Expr>, usize),
     Sum(Vec<Decl>, Box<IntExpr>, usize),
     Bin(IntBinOp, Box<IntExpr>, Box<IntExpr>),
+    /// Exact widening operation (desugar-internal, for scaled interval
+    /// arithmetic): `Add`/`Sub` grow exactly instead of wrapping at the
+    /// problem bitwidth, and `Shl(w)` builds a `w`-bit barrel shift.
+    Widen(WidenOp, Box<IntExpr>, Box<IntExpr>),
     /// A set-typed expression used in integer position (variable, join,
     /// ...). Lowers via the SUM cast, mirroring Java's `typecheck_as_int`
     /// (Kodkod `ExprToIntCast` with `SUM`): a singleton's value, else the
@@ -179,6 +200,7 @@ impl IntExpr {
             IntExpr::Card(..) => true,
             IntExpr::Sum(..) => true,
             IntExpr::Bin(_, a, b) => a.int_typed() && b.int_typed(),
+            IntExpr::Widen(_, a, b) => a.int_typed() && b.int_typed(),
             IntExpr::Val(..) => false,
             IntExpr::SumOf(..) => true,
             IntExpr::BitsVal(..) => true,
@@ -214,6 +236,7 @@ impl IntExpr {
             IntExpr::Lit(..) | IntExpr::Card(..) | IntExpr::SumOf(..) => true,
             IntExpr::Val(e, _) => matches!(&**e, Expr::Name(n, _) if n == "MSB"),
             IntExpr::Bin(_, a, b) => a.bare_int() && b.bare_int(),
+            IntExpr::Widen(_, a, b) => a.bare_int() && b.bare_int(),
             IntExpr::Sum(_, body, _) => body.bare_int(),
             IntExpr::BitsVal(..) => false,
         }
@@ -235,6 +258,7 @@ impl IntExpr {
             | IntExpr::BitsVal(..) => true,
             IntExpr::Val(..) => false,
             IntExpr::Bin(_, a, b) => a.mixed_int() || b.mixed_int(),
+            IntExpr::Widen(_, a, b) => a.mixed_int() || b.mixed_int(),
         }
     }
     /// Rewind-to-relational test for an integer LEFT of `in`: a brace-pure
@@ -538,6 +562,7 @@ impl IntExpr {
                 body.has_temporal() || decls.iter().any(|d| d.expr.has_temporal())
             }
             IntExpr::Bin(_, a, b) => a.has_temporal() || b.has_temporal(),
+            IntExpr::Widen(_, a, b) => a.has_temporal() || b.has_temporal(),
             IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => e.has_temporal(),
             IntExpr::Lit(..) => false,
         }
@@ -552,6 +577,7 @@ impl IntExpr {
                 body.has_soft() || decls.iter().any(|d| d.expr.has_soft())
             }
             IntExpr::Bin(_, a, b) => a.has_soft() || b.has_soft(),
+            IntExpr::Widen(_, a, b) => a.has_soft() || b.has_soft(),
             IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => e.has_soft(),
             IntExpr::Lit(..) => false,
         }
@@ -566,6 +592,7 @@ impl IntExpr {
                 body.has_opt_marker() || decls.iter().any(|d| d.expr.has_opt_marker())
             }
             IntExpr::Bin(_, a, b) => a.has_opt_marker() || b.has_opt_marker(),
+            IntExpr::Widen(_, a, b) => a.has_opt_marker() || b.has_opt_marker(),
             IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => {
                 e.has_opt_marker()
             }
@@ -991,6 +1018,10 @@ pub(crate) fn scan_intexpr_int_set(ie: &IntExpr, needs: &mut bool) {
             scan_intexpr_int_set(body, needs);
         }
         IntExpr::Bin(_, a, b) => {
+            scan_intexpr_int_set(a, needs);
+            scan_intexpr_int_set(b, needs);
+        }
+        IntExpr::Widen(_, a, b) => {
             scan_intexpr_int_set(a, needs);
             scan_intexpr_int_set(b, needs);
         }

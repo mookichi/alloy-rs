@@ -44,6 +44,12 @@ pub const EREAL_OPS: &[&str] = &[
     "erealLsb",
     "erealRadiusExp",
     "erealTau",
+    "erealExactEq",
+    "erealMayEq",
+    "erealCovers",
+    "erealLT",
+    "erealLTE",
+    "erealMayLTE",
     "setEReal",
 ];
 
@@ -202,8 +208,12 @@ fn module_mentions_ereal(module: &Module, scope: &Scope) -> bool {
         }
         match e {
             Expr::Name(n, _) if n == "EReal" => *hit = true,
+            // A decimal literal denotes an EReal value (lowered via
+            // lane equalities), so it implies EReal allocation even
+            // without any other EReal mention.
+            Expr::RealLit(..) => *hit = true,
             Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom
-            | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) => {}
+            | Expr::StepAtom | Expr::Bits(..) => {}
             Expr::Bin(_, a, b) => {
                 expr_mentions(a, hit);
                 expr_mentions(b, hit);
@@ -252,6 +262,10 @@ fn module_mentions_ereal(module: &Module, scope: &Scope) -> bool {
             IntExpr::Card(x, _) | IntExpr::Val(x, _) | IntExpr::BitsVal(x, _)
             | IntExpr::SumOf(x, _) => expr_mentions(x, hit),
             IntExpr::Bin(_, a, b) => {
+                intexpr_mentions(a, hit);
+                intexpr_mentions(b, hit);
+            }
+            IntExpr::Widen(_, a, b) => {
                 intexpr_mentions(a, hit);
                 intexpr_mentions(b, hit);
             }

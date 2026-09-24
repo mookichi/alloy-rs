@@ -74,6 +74,8 @@ pub fn apply_int_binop(
         IntBinOp::Xor => wrap(l as i128 ^ r as i128),
         IntBinOp::Shl => wrap((l as i128) << (r as u32 % 64)),
         IntBinOp::Shr => wrap(((l as u64) >> (r as u32 % 64)) as i128),
+        IntBinOp::Min => wrap((l as i128).min(r as i128)),
+        IntBinOp::Max => wrap((l as i128).max(r as i128)),
     })
 }
 
@@ -476,6 +478,30 @@ impl<'a> Evaluator<'a> {
                 let l = self.int_value(arena, left, env)?;
                 let r = self.int_value(arena, right, env)?;
                 self.apply_binop(op, l, r)
+            }
+            // Best-effort model readout for exact widening arithmetic:
+            // computed in i128, then wrapped to the node's static width
+            // (`Shl`) or i64-checked (`Add`/`Sub`, unbounded at 64).
+            // Oversized shifts saturate to 0 (low bits are all zero).
+            IntNode::Widen { op, left, right } => {
+                let l = self.int_value(arena, left, env)?;
+                let r = self.int_value(arena, right, env)?;
+                Ok(match op {
+                    crate::ast::WidenOp::Add => {
+                        self.wrap((l as i128) + (r as i128))
+                    }
+                    crate::ast::WidenOp::Sub => {
+                        self.wrap((l as i128) - (r as i128))
+                    }
+                    crate::ast::WidenOp::Shl(width) => {
+                        let v = if !(0..=60).contains(&r) {
+                            0i128
+                        } else {
+                            (l as i128) << (r as u32)
+                        };
+                        wrap_int(v, width, &self.overflow)
+                    }
+                })
             }
             IntNode::If { cond, then, els } => {
                 if self.formula_bool(arena, cond, env)? {

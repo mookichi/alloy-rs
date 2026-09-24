@@ -306,6 +306,11 @@ impl<'a> StaticSkolemizer<'a> {
                 let r = self.subst_int(right, map, shadow);
                 self.arena.binary_int(op, l, r)
             }
+            crate::ast::IntNode::Widen { op, left, right } => {
+                let l = self.subst_int(left, map, shadow);
+                let r = self.subst_int(right, map, shadow);
+                self.arena.widen_int(op, l, r)
+            }
             crate::ast::IntNode::If { cond, then, els } => {
                 let c = self.subst_formula(cond, map, shadow);
                 let t = self.subst_int(then, map, shadow);

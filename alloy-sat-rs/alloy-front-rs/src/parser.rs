@@ -1292,8 +1292,9 @@ impl Parser {
                 Ok(Expr::Name(v.to_string(), pos))
             }
             Tok::RealLit(s) => {
-                // Decimal real literal: exact source text, only valid
-                // inside `setEReal` (rejected at lowering elsewhere).
+                // Decimal real literal: exact source text, denoting an
+                // EReal *value* (accepted at lowering in `=`/`!=`,
+                // `setEReal`, and the `ereal*` predicates).
                 self.bump();
                 Ok(Expr::RealLit(s, pos))
             }
@@ -2286,6 +2287,11 @@ fn fold_int_literal(ie: &crate::ast::IntExpr) -> Option<i64> {
                 crate::ast::IntBinOp::Mul => x.wrapping_mul(y),
                 crate::ast::IntBinOp::Div => x.checked_div(y)?,
                 crate::ast::IntBinOp::Rem => x.checked_rem(y)?,
+                crate::ast::IntBinOp::Min => x.min(y),
+                crate::ast::IntBinOp::Max => x.max(y),
+                // Shifts depend on the circuit width: never fold here;
+                // the caller falls back to the relational reading.
+                crate::ast::IntBinOp::Shl => return None,
             })
         }
         _ => None,

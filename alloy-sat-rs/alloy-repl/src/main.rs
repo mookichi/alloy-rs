@@ -2141,7 +2141,13 @@ fn print_help() {
     println!("  `sig A {{ x: EReal }}` then `x.m`, `x.e`, `x.p`, `x.k` read lanes;");
     println!("  `erealAdd/Sub/Mul/Div[a,b,c]`, `erealWellformed[x]`, `erealDivGuard[x]`;");
     println!("  `setEReal[x, 3.14]` binds lanes to a decimal literal (same as `:mepk lit`);");
-    println!("  lane widths come from `for N Int` (+MEPK_*_WIDTH); `for N EReal` scopes atoms.");
+    println!("  decimal literals are EReal values in `=`/`!=` and `ereal*` args");
+    println!("  (`R = 1.2`, `erealAdd[a, 2.5, c]`); needs a decimal point (`1e3` is not a real);");
+    println!("  interval comparisons over [c-R, c+R]: `erealExactEq`, `erealMayEq`,");
+    println!("  `erealCovers`, `erealLT`, `erealLTE`, `erealMayLTE`;");
+    println!("  `EReal` is non-abstract (like `Int`): extenders are proper subsets,");
+    println!("  direct atoms allowed; lane widths come from `for N Int` (+MEPK_*_WIDTH);");
+    println!("  `for N EReal` scopes atoms.");
 }
 
 /// Resolve an explicit `:psave` relation argument: exact pool name first,

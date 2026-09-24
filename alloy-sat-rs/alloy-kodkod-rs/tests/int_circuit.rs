@@ -173,3 +173,32 @@ fn division_matches_truncation_for_nonzero_divisors() {
         assert_eq!(a.rem(&b, bw).value_of(&model), want_r, "{} rem {}", x, y);
     }
 }
+
+#[test]
+fn wide_barrel_shift_above_64_bits() {
+    // Regression: `shl` evaluated `1usize << i` for every `i < width`,
+    // panicking on widths above 64 (widened interval-arithmetic shifts
+    // legitimately reach ~108 bits under `for 12 Int`). Only the low
+    // ceil(log2(width)) stages do work; the rest must be skipped.
+    let ctx = BoolCtx::new();
+    // 3215 << 9 = 1646080, exact in 108 bits.
+    let base = IntCircuit::constant(3215, 13, &ctx);
+    let amount = IntCircuit::constant(9, 8, &ctx);
+    assert_eq!(base.shl(&amount, 108).value_of(&[]), 3215i64 << 9);
+    // Sign extension survives the widening: -7 << 70.
+    let neg = IntCircuit::constant(-7, 5, &ctx);
+    let big = IntCircuit::constant(70, 8, &ctx);
+    assert_eq!(neg.shl(&big, 108).value_of(&[]), ((-7i128 << 70) as i64));
+    // Shift-out past the width drops high bits (zero fill into low part).
+    let past = IntCircuit::constant(100, 8, &ctx);
+    assert_eq!(
+        base.shl(&past, 108).value_of(&[]),
+        ((3215i128 << 100) as i64)
+    );
+    // Variable amount at a wide width, driven by a model.
+    let vars: Vec<BoolRef> = (0..8).map(|_| ctx.variable()).collect();
+    let v = IntCircuit::from_bits(vars.clone(), &ctx);
+    let three = IntCircuit::constant(3, 4, &ctx);
+    let model: Vec<bool> = (0..8).map(|i| (70u32 >> i) & 1 == 1).collect();
+    assert_eq!(three.shl(&v, 100).value_of(&model), ((3i128 << 70) as i64));
+}

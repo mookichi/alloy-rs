@@ -198,6 +198,10 @@ fn collect_int_relations(arena: &AstArena, i: IntId, out: &mut BTreeSet<Relation
             collect_int_relations(arena, left, out);
             collect_int_relations(arena, right, out);
         }
+        crate::ast::IntNode::Widen { left, right, .. } => {
+            collect_int_relations(arena, left, out);
+            collect_int_relations(arena, right, out);
+        }
         crate::ast::IntNode::If { cond, then, els } => {
             collect_formula_relations(arena, cond, out);
             collect_int_relations(arena, then, out);

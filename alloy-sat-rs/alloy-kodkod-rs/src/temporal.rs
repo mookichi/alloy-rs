@@ -1215,6 +1215,11 @@ impl<'a> Ltl2Fol<'a> {
                 let r = self.int_expr(right, t)?;
                 Ok(self.arena.binary_int(op, l, r))
             }
+            crate::ast::IntNode::Widen { op, left, right } => {
+                let l = self.int_expr(left, t)?;
+                let r = self.int_expr(right, t)?;
+                Ok(self.arena.widen_int(op, l, r))
+            }
             crate::ast::IntNode::If { cond, then, els } => {
                 let c = self.formula(cond, true, t)?;
                 let th = self.int_expr(then, t)?;
@@ -1605,6 +1610,36 @@ impl<'a> TemporalEval<'a> {
         crate::eval::apply_int_binop(op, l, r, self.bitwidth, &self.overflow)
     }
 
+    fn apply_widenop(
+        &self,
+        op: crate::ast::WidenOp,
+        l: i64,
+        r: i64,
+    ) -> Result<i64, EvalError> {
+        // Mirror the `Evaluator` readout: exact i128 math, wrapped to the
+        // node's static width (`Shl`) or i64-checked (`Add`/`Sub`).
+        Ok(match op {
+            crate::ast::WidenOp::Add => crate::eval::wrap_int(
+                (l as i128) + (r as i128),
+                self.bitwidth,
+                &self.overflow,
+            ),
+            crate::ast::WidenOp::Sub => crate::eval::wrap_int(
+                (l as i128) - (r as i128),
+                self.bitwidth,
+                &self.overflow,
+            ),
+            crate::ast::WidenOp::Shl(width) => {
+                let v = if !(0..=60).contains(&r) {
+                    0i128
+                } else {
+                    (l as i128) << (r as u32)
+                };
+                crate::eval::wrap_int(v, width, &self.overflow)
+            }
+        })
+    }
+
     fn horizon(&self) -> usize {
         let steps = self.ti.len();
         let cycle = steps.saturating_sub(self.ti.loop_state()).max(1);
@@ -1991,6 +2026,11 @@ impl<'a> TemporalEval<'a> {
                 let l = self.int_at(arena, left, env, pos)?;
                 let r = self.int_at(arena, right, env, pos)?;
                 self.apply_binop(op, l, r)
+            }
+            crate::ast::IntNode::Widen { op, left, right } => {
+                let l = self.int_at(arena, left, env, pos)?;
+                let r = self.int_at(arena, right, env, pos)?;
+                self.apply_widenop(op, l, r)
             }
             crate::ast::IntNode::If { cond, then, els } => {
                 if self.formula_at(arena, cond, env, pos)? {

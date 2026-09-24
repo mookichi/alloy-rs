@@ -415,18 +415,22 @@ impl IntCircuit {
     pub fn shl(&self, other: &IntCircuit, bitwidth: u32) -> IntCircuit {
         let width = bitwidth as usize;
         let mut shifted = self.extend_bits(width);
-        for i in 0..width {
+        // Only the low ceil(log2(width)) amount-bits can affect the
+        // result; further stages are no-ops. Bounding the loop also
+        // avoids overflowing `1usize << i` on widths above 64 (widened
+        // interval-arithmetic shifts legitimately exceed it).
+        let stages = ((usize::BITS - (width.saturating_sub(1)).leading_zeros()) as usize)
+            .min(width);
+        for i in 0..stages {
             let shift = 1usize << i;
             let bit = other.bit(i);
-            if i < (usize::BITS - (width - 1).leading_zeros()) as usize {
-                for j in (0..width).rev() {
-                    let moved = if j < shift {
-                        const_false()
-                    } else {
-                        shifted[j - shift]
-                    };
-                    shifted[j] = self.ctx.ite(bit, moved, shifted[j]);
-                }
+            for j in (0..width).rev() {
+                let moved = if j < shift {
+                    const_false()
+                } else {
+                    shifted[j - shift]
+                };
+                shifted[j] = self.ctx.ite(bit, moved, shifted[j]);
             }
         }
         // TODO(Iter2): shift-out overflow detection (Java accumulate port).
@@ -515,23 +519,31 @@ impl IntCircuit {
         other.lte(self)
     }
 
+    /// Readout of the circuit value under `model`. Widths up to 64 bits
+    /// behave exactly as before (two's-complement); wider circuits
+    /// (e.g. widened interval-arithmetic shifts) return the low 64 bits.
+    /// Bits at/above 127 are dropped (documented truncation for readout).
     pub fn value_of(&self, model: &[bool]) -> i64 {
         self.ctx.with_factory(|factory| {
             let mut memo: Vec<Option<bool>> = Vec::new();
-            let mut value: i64 = 0;
+            let mut acc: i128 = 0;
             for (i, &b) in self.bits.iter().enumerate() {
-                if factory.eval_memo(b, model, &mut memo) {
-                    value |= 1 << i;
+                if i < 127 && factory.eval_memo(b, model, &mut memo) {
+                    acc |= 1i128 << i;
                 }
             }
             let w = self.bits.len() as u32;
             if w < 64 {
-                let sign = 1i64 << (w - 1);
-                if value & sign != 0 {
-                    value -= 1i64 << w;
+                let masked = if w == 0 { 0 } else { acc & ((1i128 << w) - 1) };
+                let value = masked as i64;
+                if w > 0 && (masked >> (w - 1)) & 1 == 1 {
+                    value.wrapping_sub(1i64 << w)
+                } else {
+                    value
                 }
+            } else {
+                acc as i64
             }
-            value
         })
     }
 }
