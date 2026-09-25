@@ -130,8 +130,12 @@ fn extends_real_partitions() {
     sat("sig X extends Real {}\nsig Y extends Real {}\npred p { some X and some Y }\nrun p for 2 Real");
     unsat("sig X extends Real {}\nsig Y extends Real {}\npred p { some X and some Y }\nrun p for 1 Real");
     unsat("sig X extends Real {}\nsig Y extends Real {}\npred p { some (X & Y) }\nrun p for 3 Real");
-    // `Real` itself is not covered: free values coexist with extenders.
-    sat("sig X extends Real {}\npred p { some Real - X }\nrun p for 2 Real");
+    // `Real` is abstract (covered by extenders): with a single extender
+    // nothing lies outside it; with siblings it does (via the sibling).
+    unsat("sig X extends Real {}\npred p { some Real - X }\nrun p for 2 Real");
+    sat("sig X extends Real {}\nsig Y extends Real {}\npred p { some Real - X }\nrun p for 2 Real");
+    // Without extenders, free values work as before.
+    sat("pred p { some x: Real | setReal[x, 0.5] }\nrun p for 2 Real");
     // Scope guard: EReal cannot exceed Real.
     build_err("pred p { some x: EReal | realWellformed[x] }\nrun p for 1 Real, 2 EReal", "EReal");
 }
@@ -141,4 +145,15 @@ fn for_zero_real_with_literal_const() {
     // Literals are constants needing no atoms.
     sat("pred p { realEq[0.5, 0.5] }\nrun p for 0 Real");
     unsat("pred p { realEq[0.5, 1.5] }\nrun p for 0 Real");
+}
+
+#[test]
+fn one_extender_collapses_real() {
+    // Reported case: `one sig X extends Real` yields exactly one Real
+    // value (abstract cover, own atoms, no free-pool ghosts).
+    sat("one sig X extends Real {}\nfact { setRealNearest[X, 1.2345] }\nrun {} for 11 Int");
+    sat("one sig X extends Real {}\nfact { setRealNearest[X, 1.2345] }\npred p { #Real = 1 }\nrun p for 11 Int");
+    unsat("one sig X extends Real {}\nfact { setRealNearest[X, 1.2345] }\npred p { #Real = 2 }\nrun p for 11 Int");
+    // Coexistence with EReal still works.
+    sat("one sig A extends Real {}\none sig B extends EReal {}\nfact { A = 0.5 and setEReal[B, 0.5] }\nrun {} for 1 Real, 1 EReal");
 }

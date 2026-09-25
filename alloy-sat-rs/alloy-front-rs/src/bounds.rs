@@ -109,11 +109,14 @@ pub struct Resolved {
     pub closure_atoms: HashMap<String, Vec<String>>,
     /// For `in` children: atoms are a subset of parent's atoms.
     pub in_children_atoms: HashMap<String, Vec<String>>,
-    /// Builtin `Real` atoms (`Real$0, ..`; empty unless the module uses
-    /// `Real`/`EReal`, mirroring lazy Int allocation). `EReal` atoms are
-    /// part of the `Real` closure (`EReal extends Real`).
+    /// Builtin free-pool `Real` atoms (`Real$0, ..`; empty unless bare
+    /// `Real` values are used with no user extender hosting them).
+    /// `EReal` atoms and user-extender own atoms join the `Real`
+    /// closure (`EReal extends Real`).
     pub real_atoms: Vec<String>,
-    /// Allocated `Real` population (`for N Real`, else default scope).
+    /// Allocated `Real` population (free pool + `EReal` + extenders).
+    /// Informational (atom lists are authoritative); kept for scope
+    /// introspection and future `exactly` handling.
     #[allow(dead_code)]
     pub real_count: u32,
     /// Builtin `EReal` atoms (`EReal$0, ..`; empty unless the module uses
@@ -899,34 +902,32 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     // `EReal extends Real`: the child population cannot exceed the parent
     // one. When only `EReal` is scoped, the parent defaults up to cover it
     // (backward compatible: EReal-only models keep working).
-    let mut real_count = real_scope.map(|(_, e)| num_of(e)).unwrap_or(DEFAULT_SCOPE);
+    let mut real_budget = real_scope.map(|(_, e)| num_of(e)).unwrap_or(overall);
     let mut ereal_count = ereal_scope.map(|(_, e)| num_of(e)).unwrap_or(DEFAULT_SCOPE);
     if ereal_scope.is_some() && real_scope.is_none() {
-        real_count = real_count.max(ereal_count);
+        real_budget = real_budget.max(ereal_count);
     }
     if real_scope.is_some() && ereal_scope.is_none() {
-        ereal_count = ereal_count.min(real_count);
+        ereal_count = ereal_count.min(real_budget);
     }
-    // Free `Real` atoms serve no purpose unless `Real` itself is used
-    // (as a type, scope entry, `real*` operand, or a non-`EReal` extender):
-    // `EReal`-only models keep `real_count = 0` so no garbage-lane `Real`
-    // atoms pollute the instance display. (`Real.m`/`Real.e` lanes are
-    // still allocated via `needs_real` for the `EReal` centre.)
-    let needs_free_real = scope.entries.iter().any(|(n, _)| n == "Real")
+    // Bare-`Real` use (as a type, scope entry, `real*` operand, or field
+    // type): needs free `Real` atoms when no extender hosts them (decided
+    // below, once extenders are known). `EReal`-only models keep zero
+    // free atoms so no garbage-lane `Real` atoms pollute the display.
+    // (`Real.m`/`Real.e` lanes are still allocated via `needs_real` for
+    // the `EReal` centre.)
+    let needs_bare_real = scope.entries.iter().any(|(n, _)| n == "Real")
         || real_direct_mention(module);
-    if needs_free_real && needs_ereal && ereal_count > real_count {
+    if needs_bare_real && needs_ereal && ereal_count > real_budget {
         return Err(format!(
-            "for {ereal_count} EReal exceeds for {real_count} Real; \
+            "for {ereal_count} EReal exceeds for {real_budget} Real; \
              raise the `Real` scope (`EReal extends Real`)"
         ));
     }
-    if !needs_free_real {
-        real_count = 0;
-    }
     if !needs_real {
         ereal_count = 0;
+        real_budget = 0;
     }
-    let real_count = if needs_real { real_count } else { 0 };
     // `Real`/`EReal` are reserved builtins: user declarations are rejected
     // (extension is allowed: `in` shares atoms, `extends` partitions).
     for sd in &module.sigs {
@@ -964,11 +965,12 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
                     }
                     children.entry(p.clone()).or_default().push(n.clone());
                 } else if p == "Real" {
-                    // Builtin `Real`: `in Real` accepted (subset of the
-                    // Real closure); `extends Real` accepted with Alloy
-                    // partition semantics (subset + disjoint siblings;
-                    // `Real` itself is NOT covered: free `Real` values
-                    // keep working alongside extenders).
+                    // Builtin `Real` (abstract): `in Real` accepted (subset
+                    // of the Real closure); `extends Real` children get
+                    // OWN atoms distributed over the Real budget (like a
+                    // normal hierarchy root; see the allocation below),
+                    // with Alloy partition semantics in lower.rs
+                    // (subset + disjoint + covered by extenders).
                     children.entry(p.clone()).or_default().push(n.clone());
                 } else if p == "EReal" {
                     // Builtin `EReal`: `in EReal` accepted (subset of the
@@ -1113,6 +1115,64 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         let _ = exact;
     }
 
+    // Builtin `Real` subtree (abstract, like a normal hierarchy root):
+    // direct user `extends Real` children get OWN atoms distributed over
+    // the Real budget (mirrors the loop above); the builtin `EReal`
+    // branch keeps its separate population (untouched), and `in`
+    // children keep sharing (handled below). The free pool decision
+    // follows once hosting is known.
+    let real_kids: Vec<String> = children
+        .get("Real")
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|k| sig_rels.get(k.as_str()).copied().unwrap_or(SigRel::None) != SigRel::In)
+        .collect();
+    let mut real_remaining = real_budget;
+    if !real_kids.is_empty() {
+        let mut unspecified: Vec<&String> = real_kids
+            .iter()
+            .filter(|k| !user.contains_key(k.as_str()))
+            .collect();
+        unspecified.sort();
+        let share = if unspecified.is_empty() {
+            0
+        } else {
+            real_remaining / unspecified.len() as u32
+        };
+        for k in &real_kids {
+            if let Some((n, _)) = user.get(k.as_str()) {
+                let kmult = mults.get(k.as_str()).copied().unwrap_or(SigMult::None);
+                let n2 = match kmult {
+                    SigMult::One | SigMult::Lone => 1,
+                    _ => *n,
+                };
+                atoms_of.insert(k.clone(), alloc_for(k, n2));
+            } else {
+                let kmult = mults.get(k.as_str()).copied().unwrap_or(SigMult::None);
+                let take = match kmult {
+                    SigMult::One | SigMult::Lone => 1,
+                    _ => {
+                        let t = share.min(real_remaining);
+                        real_remaining -= t;
+                        t
+                    }
+                };
+                atoms_of.insert(k.clone(), alloc_for(k, take));
+            }
+        }
+    }
+    // Free pool (`Real$i`): only when no user extender hosts `Real`
+    // values (abstract cover would leave them homeless otherwise).
+    // With extenders, bare `Real` draws from the extenders instead.
+    let real_free: u32 = if real_kids.is_empty()
+        && (real_scope.is_some() || needs_bare_real)
+    {
+        real_budget
+    } else {
+        0
+    };
+
     // For `in` children, their atoms are a subset of the parent's atoms.
     // Do NOT add them to atoms_of (which feeds the universe); instead
     // record the relationship so bind_sigs can set the correct upper bound.
@@ -1141,25 +1201,31 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     } else {
         Vec::new()
     };
-    // Builtin `Real` atoms + `EReal` atoms + bit-lane atoms (lazy like
-    // Int: allocated only when mentioned). `m`/`e` lanes are shared
-    // (`EReal extends Real` reads its centre through `Real.m`/`Real.e`);
-    // `p`/`k` lanes exist only with `EReal`.
-    let real_atoms: Vec<String> = if needs_real {
-        (0..real_count).map(|i| format!("Real${i}")).collect()
-    } else {
-        Vec::new()
-    };
+    // Builtin free-pool `Real` atoms + `EReal` atoms + bit-lane atoms
+    // (lazy like Int: allocated only when mentioned). `m`/`e` lanes are
+    // shared (`EReal extends Real` reads its centre through
+    // `Real.m`/`Real.e`); `p`/`k` lanes exist only with `EReal`.
+    // User `extends Real` children own their atoms (allocated above);
+    // they join the `Real` closure below.
+    let real_atoms: Vec<String> = (0..real_free).map(|i| format!("Real${i}")).collect();
     let ereal_atoms: Vec<String> = if needs_ereal {
         (0..ereal_count).map(|i| format!("EReal${i}")).collect()
     } else {
         Vec::new()
     };
-    // The `Real` closure covers its own atoms plus the `EReal` population
-    // (`EReal extends Real` with distinct atom names: the parent upper
-    // bound is the union, partition enforced by formulas in lower.rs).
-    let real_closure: Vec<String> =
-        real_atoms.iter().chain(ereal_atoms.iter()).cloned().collect();
+    // The `Real` closure covers the free pool, the `EReal` population,
+    // and user `extends Real` own atoms (abstract parent upper bound =
+    // union; partition enforced by formulas in lower.rs).
+    let mut real_closure: Vec<String> = real_atoms
+        .iter()
+        .chain(ereal_atoms.iter())
+        .cloned()
+        .collect();
+    for k in &real_kids {
+        if let Some(own) = atoms_of.get(k) {
+            real_closure.extend(own.iter().cloned());
+        }
+    }
     let mut lane_atoms: HashMap<u32, Vec<String>> = HashMap::new();
     if needs_real {
         lane_atoms.insert(
@@ -1191,16 +1257,14 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             // `Int`/`Signed`/`Real`/`EReal`
             if cur == "Int" || cur == "Signed" {
                 in_children_atoms.insert(n.clone(), int_atoms.clone());
-            } else if cur == "Real" || real_extenders(&module).contains(&cur) {
-                // `in Real` (or under a `Real` extender that is not an
-                // `EReal` descendant): the full `Real` closure.
-                if cur == "EReal" || ereal_extenders(&module).contains(&cur) {
-                    in_children_atoms.insert(n.clone(), ereal_atoms.clone());
-                } else {
-                    in_children_atoms.insert(n.clone(), real_closure.clone());
-                }
             } else if cur == "EReal" || ereal_extenders(&module).contains(&cur) {
                 in_children_atoms.insert(n.clone(), ereal_atoms.clone());
+            } else if let Some(own) = atoms_of.get(&cur) {
+                // User extender with own atoms (incl. `extends Real`
+                // children): `in`-descendants share those.
+                in_children_atoms.insert(n.clone(), own.clone());
+            } else if cur == "Real" {
+                in_children_atoms.insert(n.clone(), real_closure.clone());
             } else {
                 let root_atoms = atoms_of.get(&cur).cloned().unwrap_or_default();
                 in_children_atoms.insert(n.clone(), root_atoms);
@@ -1213,16 +1277,9 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     for n in ereal_extenders(&module) {
         in_children_atoms.insert(n, ereal_atoms.clone());
     }
-    // `extends Real` descendants (that are not `EReal` descendants) share
-    // the `Real` closure as their upper bound. (`EReal` itself keeps the
-    // EReal-only bound above; the `EReal ⊆ Real` membership is a formula
-    // in lower.rs.)
-    for n in real_extenders(&module) {
-        if n == "EReal" || ereal_extenders(&module).contains(&n) {
-            continue;
-        }
-        in_children_atoms.insert(n, real_closure.clone());
-    }
+    // NOTE: user `extends Real` children keep their OWN atoms (allocated
+    // above, already in `atoms_of`); they must NOT be overwritten here.
+    // The abstract cover (`Real` ⊆ extenders) is a formula in lower.rs.
 
     // closure atoms: include own + descendants
     let mut closure: HashMap<String, Vec<String>> = HashMap::new();
@@ -1359,7 +1416,7 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         },
         in_children_atoms,
         real_atoms,
-        real_count,
+        real_count: real_closure.len() as u32,
         ereal_atoms,
         ereal_count,
         lane_atoms,

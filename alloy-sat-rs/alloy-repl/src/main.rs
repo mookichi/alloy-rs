@@ -2160,7 +2160,7 @@ fn print_help() {
     println!("  `setRealNearest/Down/Up[x, 0.1]` round to the m-width mantissa");
     println!("  (nearest half-even / toward -inf / toward +inf; error untracked);");
     println!("  `R = 0.5` binds the centre for `Real`-rooted values;");
-    println!("  `Real` is never covered: free values coexist with extenders;");
+    println!("  `Real` is abstract like `EReal`: extenders partition it;");
     println!("  `for N Real` scopes free atoms (`for M EReal` needs `M <= N`).");
 }
 

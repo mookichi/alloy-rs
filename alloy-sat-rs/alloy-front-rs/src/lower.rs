@@ -302,10 +302,16 @@ impl<'m> Lowerer<'m> {
                         // kids never reach this loop, so free `EReal` values
                         // (`some a: EReal`, `for N EReal`) keep working.
                         // Subset/disjoint apply everywhere (Java parity).
-                        // Exception: the builtin `Real` root is never
-                        // covered (free `Real` values coexist with
-                        // extenders, including builtin `EReal`).
-                        if p == "Real" {
+                        // Exception: the builtin `Real` root is covered only
+                        // when user extenders exist (abstract `Real`).
+                        // With the builtin `EReal` as the sole child (or
+                        // no children at all), `Real` keeps free values:
+                        // covering would force foreign-population atoms
+                        // into `EReal` (unsound) or empty `Real` against
+                        // a live `EReal` extent (UNSAT everywhere).
+                        if p == "Real"
+                            && !kids.iter().any(|k| k != "EReal")
+                        {
                             continue;
                         }
                         let mut union = {
