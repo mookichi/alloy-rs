@@ -105,3 +105,34 @@ Valid(m,e,p,k; m_width) :=
 - `Mepk::new` 自体は非検査のまま (表示・テスト用): 検査付き構築は
   `Mepk::new_valid` を使う。
 - Java 対向物 (`MepkOps.java`)・`mepk.als` ミラーへの反映は未対応。
+
+## 5. builtin `Real` (`EReal extends Real`)
+
+exact 中心 `c = m·2^e` の親ソート。正規形は `m == 0` (e 自由) または
+`odd(m)`。`M/E` 幅は EReal と共有 (`MEPK_*_WIDTH` 分離なし)。
+`EReal` は `Real` の子として `m/e` を共有し `p/k` のみ独自に持つ。
+`Real` は抽象: extender 存在下では被覆 (`one sig X extends Real` は
+1値に畳む)、`EReal` 単独時は従来通り。`for M EReal <= N Real` を検査
+(互換デフォルトで自動調整)。
+
+### 5.1. 述語と丸めなし原則
+
+`realAdd/Sub/Mul/Div`・`realEq/LT/LTE/GT/GTE`・`realWellformed`・
+`realSucc/Pred`・`realUp/Down` 関数・`setReal`・
+`setRealNearest/Down/Up`。演算は exact のみ (割切れない除算は UNSAT)。
+`realUp/Down` はレーン successor (指数ウィンドウ探索、brute-force 照合済み);
+関数形は内包 desugar + 述語位置への自動ホイスト (skolem-fast)。
+
+### 5.2. リテラル近似の明示 opt-in
+
+plain `d` は近似なし (非dyadic は UNSAT、ただし大声エラーではなく
+合成可能な UNSAT)。`(d)` 綴り (`ApproxRealLit`) のみ近似を許可:
+
+| 位置 | plain 非dyadic | `(d)` 非dyadic |
+|---|---|---|
+| 順序比較 | UNSAT | bracket (`X < (L)` ⟺ `X ≤ Down(L)`、判定 exact) |
+| `=`/`!=`・演算・`setReal` | UNSAT | `=`/`setReal` は nearest 束縛、演算は UNSAT |
+| `(d1) = (d2)` | — | nearest 中心の等価比較 |
+
+`Down(L) < L` が厳密かつレーン値は全て dyadic のため bracket 判定は
+真値比較と等価。丸め誤差自体は追跡されない (Down+Up で挟む運用)。
