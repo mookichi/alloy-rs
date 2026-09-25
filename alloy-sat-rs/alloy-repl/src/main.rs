@@ -2157,6 +2157,8 @@ fn print_help() {
     println!("  `realAdd/Sub/Mul/Div[a,b,c]` (exact; inexact division is UNSAT),");
     println!("  `realWellformed[x]`, `realEq`, `realLT`, `realLTE`;");
     println!("  `setReal[x, 0.5]` binds dyadic literals only (non-dyadic fails loudly);");
+    println!("  `setRealNearest/Down/Up[x, 0.1]` round to the m-width mantissa");
+    println!("  (nearest half-even / toward -inf / toward +inf; error untracked);");
     println!("  `R = 0.5` binds the centre for `Real`-rooted values;");
     println!("  `Real` is never covered: free values coexist with extenders;");
     println!("  `for N Real` scopes free atoms (`for M EReal` needs `M <= N`).");

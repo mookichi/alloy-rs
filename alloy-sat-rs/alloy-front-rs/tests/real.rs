@@ -53,10 +53,34 @@ fn set_real_binds_dyadic_only() {
     sat("pred p { some x: Real | setReal[x, -1.5] }\nrun p for 2 Real");
     // Exact centre: 0.5 is (1, -1) after normalization.
     sat("pred p { some x: Real | setReal[x, 0.5] and x.m = 1 and x.e = -1 }\nrun p for 2 Real");
-    // Non-dyadic literals fail loudly (no rounding in `Real`).
+    // Non-dyadic literals fail loudly (no rounding in `setReal` itself;
+    // use the rounding variants below).
     build_err(
         "pred p { some x: Real | setReal[x, 0.1] }\nrun p for 2 Real",
-        "setReal",
+        "setRealNearest",
+    );
+}
+
+#[test]
+fn set_real_rounding_variants() {
+    // Nearest/Down/Up all accept 0.1; results bracket the truth.
+    sat("pred p { some x: Real | setRealNearest[x, 0.1] }\nrun p for 2 Real");
+    sat("pred p { some d, u: Real | setRealDown[d, 0.1] and setRealUp[u, 0.1] and realLT[d, u] }\nrun p for 2 Real");
+    unsat("pred p { some d, u: Real | setRealDown[d, 0.1] and setRealUp[u, 0.1] and realEq[d, u] }\nrun p for 2 Real");
+    // Bracketing against dyadic bounds (inline dyadic literals are exact):
+    // down(0.1) < 0.125 and 0.0625 < up(0.1).
+    sat("pred p { some d: Real | setRealDown[d, 0.1] and realLT[d, 0.125] }\nrun p for 2 Real");
+    sat("pred p { some u: Real | setRealUp[u, 0.1] and realLT[0.0625, u] }\nrun p for 2 Real");
+    // Nearest coincides with one of the brackets.
+    sat("pred p { some d, u, n: Real | setRealDown[d, 0.1] and setRealUp[u, 0.1] and setRealNearest[n, 0.1] and (realEq[n, d] or realEq[n, u]) }\nrun p for 3 Real");
+    // Dyadic inputs are exact in every mode (same centre as setReal).
+    sat("pred p { some x, y: Real | setRealNearest[x, 0.5] and setReal[y, 0.5] and realEq[x, y] }\nrun p for 2 Real");
+    sat("pred p { some x, y: Real | setRealDown[x, 0.5] and setReal[y, 0.5] and realEq[x, y] }\nrun p for 2 Real");
+    sat("pred p { some x, y: Real | setRealUp[x, 0.5] and setReal[y, 0.5] and realEq[x, y] }\nrun p for 2 Real");
+    // Second arg must still be a decimal literal.
+    build_err(
+        "pred p { some x, y: Real | setRealNearest[x, y] }\nrun p for 2 Real",
+        "decimal literal",
     );
 }
 

@@ -9,7 +9,7 @@ use alloy_kodkod_rs::ast::{
 };
 use alloy_kodkod_rs::bounds::Bounds;
 use alloy_kodkod_rs::mepk::{decimal_to_mepk, Mepk};
-use alloy_kodkod_rs::real::{decimal_to_real, RealCenter};
+use alloy_kodkod_rs::real::{decimal_to_real, decimal_to_real_rounded, RealCenter, RealRound};
 use alloy_kodkod_rs::opt::OptSense;
 use alloy_kodkod_rs::relation::{RelationId, RelationPool};
 use std::collections::HashMap;
@@ -1478,6 +1478,17 @@ impl<'a> Ctx<'a> {
                     return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
                 }
                 real_set(&args[0], &args[1], self.res.mepk_widths.m_width)?
+            }
+            "setRealNearest" | "setRealDown" | "setRealUp" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
+                }
+                let mode = match name {
+                    "setRealNearest" => RealRound::Nearest,
+                    "setRealDown" => RealRound::Down,
+                    _ => RealRound::Up,
+                };
+                real_set_rounded(&args[0], &args[1], self.res.mepk_widths.m_width, mode, name)?
             }
             _ => return Ok(None),
         };
@@ -5311,7 +5322,8 @@ fn real_div(a: &RealOp, b: &RealOp, r: &RealOp, wv: u32) -> Formula {
 }
 
 /// `setReal[x, lit]`: bind `x`'s `(m, e)` lanes to the exact dyadic
-/// conversion. Non-dyadic literals fail loudly (no rounding).
+/// conversion. Non-dyadic literals fail loudly (no rounding; use the
+/// `setRealNearest/Down/Up` variants below).
 fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
     let s = match lit {
         Expr::RealLit(s, _) => s.clone(),
@@ -5323,7 +5335,33 @@ fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
     };
     let v = decimal_to_real(&s, Some(m_width)).ok_or_else(|| {
         FrontError::Resolve(format!(
-            "setReal: cannot convert {s:?} exactly (non-dyadic, malformed, or outside the lane range)"
+            "setReal: cannot convert {s:?} exactly (non-dyadic, malformed, or outside the lane range; try setRealNearest/setRealDown/setRealUp)"
+        ))
+    })?;
+    Ok(ereal_and_all(vec![
+        Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "m"), IntExpr::Lit(v.m as i64, 0), 0),
+        Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "e"), IntExpr::Lit(v.e as i64, 0), 0),
+    ]))
+}
+
+/// `setRealNearest/Down/Up[x, lit]`: bind `x`'s `(m, e)` lanes to the
+/// `m`-width rounded conversion of the decimal literal. Dyadic inputs
+/// are exact in every mode; non-dyadic inputs round to nearest
+/// (half-even), toward −inf, or toward +inf respectively. The rounding
+/// error itself is NOT tracked (unlike `EReal`'s `k`): bracket a value
+/// with Down+Up when the error matters.
+fn real_set_rounded(x: &Expr, lit: &Expr, m_width: u32, mode: RealRound, name: &str) -> LResult<Formula> {
+    let s = match lit {
+        Expr::RealLit(s, _) => s.clone(),
+        _ => {
+            return Err(FrontError::Resolve(format!(
+                "{name} expects a decimal literal (e.g. 0.1) as its second argument"
+            )))
+        }
+    };
+    let v = decimal_to_real_rounded(&s, Some(m_width), mode).ok_or_else(|| {
+        FrontError::Resolve(format!(
+            "{name}: cannot convert {s:?} (malformed or outside the lane range)"
         ))
     })?;
     Ok(ereal_and_all(vec![

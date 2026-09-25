@@ -4,6 +4,11 @@
 //! `(m, e)` レーンは `EReal` と共通 (継承で共有)。正規形は
 //! `m == 0` (e 自由) または `odd(m)`。演算は exact のみ:
 //! 割り切れない除算・非 dyadic リテラルは `None` (solver では UNSAT)。
+//! `decimal_to_real_rounded` の丸めは例外: 非 dyadic 値を `m` 幅
+//! いっぱいに丸めるが、丸め誤差自体は追跡されない (bracketing 用途は
+//! Down/Up の2値で挟むこと)。
+
+use crate::int_ext::round_half_even_step;
 
 /// Exact-centre実数 `c = m * 2^e`。不変条件: `m == 0 || odd(m)`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,6 +335,134 @@ pub fn decimal_to_real(s: &str, m_width: Option<u32>) -> Option<RealCenter> {
     if v.is_valid(m_width) { Some(v) } else { None }
 }
 
+/// 丸めモード (`decimal_to_real_rounded` 用)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealRound {
+    /// 最近傍 (タイは half-even、`int_ext` と同一規則)。
+    Nearest,
+    /// 下側 (`≤ 真値` の最大の表現可能値、toward −inf)。
+    Down,
+    /// 上側 (`≥ 真値` の最小の表現可能値、toward +inf)。
+    Up,
+}
+
+/// `floor(log2(digits / 10^k))` (`digits > 0`)。`mepk` の同名関数と同形。
+fn floor_log2_div(digits: u128, k: u32) -> Option<i32> {
+    debug_assert!(digits > 0);
+    let den = pow10_u128(k)?;
+    let le = |e: i32| -> bool {
+        if e >= 0 {
+            match 2u128.checked_pow(e as u32).and_then(|p| p.checked_mul(den)) {
+                Some(v) => v <= digits,
+                None => false,
+            }
+        } else {
+            match digits.checked_shl((-e) as u32) {
+                Some(v) => v >= den,
+                None => true,
+            }
+        }
+    };
+    let (mut lo, mut hi) = (-200i32, 200i32);
+    debug_assert!(le(lo) && !le(hi));
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if le(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
+}
+
+/// 10進リテラルを `m` 幅いっぱいの仮数に丸めて変換。dyadic 入力は
+/// 全モードで exact 変換と同一 (`decimal_to_real` 相当)。非 dyadic は
+/// `q ≈ value·2^s` (`bitlen(q) = m_width−1` 狙い) を整数除算し、モード
+/// に応じて丸める。`m_width == None` の非 dyadic は幅不定のため `None`。
+/// 丸め誤差は追跡されない (Down/Up の bracketing で挟むこと)。
+pub fn decimal_to_real_rounded(
+    s: &str,
+    m_width: Option<u32>,
+    mode: RealRound,
+) -> Option<RealCenter> {
+    let (neg, digits, exp10) = parse_decimal(s)?;
+    if digits == 0 {
+        let v = RealCenter { m: 0, e: 0 };
+        return if v.is_valid(m_width) { Some(v) } else { None };
+    }
+    // dyadic 判定: 約分後の分母が 2 の冪のみか。
+    let is_dyadic = |digits: u128, exp10: i32| -> bool {
+        if exp10 >= 0 {
+            return true;
+        }
+        let k = match exp10.checked_neg() {
+            Some(k) => k as u32,
+            None => return false,
+        };
+        let den = match pow10_u128(k) {
+            Some(d) => d,
+            None => return false,
+        };
+        let mut den_r = den / gcd_u128(digits, den);
+        while den_r.is_multiple_of(2) {
+            den_r /= 2;
+        }
+        den_r == 1
+    };
+    if is_dyadic(digits, exp10) {
+        return decimal_to_real(s, m_width);
+    }
+    // 非 dyadic: 丸め幅が必須。
+    let mw = m_width?;
+    if mw < 2 || mw > 30 {
+        return None;
+    }
+    // 目標仮数ビット長 (符号込みレーン幅から符号分を除く)。
+    let p = (mw - 1).max(1);
+    if exp10 >= 0 {
+        // 非 dyadic かつ exp10 >= 0 は到達不能 (整数は常に dyadic)。
+        return None;
+    }
+    let k = exp10.checked_neg()? as u32;
+    let den = pow10_u128(k)?;
+    // `s = p − 1 − e_est` で `q = digits·2^s / den` の bitlen ≈ p。
+    let e_est = floor_log2_div(digits, k)?;
+    let s = (p as i32 - 1 - e_est).max(0) as u32;
+    if s >= 128 {
+        return None;
+    }
+    let num = digits.checked_mul(2u128.checked_pow(s)?)?;
+    let q0 = num.checked_div(den)?;
+    let rem = num.checked_rem(den)?;
+    let qmag = match mode {
+        RealRound::Nearest => round_half_even_step(q0, rem, den)?,
+        RealRound::Down => {
+            // `≤ 真値`: 正は切り捨て、負は切り上げ (絶対値増)。
+            if rem == 0 {
+                q0
+            } else if neg {
+                q0.checked_add(1)?
+            } else {
+                q0
+            }
+        }
+        RealRound::Up => {
+            if rem == 0 {
+                q0
+            } else if neg {
+                q0
+            } else {
+                q0.checked_add(1)?
+            }
+        }
+    };
+    let raw = to_i128(qmag)?;
+    let raw = if neg { raw.checked_neg()? } else { raw };
+    let v = RealCenter::new(raw, -(s as i32))?;
+    if v.is_valid(Some(mw)) { Some(v) } else { None }
+}
+
 /// Exact rational `num/den` (`den > 0`)。検証・leaf 入力用。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rat {
@@ -588,5 +721,87 @@ mod tests {
         let v = evaluate(&e).unwrap();
         assert_eq!(v, RealCenter { m: 3, e: 0 });
         assert_eq!(verify(&v, true_value(&e).unwrap()), Some(true));
+    }
+
+    /// 符号付き比較 `a ? b` (i128 範囲内の小さな値用): `-1/0/1`。
+    fn cmp_centres(a: &RealCenter, b: &RealCenter) -> Option<i32> {
+        let ell = a.e.min(b.e);
+        let da = (a.e - ell) as u32;
+        let db = (b.e - ell) as u32;
+        if da > 100 || db > 100 {
+            return None;
+        }
+        let x = a.m.checked_shl(da)?;
+        let y = b.m.checked_shl(db)?;
+        Some(x.cmp(&y) as i32)
+    }
+
+    #[test]
+    fn rounded_modes_bracket_tenth() {
+        // 0.1 at m_width 8 (p = 7): Nearest/Down/Up.
+        let mw = Some(8u32);
+        let n = decimal_to_real_rounded("0.1", mw, RealRound::Nearest).unwrap();
+        let d = decimal_to_real_rounded("0.1", mw, RealRound::Down).unwrap();
+        let u = decimal_to_real_rounded("0.1", mw, RealRound::Up).unwrap();
+        for v in [&n, &d, &u] {
+            assert!(v.is_valid(mw), "lane fit: {v:?}");
+            assert!(v.m == 0 || v.m % 2 != 0, "odd: {v:?}");
+        }
+        // Bracketing: Down ≤ 0.1 ≤ Up (rational check), Down < Up.
+        assert_eq!(cmp_centres(&d, &u), Some(-1));
+        // |d| vs truth: d ≤ 1/10 ≤ u ⟺ d*10 ≤ 1 ≤ u*10.
+        let scaled = |v: &RealCenter| -> Option<i128> {
+            if v.e >= 0 {
+                v.m.checked_mul(10)?.checked_mul(1i128.checked_shl(v.e as u32)?)
+            } else {
+                v.m.checked_mul(10)
+            }
+        };
+        let unit = |v: &RealCenter| -> Option<i128> {
+            if v.e >= 0 {
+                Some(1)
+            } else {
+                1i128.checked_shl((-v.e) as u32)
+            }
+        };
+        assert!(scaled(&d).unwrap() <= unit(&d).unwrap());
+        assert!(scaled(&u).unwrap() >= unit(&u).unwrap());
+        // Nearest is one of the two brackets.
+        assert!(n == d || n == u, "nearest {n:?} not a bracket of {d:?}/{u:?}");
+        // 1 ulp apart at the common scale (Down may normalize to a
+        // coarser exponent, so compare scaled to ell = min).
+        let ell = d.e.min(u.e);
+        let ds = d.m.checked_shl((d.e - ell) as u32).unwrap();
+        let us = u.m.checked_shl((u.e - ell) as u32).unwrap();
+        assert_eq!(us - ds, 1);
+    }
+
+    #[test]
+    fn rounded_dyadic_is_noop() {
+        // dyadic 入力は全モードで exact 変換と同一。
+        for lit in ["0.5", "3.0", "-1.5", "2.0"] {
+            let exact = decimal_to_real(lit, Some(8)).unwrap();
+            for mode in [RealRound::Nearest, RealRound::Down, RealRound::Up] {
+                assert_eq!(decimal_to_real_rounded(lit, Some(8), mode).unwrap(), exact, "{lit} {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_negative_tenth() {
+        // 符号対称: Down(-0.1) == -Up(0.1), Up(-0.1) == -Down(0.1).
+        let mw = Some(8u32);
+        let dn = decimal_to_real_rounded("-0.1", mw, RealRound::Down).unwrap();
+        let up = decimal_to_real_rounded("-0.1", mw, RealRound::Up).unwrap();
+        let pd = decimal_to_real_rounded("0.1", mw, RealRound::Down).unwrap();
+        let pu = decimal_to_real_rounded("0.1", mw, RealRound::Up).unwrap();
+        assert_eq!((dn.m, dn.e), (-pu.m, pu.e));
+        assert_eq!((up.m, up.e), (-pd.m, pd.e));
+    }
+
+    #[test]
+    fn rounded_needs_width() {
+        // 非 dyadic に幅なしは None (幅不定)。
+        assert!(decimal_to_real_rounded("0.1", None, RealRound::Nearest).is_none());
     }
 }
