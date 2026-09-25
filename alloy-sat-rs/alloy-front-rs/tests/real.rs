@@ -141,6 +141,15 @@ fn extends_real_partitions() {
 }
 
 #[test]
+fn real_comparisons_gt_gte() {
+    sat("pred p { some a, b: Real | setReal[a, 1.5] and setReal[b, 4.0] and realGT[b, a] }\nrun p for 2 Real");
+    unsat("pred p { some a, b: Real | setReal[a, 1.5] and setReal[b, 4.0] and realGT[a, b] }\nrun p for 2 Real");
+    unsat("pred p { some a, b: Real | setReal[a, 0.5] and setReal[b, 0.5] and realGT[a, b] }\nrun p for 2 Real");
+    sat("pred p { some a: Real | setReal[a, 1.5] and realGTE[a, 1.5] }\nrun p for 2 Real");
+    unsat("pred p { some a, b: Real | setReal[a, 1.5] and setReal[b, 4.0] and realGTE[a, b] }\nrun p for 2 Real");
+}
+
+#[test]
 fn for_zero_real_with_literal_const() {
     // Literals are constants needing no atoms.
     sat("pred p { realEq[0.5, 0.5] }\nrun p for 0 Real");
@@ -156,4 +165,31 @@ fn one_extender_collapses_real() {
     unsat("one sig X extends Real {}\nfact { setRealNearest[X, 1.2345] }\npred p { #Real = 2 }\nrun p for 11 Int");
     // Coexistence with EReal still works.
     sat("one sig A extends Real {}\none sig B extends EReal {}\nfact { A = 0.5 and setEReal[B, 0.5] }\nrun {} for 1 Real, 1 EReal");
+}
+
+#[test]
+fn real_succ_pred() {
+    // Successor is exact and minimal (default widths: succ(0.5) = 0.5625).
+    sat("pred p { some a, b: Real | setReal[a, 0.5] and realSucc[a, b] and realEq[b, 0.5625] }\nrun p for 2 Real");
+    unsat("pred p { some a, b: Real | setReal[a, 0.5] and realSucc[a, b] and realEq[b, 1.5] }\nrun p for 2 Real");
+    // Predecessor mirrors (pred(0.5625) = 0.5).
+    sat("pred p { some a, b: Real | setReal[a, 0.5625] and realPred[a, b] and realEq[b, 0.5] }\nrun p for 2 Real");
+    // Negatives mirror through zero (succ(-0.5) = -pred(0.5)).
+    sat("pred p { some a, b: Real | setReal[a, -0.5] and realSucc[a, b] and realEq[b, -0.46875] }\nrun p for 2 Real");
+    unsat("pred p { some a, b: Real | setReal[a, -0.5] and realSucc[a, b] and realEq[b, -0.5625] }\nrun p for 2 Real");
+    // Zero steps to ±(1, emin).
+    sat("pred p { some a, b: Real | setReal[a, 0.0] and realSucc[a, b] and realGT[b, 0.0] }\nrun p for 2 Real");
+    // Top of lane has no successor.
+    unsat("pred p { some a, b: Real | realSucc[a, b] and a.m = 15 and a.e = 7 }\nrun p for 2 Real");
+}
+
+#[test]
+fn real_up_down_functions() {
+    // Function form in arithmetic position (hoisted to skolem-fast shape).
+    sat("pred p { some a, c: Real | setReal[a, 0.5] and realAdd[realUp[a], 0.25, c] and realEq[c, 0.8125] }\nrun p for 3 Real");
+    // Round trip: Down(Up(x)) = x.
+    sat("pred p { some a, b, c: Real | setReal[a, 0.5] and realEq[realUp[a], b] and realEq[realDown[b], c] and realEq[a, c] }\nrun p for 3 Real");
+    // Literal arguments constant-fold (needs an atom to carry lanes).
+    sat("pred p { realEq[realUp[0.5], 0.5625] }\nrun p for 1 Real");
+    unsat("pred p { realEq[realUp[0.5], 1.5] }\nrun p for 1 Real");
 }

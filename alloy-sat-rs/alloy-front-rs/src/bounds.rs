@@ -49,10 +49,16 @@ pub const REAL_OPS: &[&str] = &[
     "realEq",
     "realLT",
     "realLTE",
+    "realGT",
+    "realGTE",
     "setReal",
     "setRealNearest",
     "setRealDown",
     "setRealUp",
+    "realSucc",
+    "realPred",
+    "realUp",
+    "realDown",
 ];
 
 /// Builtin `EReal` operation/predicate names that imply EReal allocation
@@ -76,6 +82,8 @@ pub const EREAL_OPS: &[&str] = &[
     "erealLT",
     "erealLTE",
     "erealMayLTE",
+    "erealGT",
+    "erealGTE",
     "setEReal",
 ];
 

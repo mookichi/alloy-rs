@@ -643,6 +643,7 @@ impl<'m> Lowerer<'m> {
             // universe (Java's solve-after `frame.a2k` equivalent).
             allow_atoms: true,
             pin_seq: std::cell::Cell::new(0),
+            rup_memo: std::cell::RefCell::new(HashMap::new()),
             markers: std::cell::RefCell::new(Vec::new()),
             marker_time: std::cell::Cell::new(None),
         };
@@ -951,6 +952,7 @@ impl<'m> Lowerer<'m> {
             // are solver outputs, not language terms).
             allow_atoms: false,
             pin_seq: std::cell::Cell::new(0),
+            rup_memo: std::cell::RefCell::new(HashMap::new()),
             markers: std::cell::RefCell::new(Vec::new()),
             marker_time: std::cell::Cell::new(None),
         };
@@ -1192,6 +1194,15 @@ struct Ctx<'a> {
     /// A counter (not source positions): one `pin` inside a twice-called
     /// predicate expands twice and must not collide with itself.
     pin_seq: std::cell::Cell<u32>,
+    /// Memoized `realUp`/`realDown` lowerings: `(name, source pos,
+    /// env-var fingerprint, temporal marker)` -> lowered set. The same
+    /// call site is lowered once per lane join (plus once per use);
+    /// sharing one lowering lets the kodkod matrix memo hit instead of
+    /// re-expanding the successor core per lane. Arena-stable: `Ctx`
+    /// (and this map) is fresh per lowering run.
+    rup_memo: std::cell::RefCell<
+        HashMap<(String, usize, Vec<kk::VarId>, Option<TimePoint>), (kk::ExprId, u32)>,
+    >,
     /// Collected in-body `maximize`/`minimize` markers.
     markers: std::cell::RefCell<Vec<OptMarker>>,
     /// Innermost enclosing state-pinning temporal operator for markers
@@ -1414,6 +1425,206 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Hoist `realUp`/`realDown` calls out of transparent expression
+    /// positions: rewrites the occurrence to a fresh `$rhN` variable and
+    /// records `(var, pred, arg)` triples (innermost first) for the
+    /// caller to wrap in `some $vars: Real | succs & rest`. Returns
+    /// `None` when no hoisting applies (no clone). Does NOT descend
+    /// into nested Formula contexts (quantifier/comprehension bodies,
+    /// `if` conditions): those lower per predicate call site anyway,
+    /// and remaining value positions use the comprehension desugar.
+    /// Fresh `$`-names can never collide with user bindings (the lexer
+    /// bans `$`, and `pin_seq` is monotonic process-wide here).
+    fn hoist_real_fun(
+        &self,
+        e: &Expr,
+        out: &mut Vec<(String, String, Expr)>,
+    ) -> Option<Expr> {
+        match e {
+            Expr::Name(..)
+            | Expr::Univ
+            | Expr::None_
+            | Expr::Iden
+            | Expr::IntAtom
+            | Expr::StepAtom
+            | Expr::Bits(..)
+            | Expr::RealLit(..) => None,
+            Expr::Bin(op, a, b) => {
+                let na = self.hoist_real_fun(a, out);
+                let nb = self.hoist_real_fun(b, out);
+                if na.is_none() && nb.is_none() {
+                    None
+                } else {
+                    Some(Expr::Bin(
+                        *op,
+                        Box::new(na.unwrap_or_else(|| a.as_ref().clone())),
+                        Box::new(nb.unwrap_or_else(|| b.as_ref().clone())),
+                    ))
+                }
+            }
+            Expr::Transpose(x)
+            | Expr::TClosure(x)
+            | Expr::RClosure(x)
+            | Expr::Prime(x)
+            | Expr::AtExpr(x) => {
+                let nx = self.hoist_real_fun(x, out)?;
+                Some(match e {
+                    Expr::Transpose(_) => Expr::Transpose(Box::new(nx)),
+                    Expr::TClosure(_) => Expr::TClosure(Box::new(nx)),
+                    Expr::RClosure(_) => Expr::RClosure(Box::new(nx)),
+                    Expr::Prime(_) => Expr::Prime(Box::new(nx)),
+                    _ => Expr::AtExpr(Box::new(nx)),
+                })
+            }
+            Expr::ArrowMult(m, x) | Expr::LeadMult(m, x) => {
+                let nx = self.hoist_real_fun(x, out)?;
+                Some(match e {
+                    Expr::ArrowMult(..) => Expr::ArrowMult(*m, Box::new(nx)),
+                    _ => Expr::LeadMult(*m, Box::new(nx)),
+                })
+            }
+            Expr::Comprehension(ds, body) => {
+                let mut changed = false;
+                let nds: Vec<Decl> = ds
+                    .iter()
+                    .map(|d| match self.hoist_real_fun(&d.expr, out) {
+                        None => d.clone(),
+                        Some(ne) => {
+                            changed = true;
+                            Decl { expr: ne, ..d.clone() }
+                        }
+                    })
+                    .collect();
+                if changed {
+                    Some(Expr::Comprehension(nds, body.clone()))
+                } else {
+                    None
+                }
+            }
+            Expr::If(c, t, el) => {
+                let nt = self.hoist_real_fun(t, out);
+                let ne = self.hoist_real_fun(el, out);
+                if nt.is_none() && ne.is_none() {
+                    None
+                } else {
+                    Some(Expr::If(
+                        c.clone(),
+                        Box::new(nt.unwrap_or_else(|| t.as_ref().clone())),
+                        Box::new(ne.unwrap_or_else(|| el.as_ref().clone())),
+                    ))
+                }
+            }
+            Expr::Bracket(base, args) => {
+                let nb = self.hoist_real_fun(base, out);
+                let mut nargs: Vec<Box<Expr>> = Vec::with_capacity(args.len());
+                let mut changed = nb.is_some();
+                for a in args {
+                    match self.hoist_real_fun(a, out) {
+                        None => nargs.push(a.clone()),
+                        Some(na) => {
+                            changed = true;
+                            nargs.push(Box::new(na));
+                        }
+                    }
+                }
+                if changed {
+                    Some(Expr::Bracket(
+                        Box::new(nb.unwrap_or_else(|| base.as_ref().clone())),
+                        nargs,
+                    ))
+                } else {
+                    None
+                }
+            }
+            Expr::LetBind(binds, body) => {
+                let mut changed = false;
+                let nbinds: Vec<(String, Expr)> = binds
+                    .iter()
+                    .map(|(n, ex)| match self.hoist_real_fun(ex, out) {
+                        None => (n.clone(), ex.clone()),
+                        Some(ne) => {
+                            changed = true;
+                            (n.clone(), ne)
+                        }
+                    })
+                    .collect();
+                match self.hoist_real_fun(body, out) {
+                    None if !changed => None,
+                    None => Some(Expr::LetBind(nbinds, body.clone())),
+                    Some(nb) => Some(Expr::LetBind(nbinds, Box::new(nb))),
+                }
+            }
+            Expr::Call(name, cargs, pos) => {
+                let mut nargs = Vec::with_capacity(cargs.len());
+                for a in cargs {
+                    match self.hoist_real_fun(a, out) {
+                        None => nargs.push(a.clone()),
+                        Some(na) => nargs.push(na),
+                    }
+                }
+                if (name == "realUp" || name == "realDown") && nargs.len() == 1 {
+                    let pred = if name == "realUp" { "realSucc" } else { "realPred" };
+                    let n = self.pin_seq.get();
+                    self.pin_seq.set(n + 1);
+                    let v = format!("$rhh{n}");
+                    out.push((v.clone(), pred.to_string(), nargs.pop().unwrap()));
+                    Some(Expr::Name(v, *pos))
+                } else if nargs
+                    .iter()
+                    .zip(cargs.iter())
+                    .any(|(a, b)| a != b)
+                {
+                    Some(Expr::Call(name.clone(), nargs, *pos))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Hoist wrapper for builtin predicate calls: rewrites `args`,
+    /// lowering `pred[hoisted...]` under `some $vars: Real | succs`.
+    /// Returns `None` when no occurrence applies (caller proceeds
+    /// normally). Recursion terminates (hoisted args are `realUp`-free).
+    fn hoist_real_funs_call(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        args: &[Expr],
+        env: &mut Env,
+    ) -> LResult<Option<FormulaId>> {
+        let mut hoists: Vec<(String, String, Expr)> = Vec::new();
+        let mut hoisted: Vec<Expr> = Vec::with_capacity(args.len());
+        for a in args {
+            match self.hoist_real_fun(a, &mut hoists) {
+                None => hoisted.push(a.clone()),
+                Some(na) => hoisted.push(na),
+            }
+        }
+        if hoists.is_empty() {
+            return Ok(None);
+        }
+        let mut decls = Vec::with_capacity(hoists.len());
+        let mut conj = Vec::with_capacity(hoists.len() + 1);
+        for (v, pred, arg) in hoists {
+            decls.push(Decl {
+                disj: false,
+                names: vec![v.clone()],
+                expr: Expr::Name("Real".into(), 0),
+                pos: 0,
+                is_var: false,
+            });
+            conj.push(Formula::Call(pred, vec![arg, Expr::Name(v, 0)], 0));
+        }
+        conj.push(Formula::Call(name.to_string(), hoisted, 0));
+        let wrapped = Formula::Quant(
+            QuantKind::Some,
+            decls,
+            Box::new(ereal_and_all(conj)),
+        );
+        Ok(Some(self.lower_formula(arena, &wrapped, env)?))
+    }
+
     /// Try to resolve a builtin `Real` predicate call.
     /// Returns Some(formula) if the name matches (`realAdd` etc.): desugars
     /// to exact-centre constraints over the shared `Real.m`/`Real.e` lanes.
@@ -1426,6 +1637,10 @@ impl<'a> Ctx<'a> {
         args: &[Expr],
         env: &mut Env,
     ) -> LResult<Option<FormulaId>> {
+        // Hoist `realUp`/`realDown` out of value positions (skolem-fast).
+        if let Some(hoisted) = self.hoist_real_funs_call(arena, name, args, env)? {
+            return Ok(Some(hoisted));
+        }
         let body = match name {
             "realAdd" | "realSub" => {
                 if args.len() != 3 {
@@ -1465,13 +1680,23 @@ impl<'a> Ctx<'a> {
                         .collect(),
                 )
             }
-            "realLT" | "realLTE" => {
+            "realLT" | "realLTE" | "realGT" | "realGTE" => {
                 if args.len() != 2 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
                 }
                 let wv = self.ereal_shift_width()?;
-                let (a, b) = (self.real_op(&args[0])?, self.real_op(&args[1])?);
-                let op = if name == "realLT" { IntCmpOp::Lt } else { IntCmpOp::Lte };
+                // `GT`/`GTE` swap the operands through the same exact
+                // scaled comparison as `LT`/`LTE`.
+                let (a, b) = if name == "realGT" || name == "realGTE" {
+                    (self.real_op(&args[1])?, self.real_op(&args[0])?)
+                } else {
+                    (self.real_op(&args[0])?, self.real_op(&args[1])?)
+                };
+                let op = if name == "realLT" || name == "realGT" {
+                    IntCmpOp::Lt
+                } else {
+                    IntCmpOp::Lte
+                };
                 ereal_and_all(
                     real_all_wellformed(&[&a, &b])
                         .into_iter()
@@ -1496,6 +1721,98 @@ impl<'a> Ctx<'a> {
                 };
                 real_set_rounded(&args[0], &args[1], self.res.mepk_widths.m_width, mode, name)?
             }
+            "realSucc" | "realPred" => {
+                // Lane successor / predecessor over strictly positive
+                // input (mirrored for negatives, pinned for zero):
+                // per-scale optima with pairwise extremality, all
+                // division on lane-small non-negatives (see
+                // `real_next_core`). Backs `realUp`/`realDown`.
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
+                }
+                let up = name == "realSucc";
+                let w = &self.res.mepk_widths;
+                let mw = w.m_width;
+                // Window radius: exactly the oracle window
+                // (`ilog2(mag_max) + 2`, validated exhaustively against
+                // brute force in `real.rs`), so pairwise stays minimal.
+                let mag_max = if mw >= 2 { (1i64 << (mw - 1)) - 1 } else { 0 };
+                let r = (mag_max.max(1).ilog2() + 2) as i64;
+                let emin = -(1i64 << (w.e_width - 1));
+                let emax = (1i64 << (w.e_width - 1)) - 1;
+                let (a, b) = (self.real_op(&args[0])?, self.real_op(&args[1])?);
+                // Both-constant operands constant-fold through the
+                // oracle (instant literal checks).
+                if let (RealOp::Const(va), RealOp::Const(vb)) = (a, b) {
+                    let w = &self.res.mepk_widths;
+                    let nv = if up {
+                        alloy_kodkod_rs::real::next_up(&va, w.m_width, w.e_width)
+                    } else {
+                        alloy_kodkod_rs::real::next_down(&va, w.m_width, w.e_width)
+                    };
+                    return Ok(Some(self.lower_formula(
+                        arena,
+                        &Formula::Const(nv == Some(vb)),
+                        env,
+                    )?));
+                }
+                let ma = real_lane_of(&a, "m");
+                let ea = real_lane_of(&a, "e");
+                let mb = real_lane_of(&b, "m");
+                let eb = real_lane_of(&b, "e");
+                // Zero input pins the extreme first step.
+                let emin_lit = IntExpr::Lit(emin, 0);
+                let (z_m, z_e) = if up {
+                    (IntExpr::Lit(1, 0), emin_lit.clone())
+                } else {
+                    (IntExpr::Lit(-1, 0), emin_lit.clone())
+                };
+                let zero_in = ereal_and_all(vec![
+                    ereal_icmp(IntCmpOp::Eq, ma.clone(), IntExpr::Lit(0, 0)),
+                    ereal_icmp(IntCmpOp::Eq, mb.clone(), z_m),
+                    ereal_icmp(IntCmpOp::Eq, eb.clone(), z_e),
+                ]);
+                // Positive input: direct core.
+                let pos = ereal_and_all(vec![
+                    ereal_icmp(IntCmpOp::Gt, ma.clone(), IntExpr::Lit(0, 0)),
+                    real_next_core(
+                        up, &ma, &ea, &mb, &eb, self.res.bitwidth, mag_max, emin,
+                        emax, r,
+                    ),
+                ]);
+                // Negative input: mirrored core on negated lanes, linked back.
+                // Mirroring flips the direction: the successor above a
+                // negative `a` is the negated predecessor of `-a`
+                // (and dually), so the core runs with `!up`.
+                let mx = IntExpr::Widen(
+                    WidenOp::Sub,
+                    Box::new(IntExpr::Lit(0, 0)),
+                    Box::new(ma.clone()),
+                );
+                let my = IntExpr::Widen(
+                    WidenOp::Sub,
+                    Box::new(IntExpr::Lit(0, 0)),
+                    Box::new(mb.clone()),
+                );
+                let neg_core = real_next_core(
+                    !up, &mx, &ea, &my, &eb, self.res.bitwidth, mag_max, emin, emax,
+                    r,
+                );
+                let neg = ereal_and_all(vec![
+                    ereal_icmp(IntCmpOp::Lt, ma.clone(), IntExpr::Lit(0, 0)),
+                    neg_core,
+                    // `my` mirrors `-m_b` (the `e` lane is shared: the
+                    // core pins `ey = e_b` directly).
+                    ereal_icmp(
+                        IntCmpOp::Eq,
+                        IntExpr::Widen(WidenOp::Add, Box::new(mb.clone()), Box::new(my)),
+                        real_wide(IntExpr::Lit(0, 0)),
+                    ),
+                ]);
+                let mut parts = real_all_wellformed(&[&a, &b]);
+                parts.push(ereal_or_all(vec![zero_in, pos, neg]));
+                ereal_and_all(parts)
+            }
             _ => return Ok(None),
         };
         Ok(Some(self.lower_formula(arena, &body, env)?))
@@ -1519,6 +1836,10 @@ impl<'a> Ctx<'a> {
         // resolve to `ERealConstant` tuples inline (no witness atoms).
         // `erealNeedsRefine` takes an integer goal second, so only its
         // first arg is an operand; `setEReal` keeps its literal second arg.
+        // Hoist `realUp`/`realDown` out of value positions (skolem-fast).
+        if let Some(hoisted) = self.hoist_real_funs_call(arena, name, args, env)? {
+            return Ok(Some(hoisted));
+        }
         let body = match name {
             "erealAdd" | "erealSub" => {
                 if args.len() != 3 {
@@ -1577,7 +1898,7 @@ impl<'a> Ctx<'a> {
                 }
                 ereal_exact_eq(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?)
             }
-            "erealMayEq" | "erealCovers" | "erealLT" | "erealLTE" | "erealMayLTE" => {
+            "erealMayEq" | "erealCovers" | "erealLT" | "erealLTE" | "erealMayLTE" | "erealGT" | "erealGTE" => {
                 if args.len() != 2 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
                 }
@@ -1587,6 +1908,10 @@ impl<'a> Ctx<'a> {
                     "erealCovers" => ereal_covers(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, wv),
                     "erealLT" => ereal_lt(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, wv),
                     "erealLTE" => ereal_lte(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, wv),
+                    // `GT`/`GTE` swap through the same closed-interval
+                    // edge comparisons as `LT`/`LTE`.
+                    "erealGT" => ereal_lt(&self.ereal_op(&args[1])?, &self.ereal_op(&args[0])?, wv),
+                    "erealGTE" => ereal_lte(&self.ereal_op(&args[1])?, &self.ereal_op(&args[0])?, wv),
                     _ => ereal_may_lte(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, wv),
                 }
             }
@@ -2715,7 +3040,7 @@ impl<'a> Ctx<'a> {
             }
             Expr::RealLit(..) => {
                 return Err(FrontError::Resolve(
-                    "decimal literals are only valid in EReal value positions (`=`, `!=`, `setEReal`, `erealAdd`/`erealSub`/`erealMul`/`erealDiv`/`erealExactEq`/`erealMayEq`/`erealCovers`/`erealLT`/`erealLTE`/`erealMayLTE`/`erealWellformed`/`erealDivGuard`/`erealValid`)".to_string(),
+                    "decimal literals are only valid in EReal value positions (`=`, `!=`, `setEReal`, `erealAdd`/`erealSub`/`erealMul`/`erealDiv`/`erealExactEq`/`erealMayEq`/`erealCovers`/`erealLT`/`erealLTE`/`erealMayLTE`/`erealGT`/`erealGTE`/`erealWellformed`/`erealDivGuard`/`erealValid`)".to_string(),
                 ));
             }
             Expr::Name(n, pos) => {
@@ -3000,7 +3325,104 @@ impl<'a> Ctx<'a> {
             Expr::ArrowMult(..) | Expr::LeadMult(..) => {
                 return self.unsup("multiplicity outside field declaration")
             }
-            Expr::Call(name, args, _) => {
+            Expr::Call(name, args, pos) => {
+                // Builtin `Real` successor functions (desugared to a
+                // singleton comprehension over `realSucc`/`realPred`, so
+                // no witness relations are needed and nesting works
+                // through the standard comprehension path).
+                // Decimal literals constant-fold through the oracle
+                // (`ERealConstant` philosophy): the result pins exact
+                // lanes, keeping literal-heavy models trivial. Only
+                // dyadic literals fold (round explicitly first).
+                if name == "realUp" || name == "realDown" {
+                    if args.len() != 1 {
+                        return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
+                    }
+                    if let Expr::RealLit(s, _) = &args[0] {
+                        let w = &self.res.mepk_widths;
+                        let v = decimal_to_real(s, Some(w.m_width)).ok_or_else(|| {
+                            FrontError::Resolve(format!(
+                                "cannot convert {s:?} to Real exactly; round it with setRealNearest first"
+                            ))
+                        })?;
+                        let nv = if name == "realUp" {
+                            alloy_kodkod_rs::real::next_up(&v, w.m_width, w.e_width)
+                        } else {
+                            alloy_kodkod_rs::real::next_down(&v, w.m_width, w.e_width)
+                        }
+                        .ok_or_else(|| {
+                            FrontError::Resolve(format!(
+                                "'{name}' of {s:?} leaves the lane range"
+                            ))
+                        })?;
+                        let n = self.pin_seq.get();
+                        self.pin_seq.set(n + 1);
+                        let vnm = format!("$rup{n}");
+                        let decl = Decl {
+                            disj: false,
+                            names: vec![vnm.clone()],
+                            expr: Expr::Name("Real".into(), 0),
+                            pos: 0,
+                            is_var: false,
+                        };
+                        // Pin the witness lanes to the computed centre.
+                        let pin = ereal_and_all(vec![
+                            Formula::IntCmp(
+                                IntCmpOp::Eq,
+                                ereal_lane(&Expr::Name(vnm.clone(), 0), "m"),
+                                IntExpr::Lit(nv.m as i64, 0),
+                                0,
+                            ),
+                            Formula::IntCmp(
+                                IntCmpOp::Eq,
+                                ereal_lane(&Expr::Name(vnm.clone(), 0), "e"),
+                                IntExpr::Lit(nv.e as i64, 0),
+                                0,
+                            ),
+                        ]);
+                        return self.lower_expr(
+                            arena,
+                            &Expr::Comprehension(vec![decl], Box::new(pin)),
+                            env,
+                        );
+                    }
+                    let pred = if name == "realUp" { "realSucc" } else { "realPred" };
+                    let n = self.pin_seq.get();
+                    self.pin_seq.set(n + 1);
+                    let v = format!("$rup{n}");
+                    let decl = Decl {
+                        disj: false,
+                        names: vec![v.clone()],
+                        expr: Expr::Name("Real".into(), 0),
+                        pos: 0,
+                        is_var: false,
+                    };
+                    let body = Formula::Call(
+                        pred.into(),
+                        vec![args[0].clone(), Expr::Name(v, 0)],
+                        0,
+                    );
+                    // Memoize per call site: the same occurrence is
+                    // lowered once per lane join (plus once per use);
+                    // sharing one lowering lets the kodkod matrix memo
+                    // hit instead of re-expanding the core per lane.
+                    let key = (
+                        name.clone(),
+                        *pos,
+                        env.iter().map(|(_, vid, _, _)| *vid).collect::<Vec<_>>(),
+                        self.marker_time.get(),
+                    );
+                    if let Some(hit) = self.rup_memo.borrow().get(&key) {
+                        return Ok(*hit);
+                    }
+                    let out = self.lower_expr(
+                        arena,
+                        &Expr::Comprehension(vec![decl], Box::new(body)),
+                        env,
+                    )?;
+                    self.rup_memo.borrow_mut().insert(key, out);
+                    return Ok(out);
+                }
                 // Check ordering builtins first
                 if let Some(result) = self.try_ordering_expr(arena, name, args, env)? {
                     return Ok(result);
@@ -3189,6 +3611,9 @@ impl<'a> Ctx<'a> {
                     WidenOp::Add => kk::WidenOp::Add,
                     WidenOp::Sub => kk::WidenOp::Sub,
                     WidenOp::Shl(w) => kk::WidenOp::Shl(*w),
+                    // Constant shift: the second operand is a dummy
+                    // (ignored by lowering); the amount rides in the op.
+                    WidenOp::ShlConst(k) => kk::WidenOp::ShlConst(*k),
                     WidenOp::Mul => kk::WidenOp::Mul,
                 };
                 arena.widen_int(kop, ia, ib)
@@ -5376,6 +5801,401 @@ fn real_set_rounded(x: &Expr, lit: &Expr, m_width: u32, mode: RealRound, name: &
     ]))
 }
 
+// ---- lane-successor constraints (`realSucc`/`realPred` core) --------------
+// Successor over the finite lane population without quantifiers or
+// division-on-wide: per static scale offset `c`, the optimum mantissa
+// is built from `Div`/`Rem` on lane-small non-negative values only
+// (all wider arithmetic is widened-exact), with parity folded through
+// `r²` (`r = Rem(_, 2) ∈ {-1,0,1}`, so `r² = [odd]` under any Div
+// semantics); global minimality/maximality is pairwise across scales.
+// Static `2^k` constants come from doubling chains (`Lit(2^k)` would
+// wrap once `k ≥ E-1`).
+
+/// Exact constant shift-left (free rewiring, no gates, no amount
+/// encoding): `x · 2^k` for static `k`.
+fn real_shl(x: IntExpr, k: u32) -> IntExpr {
+    IntExpr::Widen(
+        WidenOp::ShlConst(k),
+        Box::new(x),
+        Box::new(IntExpr::Lit(0, 0)),
+    )
+}
+
+/// Widen `x` (exact identity shift, for mixed-width comparisons).
+fn real_wide(x: IntExpr) -> IntExpr {
+    real_shl(x, 0)
+}
+
+/// Static integer as a widened exact value via binary decomposition
+/// into constant shifts of one (avoids `Lit` wrap for magnitudes
+/// `≥ 2^(E-1)`; avoids the exponential doubling-table trees).
+fn real_small(k: i64) -> IntExpr {
+    if k == 0 {
+        return IntExpr::Lit(0, 0);
+    }
+    let neg = k < 0;
+    let mut mag = k.unsigned_abs();
+    let mut acc: Option<IntExpr> = None;
+    let mut b = 0u32;
+    while mag > 0 {
+        if mag & 1 == 1 {
+            let p = real_shl(IntExpr::Lit(1, 0), b);
+            acc = Some(match acc {
+                None => p,
+                Some(a) => IntExpr::Widen(WidenOp::Add, Box::new(a), Box::new(p)),
+            });
+        }
+        mag >>= 1;
+        b += 1;
+    }
+    let pos = acc.unwrap_or(IntExpr::Lit(0, 0));
+    if neg {
+        IntExpr::Widen(
+            WidenOp::Sub,
+            Box::new(IntExpr::Lit(0, 0)),
+            Box::new(pos),
+        )
+    } else {
+        pos
+    }
+}
+
+/// One per-scale candidate: lane equalities pinning the optimum at
+/// this scale, its value for pairwise ordering (`val_m` at static
+/// scale offset `off`), and its lane-feasibility gate (`feas`).
+/// Gates are load-bearing for pairwise targets: an infeasible scale
+/// (mantissa overfull or exponent out of lane) still computes a
+/// formula value, typically just above the input, which would
+/// spuriously kill the true optimum without gating.
+struct RealScaleCand {
+    eqs: Vec<Formula>,
+    val_m: IntExpr,
+    off: i64,
+    feas: Option<Formula>,
+}
+
+/// Lane-feasibility gate for a per-scale optimum at static offset `c`:
+/// the mantissa fits (`m2 ≤ mag_max`) and the exponent lands in lane
+/// (`emin ≤ e_a + c ≤ emax`), all widened-exact.
+fn real_scale_feas(
+    m2_w: &IntExpr,
+    ex_w: &IntExpr,
+    c: i64,
+    mag_max: i64,
+    emin: i64,
+    emax: i64,
+) -> Formula {
+    let esc = IntExpr::Widen(
+        WidenOp::Add,
+        Box::new(ex_w.clone()),
+        Box::new(real_small(c)),
+    );
+    ereal_and_all(vec![
+        ereal_icmp(IntCmpOp::Lte, m2_w.clone(), real_wide(IntExpr::Lit(mag_max, 0))),
+        ereal_icmp(IntCmpOp::Lte, real_wide(IntExpr::Lit(emin, 0)), esc.clone()),
+        ereal_icmp(IntCmpOp::Lte, esc, real_wide(IntExpr::Lit(emax, 0))),
+    ])
+}
+
+/// Per-scale successor optimum at static offset `c` (`e' = e_a + c`)
+/// for strictly positive input lanes (`mx > 0` guarded outside):
+/// smallest odd `m''` above `t = mx/2^c`, as
+/// `m'' = q + 1 + r²` with `q = Div(mx, 2^c)`, `r = Rem(q, 2)`
+/// (branch-free odd rounding; `Div` divisor folded to `q = 0` when
+/// `2^c` cannot fit the problem width, where `t < 1` forces `m'' = 1`).
+/// No cap construction: overshoot implies the scale is infeasible
+/// (nothing in-lane lies above `t`), covered by the gate.
+fn real_succ_scale(
+    mx: &IntExpr,
+    ex_w: &IntExpr,
+    my_w: &IntExpr,
+    ey_w: &IntExpr,
+    c: i64,
+    ebits: u32,
+    mag_max: i64,
+    emin: i64,
+    emax: i64,
+) -> RealScaleCand {
+    let m2 = if c >= 0 && c >= (ebits as i64) - 1 {
+        // `2^c` exceeds the lane domain: `t < 1`, so the optimum is 1.
+        real_wide(IntExpr::Lit(1, 0))
+    } else if c >= 0 {
+        let two_c = IntExpr::Lit(1i64 << (c as u32), 0);
+        let q = IntExpr::Bin(IntBinOp::Div, Box::new(mx.clone()), Box::new(two_c.clone()));
+        let two = IntExpr::Lit(2, 0);
+        let r = IntExpr::Bin(IntBinOp::Rem, Box::new(q.clone()), Box::new(two));
+        let r2 = IntExpr::Widen(WidenOp::Mul, Box::new(r.clone()), Box::new(r));
+        let qw = real_wide(q);
+        let r2w = real_wide(r2);
+        IntExpr::Widen(
+            WidenOp::Add,
+            Box::new(IntExpr::Widen(
+                WidenOp::Add,
+                Box::new(qw),
+                Box::new(r2w),
+            )),
+            Box::new(real_wide(IntExpr::Lit(1, 0))),
+        )
+    } else {
+        // `t = mx·2^|c|` exact (free rewiring); unified odd-rounding
+        // on `q = t` (`r²` kills the truncation sign; parity survives).
+        let t = real_shl(mx.clone(), (-c) as u32);
+        let r = IntExpr::Bin(
+            IntBinOp::Rem,
+            Box::new(t.clone()),
+            Box::new(IntExpr::Lit(2, 0)),
+        );
+        let r2 = IntExpr::Widen(WidenOp::Mul, Box::new(r.clone()), Box::new(r));
+        IntExpr::Widen(
+            WidenOp::Add,
+            Box::new(IntExpr::Widen(WidenOp::Add, Box::new(t), Box::new(r2))),
+            Box::new(real_wide(IntExpr::Lit(1, 0))),
+        )
+    };
+    let e_pin = real_small(c);
+    let eqs = vec![
+        ereal_icmp(IntCmpOp::Eq, my_w.clone(), m2.clone()),
+        ereal_icmp(
+            IntCmpOp::Eq,
+            ey_w.clone(),
+            IntExpr::Widen(WidenOp::Add, Box::new(ex_w.clone()), Box::new(e_pin)),
+        ),
+    ];
+    let feas = real_scale_feas(&m2, ex_w, c, mag_max, emin, emax);
+    RealScaleCand {
+        eqs,
+        val_m: m2,
+        off: c,
+        feas: Some(feas),
+    }
+}
+
+/// Per-scale predecessor optima at static offset `c` for strictly
+/// positive input: largest below `t`, as up to two gated mains —
+/// - fit-main: `Q = Div(mx - 1, 2^c) > 0` with `m'' = Q - 1 + r²`
+///   (`r = Rem(Q, 2)`), gated on `Q ≠ 0`, mantissa fit, exponent fit;
+/// - cap-main: the lane cap `MAG` itself when it lies below `t`
+///   (`MAG·2^c < mx`, needed when the formula overshoots the lane),
+///   gated on that strict below-ness plus exponent fit.
+/// (The zero answer is a separate global disjunct built by the caller:
+/// all mains infeasible.) `Div` divisor folded to `Q = 0` when `2^c`
+/// cannot fit the problem width (then only the zero case applies).
+/// Returns the mains (each with its gate).
+fn real_pred_scale(
+    mx: &IntExpr,
+    ex_w: &IntExpr,
+    my_w: &IntExpr,
+    ey_w: &IntExpr,
+    c: i64,
+    ebits: u32,
+    mag_max: i64,
+    emin: i64,
+    emax: i64,
+) -> Vec<RealScaleCand> {
+    let e_pin = || {
+        ereal_icmp(
+            IntCmpOp::Eq,
+            ey_w.clone(),
+            IntExpr::Widen(
+                WidenOp::Add,
+                Box::new(ex_w.clone()),
+                Box::new(real_small(c)),
+            ),
+        )
+    };
+    let e_fit = || {
+        let esc = IntExpr::Widen(
+            WidenOp::Add,
+            Box::new(ex_w.clone()),
+            Box::new(real_small(c)),
+        );
+        ereal_and_all(vec![
+            ereal_icmp(IntCmpOp::Lte, real_wide(IntExpr::Lit(emin, 0)), esc.clone()),
+            ereal_icmp(IntCmpOp::Lte, esc, real_wide(IntExpr::Lit(emax, 0))),
+        ])
+    };
+    let mag_w = real_wide(IntExpr::Lit(mag_max, 0));
+    let mut out = Vec::new();
+    if c >= 0 && c >= (ebits as i64) - 1 {
+        // `t < 1`: no positive optimum at this scale (zero is global).
+        return out;
+    }
+    // Fit-main: `Q = floor((mx-1)/2^c)`, gate `Q ≠ 0`.
+    let q: IntExpr = if c >= 0 {
+        let two_c = IntExpr::Lit(1i64 << (c as u32), 0);
+        IntExpr::Bin(
+            IntBinOp::Div,
+            Box::new(IntExpr::Bin(
+                IntBinOp::Sub,
+                Box::new(mx.clone()),
+                Box::new(IntExpr::Lit(1, 0)),
+            )),
+            Box::new(two_c),
+        )
+    } else {
+        // `t = mx·2^|c|` exact rewiring; `Q = t - 1` (largest int
+        // below, `t` integral here).
+        IntExpr::Widen(
+            WidenOp::Sub,
+            Box::new(real_shl(mx.clone(), (-c) as u32)),
+            Box::new(real_wide(IntExpr::Lit(1, 0))),
+        )
+    };
+    let gate_nz = ereal_icmp(IntCmpOp::Neq, q.clone(), IntExpr::Lit(0, 0));
+    let r = IntExpr::Bin(
+        IntBinOp::Rem,
+        Box::new(q.clone()),
+        Box::new(IntExpr::Lit(2, 0)),
+    );
+    let r2 = IntExpr::Widen(WidenOp::Mul, Box::new(r.clone()), Box::new(r));
+    let qw = real_wide(q.clone());
+    let m2 = IntExpr::Widen(
+        WidenOp::Sub,
+        Box::new(IntExpr::Widen(WidenOp::Add, Box::new(qw), Box::new(r2))),
+        Box::new(real_wide(IntExpr::Lit(1, 0))),
+    );
+    let fit_gate = ereal_and_all(vec![
+        gate_nz,
+        ereal_icmp(IntCmpOp::Lte, m2.clone(), mag_w.clone()),
+        e_fit(),
+    ]);
+    out.push(RealScaleCand {
+        eqs: vec![
+            ereal_icmp(IntCmpOp::Eq, my_w.clone(), m2.clone()),
+            e_pin(),
+        ],
+        val_m: m2,
+        off: c,
+        feas: Some(fit_gate),
+    });
+    // Cap-main: `MAG` itself, gated on strict below-ness at this scale
+    // plus exponent fit (covers formula overshoot of the lane).
+    let cap_below = if c >= 0 {
+        ereal_icmp(
+            IntCmpOp::Lt,
+            real_shl(mag_w.clone(), c as u32),
+            real_wide(mx.clone()),
+        )
+    } else {
+        ereal_icmp(
+            IntCmpOp::Lt,
+            mag_w.clone(),
+            real_shl(real_wide(mx.clone()), (-c) as u32),
+        )
+    };
+    let cap_gate = ereal_and_all(vec![cap_below, e_fit()]);
+    out.push(RealScaleCand {
+        eqs: vec![
+            ereal_icmp(IntCmpOp::Eq, my_w.clone(), mag_w.clone()),
+            e_pin(),
+        ],
+        val_m: mag_w,
+        off: c,
+        feas: Some(cap_gate),
+    });
+    out
+}
+
+/// Pairwise ordering across per-scale candidates at balance shift `k`:
+/// `b ≤ V` for successor (`up`), `b ≥ V` for predecessor, scaled by
+/// exact constant shifts (`K + off ≥ 0` by construction).
+fn real_scale_ord(
+    up: bool,
+    b_w: &IntExpr,
+    b_off: i64,
+    v_w: &IntExpr,
+    v_off: i64,
+    k: u32,
+) -> Formula {
+    let bl = real_shl(b_w.clone(), (k as i64 + b_off) as u32);
+    let vr = real_shl(v_w.clone(), (k as i64 + v_off) as u32);
+    let (l, r, op) = if up {
+        (bl, vr, IntCmpOp::Lte)
+    } else {
+        (vr, bl, IntCmpOp::Lte)
+    };
+    ereal_icmp(op, l, r)
+}
+
+/// Successor (`up`) / predecessor core over strictly positive input
+/// lanes (`mx`, `ex`): disjunction over static scale offsets of
+/// [per-scale optimum pins + pairwise extremality]. `r` is the window
+/// radius (offsets `-r..=r`, a superset of the oracle window);
+/// `k = r + 1` balances pairwise shifts. `mag_max`/`emin`/`emax` are
+/// the lane bounds. Callers conjoin wellformedness and the positivity
+/// guard, and link mirrored (negated) lanes for negative inputs.
+/// Predecessor gains one global zero disjunct (all mains infeasible).
+#[allow(clippy::too_many_arguments)]
+fn real_next_core(
+    up: bool,
+    mx: &IntExpr,
+    ex: &IntExpr,
+    my: &IntExpr,
+    ey: &IntExpr,
+    ebits: u32,
+    mag_max: i64,
+    emin: i64,
+    emax: i64,
+    r: i64,
+) -> Formula {
+    let ex_w = real_wide(ex.clone());
+    let my_w = real_wide(my.clone());
+    let ey_w = real_wide(ey.clone());
+    // Collect per-scale mains.
+    let mut subs: Vec<RealScaleCand> = Vec::new();
+    let mut c = -r;
+    loop {
+        if up {
+            subs.push(real_succ_scale(
+                mx, &ex_w, &my_w, &ey_w, c, ebits, mag_max, emin, emax,
+            ));
+        } else {
+            subs.extend(real_pred_scale(
+                mx, &ex_w, &my_w, &ey_w, c, ebits, mag_max, emin, emax,
+            ));
+        }
+        if c >= r {
+            break;
+        }
+        c += 1;
+    }
+    let k = (r + 1) as u32;
+    // Pairwise extremality between mains (gated by definedness).
+    let mut ordered: Vec<Formula> = Vec::new();
+    for (i, s) in subs.iter().enumerate() {
+        let mut conj = s.eqs.clone();
+        for (j, t) in subs.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let cmp = real_scale_ord(up, &s.val_m, s.off, &t.val_m, t.off, k);
+            match &t.feas {
+                None => conj.push(cmp),
+                Some(f) => conj.push(Formula::Or(
+                    Box::new(Formula::Not(Box::new(f.clone()))),
+                    Box::new(cmp),
+                )),
+            }
+        }
+        ordered.push(ereal_and_all(conj));
+    }
+    if !up {
+        // Global zero: all mains infeasible (zero is below every
+        // positive main value, so no ordering is needed).
+        let mut conj = vec![ereal_icmp(
+            IntCmpOp::Eq,
+            my_w.clone(),
+            real_wide(IntExpr::Lit(0, 0)),
+        )];
+        for t in subs.iter() {
+            if let Some(f) = &t.feas {
+                conj.push(Formula::Not(Box::new(f.clone())));
+            }
+        }
+        ordered.push(ereal_and_all(conj));
+    }
+    ereal_or_all(ordered)
+}
 
 fn total_order_target(sig_arg: &Expr, rel_arg: &Expr) -> Option<(String, String)> {
     let Expr::Name(sig, _) = sig_arg else {

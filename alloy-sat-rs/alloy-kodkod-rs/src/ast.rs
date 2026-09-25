@@ -373,6 +373,10 @@ pub enum WidenOp {
     Sub,
     /// Variable shift-left with explicit exact output width in bits.
     Shl(u32),
+    /// Constant shift-left by `k` bits (exact rewiring, no gates).
+    /// For static scale alignment where a barrel shifter would waste
+    /// circuitry and risk amount-encoding wrap on narrow bitwidths.
+    ShlConst(u32),
     /// Exact widening multiplication (`w1 + w2` bits, no truncation).
     Mul,
 }

@@ -1642,6 +1642,14 @@ impl<'a> TemporalEval<'a> {
                 };
                 crate::eval::wrap_int(v, width, &self.overflow)
             }
+            crate::ast::WidenOp::ShlConst(k) => {
+                let v = (l as i128).checked_shl(k).unwrap_or(if l >= 0 {
+                    i128::MAX
+                } else {
+                    i128::MIN
+                });
+                crate::eval::wrap_int(v, 64, &self.overflow)
+            }
         })
     }
 

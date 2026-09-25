@@ -408,6 +408,8 @@ enum Rel {
     Lte,
     MayLte,
     ExactEq,
+    Gt,
+    Gte,
 }
 
 impl Rel {
@@ -419,6 +421,8 @@ impl Rel {
             Rel::Lte => "erealLTE",
             Rel::MayLte => "erealMayLTE",
             Rel::ExactEq => "erealExactEq",
+            Rel::Gt => "erealGT",
+            Rel::Gte => "erealGTE",
         }
     }
     /// Ground truth in exact integer arithmetic on closed intervals.
@@ -434,6 +438,8 @@ impl Rel {
             Rel::Lte => hi_a <= lo_b,
             Rel::MayLte => lo_b <= hi_a && hi_a <= hi_b,
             Rel::ExactEq => exact,
+            Rel::Gt => hi_b < lo_a,
+            Rel::Gte => hi_b <= lo_a,
         }
     }
 }
@@ -465,7 +471,7 @@ fn interval_comparisons_match_oracle() {
     let vals = [
         "0.5", "1.5", "2.0", "0.75", "8.0", "0.1", "-1.3e1", "1.2", "0.0", "-0.5",
     ];
-    let rels = [MayEq, Covers, Lt, Lte, MayLte, ExactEq];
+    let rels = [MayEq, Covers, Lt, Lte, MayLte, ExactEq, Gt, Gte];
     for &x in &vals {
         for &y in &vals {
             for &rel in &rels {
@@ -480,6 +486,8 @@ fn interval_pred_shapes() {
     // Literals hoist in the new predicates too.
     sat("one sig R1 extends EReal {}\nfact { R1 = 1.2 and erealLTE[R1, 8.0] }\nrun {} for 2 EReal");
     unsat("one sig R1 extends EReal {}\nfact { R1 = 1.2 and erealLT[R1, 0.5] }\nrun {} for 2 EReal");
+    sat("one sig R1 extends EReal {}\nfact { R1 = 1.2 and erealGT[R1, 0.5] }\nrun {} for 2 EReal");
+    unsat("one sig R1 extends EReal {}\nfact { R1 = 1.2 and erealGTE[R1, 8.0] }\nrun {} for 2 EReal");
     // Arity is checked.
     build_err(
         "pred p { some a: EReal | erealLT[a] }\nrun p for 2 EReal",

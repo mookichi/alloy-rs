@@ -2155,10 +2155,13 @@ fn print_help() {
     println!("notes: builtin `Real` (exact centre `c = m*2^e`, `EReal extends Real`):");
     println!("  `x.m`, `x.e` read the shared centre lanes (`m == 0` or odd);");
     println!("  `realAdd/Sub/Mul/Div[a,b,c]` (exact; inexact division is UNSAT),");
-    println!("  `realWellformed[x]`, `realEq`, `realLT`, `realLTE`;");
+    println!("  `realWellformed[x]`, `realEq`, `realLT`, `realLTE`, `realGT`, `realGTE`;");
     println!("  `setReal[x, 0.5]` binds dyadic literals only (non-dyadic fails loudly);");
     println!("  `setRealNearest/Down/Up[x, 0.1]` round to the m-width mantissa");
     println!("  (nearest half-even / toward -inf / toward +inf; error untracked);");
+    println!("  `realSucc/realPred[a, b]` pin the lane successor/predecessor;");
+    println!("  `realUp[x]`/`realDown[x]` functions (hoisted to skolem shape in");
+    println!("  predicate args; top-of-lane is UNSAT);");
     println!("  `R = 0.5` binds the centre for `Real`-rooted values;");
     println!("  `Real` is abstract like `EReal`: extenders partition it;");
     println!("  `for N Real` scopes free atoms (`for M EReal` needs `M <= N`).");
