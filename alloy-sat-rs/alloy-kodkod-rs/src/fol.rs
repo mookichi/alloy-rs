@@ -298,6 +298,17 @@ impl<'a> FolTranslator<'a> {
             }
             let _ = inst.add(r, &ts);
         }
+        // Lane int-layer (`group -> value -> atoms`): exact bounds are
+        // model-independent singletons, so copy them straight from the
+        // bounds. Without this, `Evaluator` lane reads (and hence
+        // lane-valued optimization costs) see an empty layer and
+        // report 0. Builtin `Int` bounds stay untouched (displayed
+        // `ints:` output must remain byte-identical).
+        for g in self.bounds.lane_groups() {
+            for (i, ts) in self.bounds.int_bounds_in(g) {
+                let _ = inst.add_int_in(g, i, ts);
+            }
+        }
         inst
     }
 
