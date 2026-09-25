@@ -297,10 +297,11 @@ fn module_mentions_ereal(module: &Module, scope: &Scope) -> bool {
         }
         match e {
             Expr::Name(n, _) if n == "EReal" => *hit = true,
-            // A decimal literal denotes an EReal value (lowered via
-            // lane equalities), so it implies EReal allocation even
-            // without any other EReal mention.
-            Expr::RealLit(..) => *hit = true,
+            // NOTE: a decimal literal does NOT imply `EReal` (it implies
+            // `Real`; see `module_mentions_real`). `EReal` lanes are
+            // allocated only on explicit `EReal` use, so pure-`Real`
+            // models carry no `EReal` population or `p`/`k` lanes.
+            Expr::RealLit(..) => {}
             Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom
             | Expr::StepAtom | Expr::Bits(..) => {}
             Expr::Bin(_, a, b) => {
