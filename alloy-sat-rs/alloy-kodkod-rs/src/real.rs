@@ -463,6 +463,18 @@ pub fn decimal_to_real_rounded(
     if v.is_valid(Some(mw)) { Some(v) } else { None }
 }
 
+/// Down/Up の組 (`decimal_to_real_rounded` の両端): dyadic 入力は
+/// `(v, v)`、非 dyadic は `(Down, Up)`。`None` は malformed・範囲外。
+/// 順序比較の bracket 意味論 (`X < L ⟺ X ≤ Down(L)` 等) の基礎。
+pub fn decimal_down_up(s: &str, m_width: Option<u32>) -> Option<(RealCenter, RealCenter)> {
+    if let Some(v) = decimal_to_real(s, m_width) {
+        return Some((v, v));
+    }
+    let d = decimal_to_real_rounded(s, m_width, RealRound::Down)?;
+    let u = decimal_to_real_rounded(s, m_width, RealRound::Up)?;
+    Some((d, u))
+}
+
 /// Exact rational `num/den` (`den > 0`)。検証・leaf 入力用。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rat {

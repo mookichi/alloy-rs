@@ -72,6 +72,11 @@ pub enum Expr {
     /// EReal *value* in `=`/`!=`, `setEReal`, and the `ereal*` predicates
     /// (rejected at lowering elsewhere). Never rounded.
     RealLit(String, usize),
+    /// Approximable decimal literal `(d)`: explicit opt-in to
+    /// literal→dyadic approximation where a value is needed
+    /// (nearest), or bracket comparison in order predicates.
+    /// Plain `RealLit` in exact positions is UNSAT when non-dyadic.
+    ApproxRealLit(String, usize),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Transpose(Box<Expr>),
     TClosure(Box<Expr>),
@@ -487,7 +492,7 @@ impl Expr {
             | Expr::Iden
             | Expr::IntAtom
             | Expr::StepAtom
-            | Expr::Bits(..) | Expr::RealLit(..) => false,
+            | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => false,
             Expr::LetBind(binds, body) => {
                 body.has_temporal() || binds.iter().any(|(_, e)| e.has_temporal())
             }
@@ -521,7 +526,7 @@ impl Expr {
             | Expr::Iden
             | Expr::IntAtom
             | Expr::StepAtom
-            | Expr::Bits(..) | Expr::RealLit(..) => false,
+            | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => false,
         }
     }
 
@@ -554,7 +559,7 @@ impl Expr {
             | Expr::Iden
             | Expr::IntAtom
             | Expr::StepAtom
-            | Expr::Bits(..) | Expr::RealLit(..) => false,
+            | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => false,
         }
     }
 }
@@ -887,7 +892,7 @@ pub(crate) fn scan_expr_int_set(e: &Expr, needs: &mut bool) {
         {
             *needs = true;
         }
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::StepAtom | Expr::RealLit(..) => {}
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::StepAtom | Expr::RealLit(..) | Expr::ApproxRealLit(..) => {}
         Expr::Bin(_, a, b) => {
             scan_expr_int_set(a, needs);
             scan_expr_int_set(b, needs);

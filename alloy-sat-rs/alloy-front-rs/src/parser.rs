@@ -1325,6 +1325,28 @@ impl Parser {
                 Ok(Expr::If(Box::new(c), Box::new(t), Box::new(e)))
             }
             Tok::LParen => {
+                // Approximable decimal literal `(d)` / `(-d)`: explicit
+                // opt-in to literal→dyadic approximation. Plain grouped
+                // decimals keep their grouping reading (dyadic-identical).
+                if let Tok::RealLit(s) = self.peek_at(1).clone() {
+                    if matches!(self.peek_at(2), Tok::RParen) {
+                        self.bump();
+                        self.bump();
+                        self.bump();
+                        return Ok(Expr::ApproxRealLit(s, pos));
+                    }
+                }
+                if matches!(self.peek_at(1), Tok::Minus) {
+                    if let Tok::RealLit(s) = self.peek_at(2).clone() {
+                        if matches!(self.peek_at(3), Tok::RParen) {
+                            self.bump();
+                            self.bump();
+                            self.bump();
+                            self.bump();
+                            return Ok(Expr::ApproxRealLit(format!("-{s}"), pos));
+                        }
+                    }
+                }
                 self.bump();
                 let e = self.rel_expr_top(in_sig)?;
                 self.expect(&Tok::RParen)?;

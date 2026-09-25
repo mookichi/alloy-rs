@@ -315,7 +315,8 @@ fn module_mentions_ereal(module: &Module, scope: &Scope) -> bool {
             // `Real`; see `module_mentions_real`). `EReal` lanes are
             // allocated only on explicit `EReal` use, so pure-`Real`
             // models carry no `EReal` population or `p`/`k` lanes.
-            Expr::RealLit(..) => {}
+            // The approximable spelling implies nothing more.
+            Expr::RealLit(..) | Expr::ApproxRealLit(..) => {}
             Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom
             | Expr::StepAtom | Expr::Bits(..) => {}
             Expr::Bin(_, a, b) => {
@@ -504,7 +505,7 @@ fn module_mentions_real(module: &Module, scope: &Scope) -> bool {
         }
         match e {
             Expr::Name(n, _) if n == "Real" => *hit = true,
-            Expr::RealLit(..) => *hit = true,
+            Expr::RealLit(..) | Expr::ApproxRealLit(..) => *hit = true,
             Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom
             | Expr::StepAtom | Expr::Bits(..) => {}
             Expr::Bin(_, a, b) => {
@@ -687,7 +688,7 @@ fn real_direct_mention(module: &Module) -> bool {
         match e {
             Expr::Name(n, _) if n == "Real" => *hit = true,
             Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom
-            | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) => {}
+            | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => {}
             Expr::Bin(_, a, b) => {
                 expr_hit(a, hit);
                 expr_hit(b, hit);

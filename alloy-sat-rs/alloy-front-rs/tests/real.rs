@@ -53,12 +53,12 @@ fn set_real_binds_dyadic_only() {
     sat("pred p { some x: Real | setReal[x, -1.5] }\nrun p for 2 Real");
     // Exact centre: 0.5 is (1, -1) after normalization.
     sat("pred p { some x: Real | setReal[x, 0.5] and x.m = 1 and x.e = -1 }\nrun p for 2 Real");
-    // Non-dyadic literals fail loudly (no rounding in `setReal` itself;
-    // use the rounding variants below).
-    build_err(
-        "pred p { some x: Real | setReal[x, 0.1] }\nrun p for 2 Real",
-        "setRealNearest",
-    );
+    // Plain non-dyadic literals are UNSAT (no dyadic centre equals
+    // them; approximation needs the `(d)` spelling or the rounding
+    // variants below).
+    unsat("pred p { some x: Real | setReal[x, 0.1] }\nrun p for 2 Real");
+    // Approximable spelling binds nearest.
+    sat("pred p { some x, y: Real | setReal[x, (0.1)] and setRealNearest[y, 0.1] and realEq[x, y] }\nrun p for 2 Real");
 }
 
 #[test]
@@ -82,6 +82,27 @@ fn set_real_rounding_variants() {
         "pred p { some x, y: Real | setRealNearest[x, y] }\nrun p for 2 Real",
         "decimal literal",
     );
+}
+
+#[test]
+fn approx_literal_paren_spelling() {
+    // `(d)` in comparisons: bracket semantics (verdict-exact).
+    sat("pred p { some x: Real | setReal[x, 0.0625] and realLT[x, (0.1)] }\nrun p for 2 Real");
+    unsat("pred p { some x: Real | setReal[x, 0.125] and realLT[x, (0.1)] }\nrun p for 2 Real");
+    sat("pred p { some x: Real | setReal[x, 0.125] and realGT[x, (0.1)] }\nrun p for 2 Real");
+    // Plain non-dyadic in comparisons is UNSAT (no approximation).
+    unsat("pred p { some x: Real | setReal[x, 0.0625] and realLT[x, 0.1] }\nrun p for 2 Real");
+    // `(d)` in `=` binds nearest.
+    sat("pred p { some x, y: Real | setReal[x, (0.5)] and setReal[y, 0.5] and realEq[x, y] }\nrun p for 2 Real");
+    sat("pred p { some x, y: Real | setReal[x, (0.1)] and setRealNearest[y, 0.1] and realEq[x, y] }\nrun p for 2 Real");
+    // Plain non-dyadic in exact positions is UNSAT (composable).
+    unsat("pred p { some a, b, c: Real | setReal[a, 0.5] and realAdd[a, 0.1, c] }\nrun p for 3 Real");
+    unsat("pred p { some x: Real | setReal[x, 0.5] and x = 0.1 }\nrun p for 2 Real");
+    // `(d)` in `=` with no dyadic centre equal is likewise UNSAT.
+    unsat("pred p { some x: Real | setReal[x, 0.5] and x = (0.1) }\nrun p for 2 Real");
+    unsat("one sig R extends Real {}\nfact { R = 0.1 }\nrun {} for 1 Real");
+    // Both-literal approximable equality: nearest-centre equality.
+    sat("pred p { (0.1) = (0.1) }\nrun p for 0 Real");
 }
 
 #[test]

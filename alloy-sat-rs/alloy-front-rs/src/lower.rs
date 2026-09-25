@@ -9,7 +9,10 @@ use alloy_kodkod_rs::ast::{
 };
 use alloy_kodkod_rs::bounds::Bounds;
 use alloy_kodkod_rs::mepk::{decimal_to_mepk, Mepk};
-use alloy_kodkod_rs::real::{decimal_to_real, decimal_to_real_rounded, RealCenter, RealRound};
+use alloy_kodkod_rs::real::{
+    decimal_down_up, decimal_to_real, decimal_to_real_rounded, RealCenter, RealRound,
+};
+use alloy_kodkod_rs::mepk::decimal_rational;
 use alloy_kodkod_rs::opt::OptSense;
 use alloy_kodkod_rs::relation::{RelationId, RelationPool};
 use std::collections::HashMap;
@@ -1448,7 +1451,8 @@ impl<'a> Ctx<'a> {
             | Expr::IntAtom
             | Expr::StepAtom
             | Expr::Bits(..)
-            | Expr::RealLit(..) => None,
+            | Expr::RealLit(..)
+            | Expr::ApproxRealLit(..) => None,
             Expr::Bin(op, a, b) => {
                 let na = self.hoist_real_fun(a, out);
                 let nb = self.hoist_real_fun(b, out);
@@ -1648,31 +1652,55 @@ impl<'a> Ctx<'a> {
                 }
                 let wv = self.ereal_shift_width()?;
                 let sign = if name == "realAdd" { 1 } else { -1 };
-                real_add_sub(&self.real_op(&args[0])?, &self.real_op(&args[1])?, &self.real_op(&args[2])?, sign, wv)
+                let (a, b, r) = match (
+                    self.real_op_or_unsat(&args[0])?,
+                    self.real_op_or_unsat(&args[1])?,
+                    self.real_op_or_unsat(&args[2])?,
+                ) {
+                    (Some(a), Some(b), Some(r)) => (a, b, r),
+                    // Plain non-dyadic operand: no dyadic centre can
+                    // occupy the position — the predicate is UNSAT.
+                    _ => return Ok(Some(self.lower_formula(arena, &Formula::Const(false), env)?)),
+                };
+                real_add_sub(&a, &b, &r, sign, wv)
             }
             "realMul" | "realDiv" => {
                 if args.len() != 3 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 3 args")));
                 }
                 let wv = self.ereal_shift_width_mul()?;
+                let (a, b, r) = match (
+                    self.real_op_or_unsat(&args[0])?,
+                    self.real_op_or_unsat(&args[1])?,
+                    self.real_op_or_unsat(&args[2])?,
+                ) {
+                    (Some(a), Some(b), Some(r)) => (a, b, r),
+                    _ => return Ok(Some(self.lower_formula(arena, &Formula::Const(false), env)?)),
+                };
                 if name == "realMul" {
-                    real_mul(&self.real_op(&args[0])?, &self.real_op(&args[1])?, &self.real_op(&args[2])?, wv)
+                    real_mul(&a, &b, &r, wv)
                 } else {
-                    real_div(&self.real_op(&args[0])?, &self.real_op(&args[1])?, &self.real_op(&args[2])?, wv)
+                    real_div(&a, &b, &r, wv)
                 }
             }
             "realWellformed" => {
                 if args.len() != 1 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
                 }
-                real_wellformed(&self.real_op(&args[0])?)
+                match self.real_op_or_unsat(&args[0])? {
+                    Some(a) => real_wellformed(&a),
+                    None => Formula::Const(false),
+                }
             }
             "realEq" => {
                 if args.len() != 2 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
                 }
                 let wv = self.ereal_shift_width()?;
-                let (a, b) = (self.real_op(&args[0])?, self.real_op(&args[1])?);
+                let (a, b) = match (self.real_op_or_unsat(&args[0])?, self.real_op_or_unsat(&args[1])?) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Ok(Some(self.lower_formula(arena, &Formula::Const(false), env)?)),
+                };
                 ereal_and_all(
                     real_all_wellformed(&[&a, &b])
                         .into_iter()
@@ -1687,15 +1715,102 @@ impl<'a> Ctx<'a> {
                 let wv = self.ereal_shift_width()?;
                 // `GT`/`GTE` swap the operands through the same exact
                 // scaled comparison as `LT`/`LTE`.
-                let (a, b) = if name == "realGT" || name == "realGTE" {
-                    (self.real_op(&args[1])?, self.real_op(&args[0])?)
+                let (l, r) = if name == "realGT" || name == "realGTE" {
+                    (&args[1], &args[0])
                 } else {
-                    (self.real_op(&args[0])?, self.real_op(&args[1])?)
+                    (&args[0], &args[1])
                 };
-                let op = if name == "realLT" || name == "realGT" {
+                // Strictness follows the original name (the swap above
+                // preserves it: `GT`→`Lt`, `GTE`→`Lte`).
+                let strict = name == "realLT" || name == "realGT";
+                let op = if strict { IntCmpOp::Lt } else { IntCmpOp::Lte };
+                // Bracket semantics for non-dyadic literals (plain or
+                // `(d)` alike): `X < L ⟺ X ≤ Down(L)`,
+                // `L < X ⟺ Up(L) ≤ X` (verdict-exact: `Down(L) < L`
+                // strictly, and every lane value is dyadic).
+                // Dyadic literals take the legacy exact path.
+                let mw = self.res.mepk_widths.m_width;
+                // Plain non-dyadic literal anywhere: the predicate is
+                // UNSAT (no approximation without the `(d)` spelling).
+                for e in [l, r] {
+                    if let Expr::RealLit(s, _) = e {
+                        if decimal_to_real(s, Some(mw)).is_none()
+                            && decimal_down_up(s, Some(mw)).is_some()
+                        {
+                            return Ok(Some(
+                                self.lower_formula(arena, &Formula::Const(false), env)?,
+                            ));
+                        }
+                    }
+                }
+                // Bracket endpoint (`upper` selects `Up`/`Down`) for
+                // `(d)` non-dyadic literals only; `None` for
+                // non-literals and dyadic literals.
+                let br = |e: &Expr, upper: bool| -> LResult<Option<RealCenter>> {
+                    let s = match e {
+                        Expr::ApproxRealLit(s, _) => s,
+                        _ => return Ok(None),
+                    };
+                    if decimal_to_real(s, Some(mw)).is_some() {
+                        return Ok(None);
+                    }
+                    match decimal_down_up(s, Some(mw)) {
+                        Some((d, u)) => Ok(Some(if upper { u } else { d })),
+                        None => Err(FrontError::Resolve(format!(
+                            "cannot convert ({s:?}) (malformed or outside the m lane)"
+                        ))),
+                    }
+                };
+                fn lit_str(e: &Expr) -> Option<&String> {
+                    match e {
+                        Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => Some(s),
+                        _ => None,
+                    }
+                }
+                // Both sides non-dyadic literals: exact rational compare
+                // (no lanes involved; a single bracket endpoint each
+                // would be sufficient-only, hence unsound).
+                if let (Some(s1), Some(s2)) = (lit_str(l), lit_str(r)) {
+                    let dy1 = decimal_to_real(s1, Some(mw)).is_some();
+                    let dy2 = decimal_to_real(s2, Some(mw)).is_some();
+                    if !dy1 || !dy2 {
+                        let (n1, d1) = decimal_rational(s1).ok_or_else(|| {
+                            FrontError::Resolve(format!(
+                                "cannot convert {s1:?} (malformed or outside the i128 oracle range)"
+                            ))
+                        })?;
+                        let (n2, d2) = decimal_rational(s2).ok_or_else(|| {
+                            FrontError::Resolve(format!(
+                                "cannot convert {s2:?} (malformed or outside the i128 oracle range)"
+                            ))
+                        })?;
+                        let (lhs, rhs) = (
+                            n1.checked_mul(d2).ok_or_else(|| {
+                                FrontError::Resolve("rational comparison overflow".to_string())
+                            })?,
+                            n2.checked_mul(d1).ok_or_else(|| {
+                                FrontError::Resolve("rational comparison overflow".to_string())
+                            })?,
+                        );
+                        let holds = if strict { lhs < rhs } else { lhs <= rhs };
+                        return Ok(Some(self.lower_formula(arena, &Formula::Const(holds), env)?));
+                    }
+                }
+                // Resolve: bracketed endpoint consts replace non-dyadic
+                // literals (strictness absorbed: `LT`→`LTE`); dyadic and
+                // variables take the exact path.
+                let (bl, bb) = (br(l, true)?, br(r, false)?);
+                let op = if bl.is_some() || bb.is_some() {
+                    IntCmpOp::Lte
+                } else if strict {
                     IntCmpOp::Lt
                 } else {
                     IntCmpOp::Lte
+                };
+                let (a, b) = match (bl, bb) {
+                    (Some(v), _) => (RealOp::Const(v), self.real_op(r)?),
+                    (None, Some(v)) => (self.real_op(l)?, RealOp::Const(v)),
+                    (None, None) => (self.real_op(l)?, self.real_op(r)?),
                 };
                 ereal_and_all(
                     real_all_wellformed(&[&a, &b])
@@ -1940,7 +2055,7 @@ impl<'a> Ctx<'a> {
     /// Out-of-range literals fail loudly, as in `setEReal`.
     fn ereal_op<'e>(&self, e: &'e Expr) -> LResult<ERealOp<'e>> {
         match e {
-            Expr::RealLit(s, _) => {
+            Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => {
                 let conv = decimal_to_mepk(s, self.ereal_max_p()).ok_or_else(|| {
                     FrontError::Resolve(format!(
                         "cannot convert {s:?} (malformed or outside the i128 oracle range)"
@@ -1954,8 +2069,10 @@ impl<'a> Ctx<'a> {
 
     /// Resolve a `Real` operand: dyadic decimal literals become
     /// `RealConstant` centres inline (no witness atoms, no scope consumed);
-    /// anything else stays an atom reference. Non-dyadic literals fail
-    /// loudly (`Real` never rounds).
+    /// approximable `(d)` literals become their nearest centre;
+    /// anything else stays an atom reference. Malformed/range literals
+    /// fail loudly; plain non-dyadic literals fail loudly here too —
+    /// callers needing UNSAT-instead-of-error use `real_op_or_unsat`.
     fn real_op<'e>(&self, e: &'e Expr) -> LResult<RealOp<'e>> {
         match e {
             Expr::RealLit(s, _) => {
@@ -1967,7 +2084,40 @@ impl<'a> Ctx<'a> {
                 })?;
                 Ok(RealOp::Const(v))
             }
+            Expr::ApproxRealLit(s, _) => {
+                let mw = self.res.mepk_widths.m_width;
+                let v = decimal_to_real_rounded(s, Some(mw), RealRound::Nearest).ok_or_else(|| {
+                    FrontError::Resolve(format!(
+                        "cannot convert ({s:?}) to Real (malformed or outside the m lane)"
+                    ))
+                })?;
+                Ok(RealOp::Const(v))
+            }
             _ => Ok(RealOp::Ref(e)),
+        }
+    }
+
+    /// `real_op` with plain-non-dyadic mapped to whole-predicate-false:
+    /// `None` means the enclosing predicate is UNSAT (no dyadic centre
+    /// equals the literal — composable, unlike loud errors).
+    /// Malformed/range literals still fail loudly.
+    fn real_op_or_unsat<'e>(&self, e: &'e Expr) -> LResult<Option<RealOp<'e>>> {
+        match e {
+            Expr::RealLit(s, _) => {
+                let mw = self.res.mepk_widths.m_width;
+                if decimal_to_real(s, Some(mw)).is_some() {
+                    return self.real_op(e).map(Some);
+                }
+                // Distinguish approximable (UNSAT) from malformed (loud).
+                if decimal_to_real_rounded(s, Some(mw), RealRound::Nearest).is_some() {
+                    Ok(None)
+                } else {
+                    Err(FrontError::Resolve(format!(
+                        "cannot convert {s:?} to Real (malformed or outside the m lane)"
+                    )))
+                }
+            }
+            _ => self.real_op(e).map(Some),
         }
     }
 
@@ -2752,8 +2902,49 @@ impl<'a> Ctx<'a> {
                 let eq = c1.v == c2.v;
                 Ok(Some(Formula::Const(if neg { !eq } else { eq })))
             }
-            (Expr::RealLit(..), other) | (other, Expr::RealLit(..)) => {
-                let lit = if matches!(l, Expr::RealLit(..)) { l } else { r };
+            (Expr::ApproxRealLit(..), Expr::ApproxRealLit(..))
+            | (Expr::RealLit(..), Expr::ApproxRealLit(..))
+            | (Expr::ApproxRealLit(..), Expr::RealLit(..)) => {
+                // `=`/`!=` with an approximable side: nearest-centre
+                // equality (verdict-exact only when both sides' nearest
+                // coincide semantics hold; both-constant so direct).
+                fn approx_centre(
+                    mw: u32,
+                    e: &Expr,
+                ) -> Result<RealCenter, FrontError> {
+                    let (s, approx) = match e {
+                        Expr::RealLit(s, _) => (s.as_str(), false),
+                        Expr::ApproxRealLit(s, _) => (s.as_str(), true),
+                        _ => unreachable!(),
+                    };
+                    if approx {
+                        decimal_to_real_rounded(s, Some(mw), RealRound::Nearest).ok_or_else(|| {
+                            FrontError::Resolve(format!(
+                                "cannot convert ({s:?}) (malformed or outside the m lane)"
+                            ))
+                        })
+                    } else {
+                        decimal_to_real(s, Some(mw)).ok_or_else(|| {
+                            FrontError::Resolve(format!(
+                                "cannot convert {s:?} exactly (non-dyadic; wrap it as ({s}) to approximate)"
+                            ))
+                        })
+                    }
+                }
+                let mw0 = self.res.mepk_widths.m_width;
+                let (c1, c2) = (approx_centre(mw0, l)?, approx_centre(mw0, r)?);
+                let eq = c1 == c2;
+                Ok(Some(Formula::Const(if neg { !eq } else { eq })))
+            }
+            (Expr::RealLit(..), other)
+            | (other, Expr::RealLit(..))
+            | (Expr::ApproxRealLit(..), other)
+            | (other, Expr::ApproxRealLit(..)) => {
+                let lit = if matches!(l, Expr::RealLit(..) | Expr::ApproxRealLit(..)) {
+                    l
+                } else {
+                    r
+                };
                 if self.lane_group_of(other).is_some() {
                     return Err(FrontError::Resolve(
                         "type mismatch: decimal literals cannot appear in integer lane position (e.g. `x.m = 3.14`); compare EReal values instead"
@@ -2765,11 +2956,25 @@ impl<'a> Ctx<'a> {
                 // values, quantifier variables, unrecognized shapes)
                 // uses the exact-centre `setReal` reading (`m`/`e`
                 // only — still centre-correct for `EReal` atoms, with
-                // `p`/`k` left free).
+                // `p`/`k` left free). Plain non-dyadic `Real` literals
+                // are UNSAT (`=`)/true (`!=`); `(d)` binds nearest.
                 let body = if self.expr_is_ereal_rooted(other) {
                     ereal_set(other, lit, max_p)?
                 } else {
-                    real_set(other, lit, self.res.mepk_widths.m_width)?
+                    let mw = self.res.mepk_widths.m_width;
+                    let lit_text = match lit {
+                        Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => s.as_str(),
+                        _ => unreachable!(),
+                    };
+                    let is_approx = matches!(lit, Expr::ApproxRealLit(..));
+                    if !is_approx
+                        && decimal_to_real(lit_text, Some(mw)).is_none()
+                        && decimal_to_real_rounded(lit_text, Some(mw), RealRound::Nearest).is_some()
+                    {
+                        // No dyadic centre equals the literal.
+                        return Ok(Some(Formula::Const(neg)));
+                    }
+                    real_set(other, lit, mw)?
                 };
                 Ok(Some(if neg {
                     Formula::Not(Box::new(body))
@@ -3038,9 +3243,9 @@ impl<'a> Ctx<'a> {
                     None => (arena.constant(kk::ConstantExpr::Empty), 1),
                 }
             }
-            Expr::RealLit(..) => {
+            Expr::RealLit(..) | Expr::ApproxRealLit(..) => {
                 return Err(FrontError::Resolve(
-                    "decimal literals are only valid in EReal value positions (`=`, `!=`, `setEReal`, `erealAdd`/`erealSub`/`erealMul`/`erealDiv`/`erealExactEq`/`erealMayEq`/`erealCovers`/`erealLT`/`erealLTE`/`erealMayLTE`/`erealGT`/`erealGTE`/`erealWellformed`/`erealDivGuard`/`erealValid`)".to_string(),
+                    "decimal literals are only valid in Real/EReal value positions (`=`, `!=`, `setReal`, `setEReal`, `real*`, `ereal*`); approximable literals `(d)` additionally allow `real*` rounding positions".to_string(),
                 ));
             }
             Expr::Name(n, pos) => {
@@ -3338,13 +3543,22 @@ impl<'a> Ctx<'a> {
                     if args.len() != 1 {
                         return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
                     }
-                    if let Expr::RealLit(s, _) = &args[0] {
+                    if let Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) = &args[0] {
+                        let approx = matches!(&args[0], Expr::ApproxRealLit(..));
                         let w = &self.res.mepk_widths;
-                        let v = decimal_to_real(s, Some(w.m_width)).ok_or_else(|| {
-                            FrontError::Resolve(format!(
-                                "cannot convert {s:?} to Real exactly; round it with setRealNearest first"
-                            ))
-                        })?;
+                        let v = if approx {
+                            decimal_to_real_rounded(s, Some(w.m_width), RealRound::Nearest).ok_or_else(|| {
+                                FrontError::Resolve(format!(
+                                    "cannot convert ({s:?}) to Real (malformed or outside the m lane)"
+                                ))
+                            })?
+                        } else {
+                            decimal_to_real(s, Some(w.m_width)).ok_or_else(|| {
+                                FrontError::Resolve(format!(
+                                    "cannot convert {s:?} to Real exactly; round it with setRealNearest first"
+                                ))
+                            })?
+                        };
                         let nv = if name == "realUp" {
                             alloy_kodkod_rs::real::next_up(&v, w.m_width, w.e_width)
                         } else {
@@ -4418,7 +4632,7 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
 fn subst_expr(e: &Expr, from: &str, to: &str) -> Expr {
     match e {
         Expr::Name(n, p) if n == from => Expr::Name(to.to_string(), *p),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) => {
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => {
             e.clone()
         }
         Expr::Bin(op, a, b) => Expr::Bin(
@@ -4540,7 +4754,7 @@ fn strip_mult(e: &Expr) -> Expr {
         Expr::Prime(x) => Expr::Prime(Box::new(strip_mult(x))),
         Expr::AtExpr(x) => Expr::AtExpr(Box::new(strip_mult(x))),
         Expr::LetBind(binds, body) => Expr::LetBind(binds.clone(), Box::new(strip_mult(body))),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) => {
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => {
             e.clone()
         }
     }
@@ -4552,7 +4766,7 @@ fn strip_mult(e: &Expr) -> Expr {
 fn mentions_int_expr(e: &Expr) -> bool {
     match e {
         Expr::IntAtom | Expr::Bits(..) => true,
-        Expr::RealLit(..) => false,
+        Expr::RealLit(..) | Expr::ApproxRealLit(..) => false,
         Expr::Name(n, _) => n == "int" || n == "Int" || n == "Signed",
         Expr::ArrowMult(_, inner) | Expr::LeadMult(_, inner) => mentions_int_expr(inner),
         Expr::Bin(_, a, b) => mentions_int_expr(a) || mentions_int_expr(b),
@@ -5592,7 +5806,7 @@ fn ereal_div_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32) -> Formula {
 /// through `f64`. Out-of-range literals fail loudly at lowering.
 fn ereal_set(x: &Expr, lit: &Expr, max_p: u32) -> LResult<Formula> {
     let s = match lit {
-        Expr::RealLit(s, _) => s.clone(),
+        Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => s.clone(),
         _ => {
             return Err(FrontError::Resolve(
                 "setEReal expects a decimal literal (e.g. 3.14) as its second argument".to_string(),
@@ -5756,23 +5970,41 @@ fn real_div(a: &RealOp, b: &RealOp, r: &RealOp, wv: u32) -> Formula {
 /// conversion. Non-dyadic literals fail loudly (no rounding; use the
 /// `setRealNearest/Down/Up` variants below).
 fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
-    let s = match lit {
-        Expr::RealLit(s, _) => s.clone(),
+    // Plain `d`: exact dyadic only; non-dyadic-but-approximable is UNSAT
+    // (no dyadic centre equals it). `(d)`: nearest binding.
+    // Malformed/range literals still fail loudly.
+    let (s, approx) = match lit {
+        Expr::RealLit(s, _) => (s.clone(), false),
+        Expr::ApproxRealLit(s, _) => (s.clone(), true),
         _ => {
             return Err(FrontError::Resolve(
-                "setReal expects a decimal literal (e.g. 0.5) as its second argument".to_string(),
+                "setReal expects a decimal literal (e.g. 0.5) or (0.1) as its second argument".to_string(),
             ))
         }
     };
-    let v = decimal_to_real(&s, Some(m_width)).ok_or_else(|| {
-        FrontError::Resolve(format!(
-            "setReal: cannot convert {s:?} exactly (non-dyadic, malformed, or outside the lane range; try setRealNearest/setRealDown/setRealUp)"
-        ))
-    })?;
-    Ok(ereal_and_all(vec![
-        Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "m"), IntExpr::Lit(v.m as i64, 0), 0),
-        Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "e"), IntExpr::Lit(v.e as i64, 0), 0),
-    ]))
+    if approx {
+        let v = decimal_to_real_rounded(&s, Some(m_width), RealRound::Nearest).ok_or_else(|| {
+            FrontError::Resolve(format!(
+                "setReal: cannot convert ({s:?}) (malformed or outside the lane range)"
+            ))
+        })?;
+        return Ok(ereal_and_all(vec![
+            Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "m"), IntExpr::Lit(v.m as i64, 0), 0),
+            Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "e"), IntExpr::Lit(v.e as i64, 0), 0),
+        ]));
+    }
+    if let Some(v) = decimal_to_real(&s, Some(m_width)) {
+        return Ok(ereal_and_all(vec![
+            Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "m"), IntExpr::Lit(v.m as i64, 0), 0),
+            Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "e"), IntExpr::Lit(v.e as i64, 0), 0),
+        ]));
+    }
+    if decimal_to_real_rounded(&s, Some(m_width), RealRound::Nearest).is_some() {
+        return Ok(Formula::Const(false));
+    }
+    Err(FrontError::Resolve(format!(
+        "setReal: cannot convert {s:?} exactly (malformed or outside the lane range)"
+    )))
 }
 
 /// `setRealNearest/Down/Up[x, lit]`: bind `x`'s `(m, e)` lanes to the
@@ -5783,7 +6015,7 @@ fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
 /// with Down+Up when the error matters.
 fn real_set_rounded(x: &Expr, lit: &Expr, m_width: u32, mode: RealRound, name: &str) -> LResult<Formula> {
     let s = match lit {
-        Expr::RealLit(s, _) => s.clone(),
+        Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => s.clone(),
         _ => {
             return Err(FrontError::Resolve(format!(
                 "{name} expects a decimal literal (e.g. 0.1) as its second argument"
@@ -6489,7 +6721,7 @@ fn field_mult_constraint(
 fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
     match e {
         Expr::Name(n, _) if n == from => to.clone(),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) => {
+        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => {
             e.clone()
         }
         Expr::Bin(op, a, b) => Expr::Bin(

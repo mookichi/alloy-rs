@@ -2156,7 +2156,9 @@ fn print_help() {
     println!("  `x.m`, `x.e` read the shared centre lanes (`m == 0` or odd);");
     println!("  `realAdd/Sub/Mul/Div[a,b,c]` (exact; inexact division is UNSAT),");
     println!("  `realWellformed[x]`, `realEq`, `realLT`, `realLTE`, `realGT`, `realGTE`;");
-    println!("  `setReal[x, 0.5]` binds dyadic literals only (non-dyadic fails loudly);");
+    println!("  `setReal[x, 0.5]` binds dyadic literals only (plain non-dyadic is UNSAT);");
+    println!("  `(d)` opts into approximation: nearest binding in `=`/`setReal`,");
+    println!("  bracket comparison in `realLT/LTE/GT/GTE` (`X < (L)` iff `X <= Down(L)`);");
     println!("  `setRealNearest/Down/Up[x, 0.1]` round to the m-width mantissa");
     println!("  (nearest half-even / toward -inf / toward +inf; error untracked);");
     println!("  `realSucc/realPred[a, b]` pin the lane successor/predecessor;");
