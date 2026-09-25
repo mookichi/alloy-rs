@@ -192,7 +192,12 @@ fn run_with_timing(source: &str, source_desc: &str, cli: &Cli) {
                         .cost
                         .map(|c| format!(" cost={c}"))
                         .unwrap_or_default();
-                    println!("{i:02}. {kind:<8} {name:<20} {models} {tag}{cost}  solve={}", fmt_dur(dt));
+                    let calls = if cli.timing {
+                        format!(" calls={}", sol.sat_calls)
+                    } else {
+                        String::new()
+                    };
+                    println!("{i:02}. {kind:<8} {name:<20} {models} {tag}{cost}{calls}  solve={}", fmt_dur(dt));
                     if let Some(ref inst) = sol.instance {
                         print_solution(inst);
                     }

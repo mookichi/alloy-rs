@@ -213,6 +213,8 @@ pub fn solve_opt_with<S: SatSolver>(
                 .into(),
         ));
     }
+    let t_all = std::time::Instant::now();
+    let timing = std::env::var_os("ALLOY_TIMING").is_some();
     let mut translator = FolTranslator::with_options(
         crate::BoolCtx::new(),
         bounds,
@@ -220,6 +222,7 @@ pub fn solve_opt_with<S: SatSolver>(
         no_overflow,
     );
     let root = translator.formula_ref(arena, formula, &[])?;
+    let dt_fol = t_all.elapsed();
 
     // Relations appearing in cell objectives need leaf circuits (and
     // hence primary slots) even when the formula never mentions them.
@@ -266,6 +269,19 @@ pub fn solve_opt_with<S: SatSolver>(
         }
         Objective::Weighted { .. } | Objective::And { .. } | Objective::Collected => Vec::new(),
     };
+    if timing {
+        let widths: Vec<usize> = int_targets.iter().map(|(b, _)| b.len()).collect();
+        eprintln!(
+            "[opt] fol={}ms int_targets={} widths={:?} refs={} joins={} memohit={} memomiss={}",
+            dt_fol.as_millis(),
+            int_targets.len(),
+            widths,
+            translator.stats.formula_refs,
+            translator.stats.matrix_join,
+            translator.memo_hits,
+            translator.memo_miss,
+        );
+    }
     let max_primary = translator.ctx.num_slots();
     let ctx = translator.ctx.clone();
     // Register every primary slot up front. Later emissions do this
@@ -400,7 +416,19 @@ pub fn solve_opt_with<S: SatSolver>(
     // Feasibility probe under no assumptions: UNSAT here means the hard
     // formula itself is unsatisfiable (reported, not an error).
     let mut sat_calls = 1;
-    if !solver.solve() {
+    let t_probe = std::time::Instant::now();
+    let feasible = solver.solve();
+    let dt_probe = t_probe.elapsed();
+    if timing {
+        eprintln!(
+            "[opt] cnf_emit_done softs={} total_weight={} probe={}ms nvars={}",
+            softs.len(),
+            softs.iter().map(|&(_, w)| w).sum::<i64>(),
+            dt_probe.as_millis(),
+            solver.num_variables(),
+        );
+    }
+    if !feasible {
         return Ok(unsat_solution(max_primary));
     }
 
@@ -451,6 +479,8 @@ pub fn solve_opt_with<S: SatSolver>(
         .ok_or_else(|| TranslateError::Solver("objective weights overflow i64".into()))?;
 
     let mut rounds: i64 = 0;
+    let mut dt_sat_total = std::time::Duration::ZERO;
+    let mut dt_sat_max = std::time::Duration::ZERO;
     loop {
         let mut sel_to_idx: HashMap<i64, usize> = HashMap::new();
         for (i, it) in items.iter().enumerate() {
@@ -460,7 +490,23 @@ pub fn solve_opt_with<S: SatSolver>(
             }
         }
         sat_calls += 1;
-        if solver.solve() {
+        let t_round = std::time::Instant::now();
+        let sat = solver.solve();
+        let dt_round = t_round.elapsed();
+        dt_sat_total += dt_round;
+        dt_sat_max = dt_sat_max.max(dt_round);
+        if sat {
+            if timing {
+                eprintln!(
+                    "[opt] done rounds={} sat_calls={} sat_total={}ms sat_max={}ms elapsed={}ms nvars={}",
+                    rounds,
+                    sat_calls,
+                    dt_sat_total.as_millis(),
+                    dt_sat_max.as_millis(),
+                    t_all.elapsed().as_millis(),
+                    solver.num_variables(),
+                );
+            }
             let instance =
                 Some(translator.materialize(|slot| SatSolver::value_of(solver, slot as i64)));
             let mut cost = eval_cost(arena, &objective, instance.as_ref().unwrap())?;
