@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 pub const DEFAULT_SCOPE: u32 = 3;
 
-/// Bit-lane group ids for the builtin `EReal` lanes in the kodkod
+/// Bit-lane group ids for the builtin `Real`/`EReal` lanes in the kodkod
 /// int-bound group registry (`Bounds::bound_exactly_int_in`).
 /// Group 0 stays the builtin `Int` namespace.
 pub const LANE_M: u32 = 1;
@@ -24,11 +24,33 @@ pub const LANE_E: u32 = 2;
 pub const LANE_P: u32 = 3;
 pub const LANE_K: u32 = 4;
 
-/// Builtin `EReal` field lanes: (field name, bit-lane group).
+/// Builtin `Real` centre lanes: (field name, bit-lane group).
+/// Shared with `EReal` (`EReal extends Real`): `EReal` atoms read their
+/// centre through `Real.m`/`Real.e`, `p`/`k` live in `EREAL_EXTRA_LANES`.
 /// Lane atoms live in `Resolved::lane_atoms[group]` (bit positions,
 /// value = index, two's-complement MSB reading via `BitsIn`).
+pub const REAL_LANES: [(&str, u32); 2] = [("m", LANE_M), ("e", LANE_E)];
+/// Builtin `EReal`-only lanes (precision / error exponent).
+pub const EREAL_EXTRA_LANES: [(&str, u32); 2] = [("p", LANE_P), ("k", LANE_K)];
+
+/// Builtin `Real`+`EReal` field lanes: (field name, bit-lane group).
+/// `m`/`e` are `Real` lanes (shared), `p`/`k` are `EReal`-only.
 pub const EREAL_LANES: [(&str, u32); 4] =
     [("m", LANE_M), ("e", LANE_E), ("p", LANE_P), ("k", LANE_K)];
+
+/// Builtin `Real` operation/predicate names that imply Real allocation
+/// (exact-centre counterparts of the `ereal*` surface).
+pub const REAL_OPS: &[&str] = &[
+    "realAdd",
+    "realSub",
+    "realMul",
+    "realDiv",
+    "realWellformed",
+    "realEq",
+    "realLT",
+    "realLTE",
+    "setReal",
+];
 
 /// Builtin `EReal` operation/predicate names that imply EReal allocation
 /// when called (mirrors the `util/mepk` library surface).
@@ -84,6 +106,13 @@ pub struct Resolved {
     pub closure_atoms: HashMap<String, Vec<String>>,
     /// For `in` children: atoms are a subset of parent's atoms.
     pub in_children_atoms: HashMap<String, Vec<String>>,
+    /// Builtin `Real` atoms (`Real$0, ..`; empty unless the module uses
+    /// `Real`/`EReal`, mirroring lazy Int allocation). `EReal` atoms are
+    /// part of the `Real` closure (`EReal extends Real`).
+    pub real_atoms: Vec<String>,
+    /// Allocated `Real` population (`for N Real`, else default scope).
+    #[allow(dead_code)]
+    pub real_count: u32,
     /// Builtin `EReal` atoms (`EReal$0, ..`; empty unless the module uses
     /// `EReal`, mirroring lazy Int allocation).
     pub ereal_atoms: Vec<String>,
@@ -163,6 +192,65 @@ pub fn ereal_extenders(module: &Module) -> HashSet<String> {
     out
 }
 
+/// Sigs that transitively `extend` the builtin `Real` (through
+/// `extends`-links only; `in`-children are handled separately).
+/// The builtin `EReal` itself extends `Real`, so `ereal_extenders`
+/// are included transitively. Fixed point so declaration order
+/// does not matter.
+pub fn real_extenders(module: &Module) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    // Builtin root: `EReal extends Real` always.
+    out.insert("EReal".to_string());
+    loop {
+        let mut grew = false;
+        for sd in &module.sigs {
+            if sd.rel == SigRel::In {
+                continue;
+            }
+            if let Some(p) = &sd.extends {
+                if p == "Real" || out.contains(p) {
+                    for n in &sd.names {
+                        if out.insert(n.clone()) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    out
+}
+
+/// Sigs sharing the `Real` population: `extends` descendants of `Real`
+/// (including builtin `EReal`) plus `in`-children transitively under them.
+/// See [`ereal_shared_sigs`] for the multiplicity rationale.
+pub fn real_shared_sigs(module: &Module) -> HashSet<String> {
+    let mut out = real_extenders(module);
+    loop {
+        let mut grew = false;
+        for sd in &module.sigs {
+            if sd.rel != SigRel::In {
+                continue;
+            }
+            if let Some(p) = &sd.extends {
+                if p == "Real" || out.contains(p) {
+                    for n in &sd.names {
+                        if out.insert(n.clone()) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    out
+}
 /// Sigs whose upper bound is the shared `EReal` population: `extends`
 /// descendants of `EReal` plus `in`-children transitively under them
 /// (including direct `in EReal` children). Sig multiplicities on these
@@ -382,19 +470,412 @@ fn module_mentions_ereal(module: &Module, scope: &Scope) -> bool {
     hit
 }
 
+/// True when the module mentions the builtin `Real` (as a type, a scope
+/// entry, or a `real*` operation call), or anything that implies the
+/// `Real` closure (`EReal` mentions count: `EReal extends Real`).
+/// A decimal literal denotes a real value, so it implies `Real`
+/// allocation (the `EReal` half is covered by [`module_mentions_ereal`]).
+fn module_mentions_real(module: &Module, scope: &Scope) -> bool {
+    use crate::ast::{Expr, Formula, IntExpr};
+    if scope.entries.iter().any(|(n, _)| n == "Real" || n == "EReal") {
+        return true;
+    }
+    if module_mentions_ereal(module, scope) {
+        return true;
+    }
+    fn expr_mentions(e: &Expr, hit: &mut bool) {
+        if *hit {
+            return;
+        }
+        match e {
+            Expr::Name(n, _) if n == "Real" => *hit = true,
+            Expr::RealLit(..) => *hit = true,
+            Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom
+            | Expr::StepAtom | Expr::Bits(..) => {}
+            Expr::Bin(_, a, b) => {
+                expr_mentions(a, hit);
+                expr_mentions(b, hit);
+            }
+            Expr::Transpose(x) | Expr::TClosure(x) | Expr::RClosure(x) | Expr::Prime(x)
+            | Expr::AtExpr(x) | Expr::ArrowMult(_, x) | Expr::LeadMult(_, x) => {
+                expr_mentions(x, hit)
+            }
+            Expr::Comprehension(ds, body) => {
+                for d in ds {
+                    expr_mentions(&d.expr, hit);
+                }
+                formula_mentions(body, hit);
+            }
+            Expr::If(c, t, el) => {
+                formula_mentions(c, hit);
+                expr_mentions(t, hit);
+                expr_mentions(el, hit);
+            }
+            Expr::Bracket(base, args) => {
+                expr_mentions(base, hit);
+                for a in args {
+                    expr_mentions(a, hit);
+                }
+            }
+            Expr::Call(name, args, _) => {
+                if name == "Real" || REAL_OPS.contains(&name.as_str()) {
+                    *hit = true;
+                    return;
+                }
+                for a in args {
+                    expr_mentions(a, hit);
+                }
+            }
+            Expr::LetBind(binds, body) => {
+                for (_, ex) in binds {
+                    expr_mentions(ex, hit);
+                }
+                expr_mentions(body, hit);
+            }
+        }
+    }
+    fn intexpr_mentions(e: &IntExpr, hit: &mut bool) {
+        match e {
+            IntExpr::Lit(..) => {}
+            IntExpr::Card(x, _) | IntExpr::Val(x, _) | IntExpr::BitsVal(x, _)
+            | IntExpr::SumOf(x, _) => expr_mentions(x, hit),
+            IntExpr::Bin(_, a, b) => {
+                intexpr_mentions(a, hit);
+                intexpr_mentions(b, hit);
+            }
+            IntExpr::Widen(_, a, b) => {
+                intexpr_mentions(a, hit);
+                intexpr_mentions(b, hit);
+            }
+            IntExpr::Sum(ds, body, _) => {
+                for d in ds {
+                    expr_mentions(&d.expr, hit);
+                }
+                intexpr_mentions(body, hit);
+            }
+        }
+    }
+    fn formula_mentions(f: &Formula, hit: &mut bool) {
+        if *hit {
+            return;
+        }
+        match f {
+            Formula::Const(_) | Formula::Pin(..) | Formula::BadIn(..) => {}
+            Formula::Cmp(_, a, b, _) => {
+                expr_mentions(a, hit);
+                expr_mentions(b, hit);
+            }
+            Formula::IntCmp(_, a, b, _) => {
+                intexpr_mentions(a, hit);
+                intexpr_mentions(b, hit);
+            }
+            Formula::Quant(_, ds, body) | Formula::MaxSomeDecl(ds, body) => {
+                for d in ds {
+                    expr_mentions(&d.expr, hit);
+                }
+                formula_mentions(body, hit);
+            }
+            Formula::Multi(_, e, _) => expr_mentions(e, hit),
+            Formula::MaxSome(e) | Formula::MinSome(e) => expr_mentions(e, hit),
+            Formula::Maximize(e) | Formula::Minimize(e) => intexpr_mentions(e, hit),
+            Formula::And(a, b) | Formula::Or(a, b) | Formula::Implies(a, b)
+            | Formula::Iff(a, b) | Formula::Until(a, b) | Formula::Releases(a, b)
+            | Formula::Since(a, b) | Formula::Triggered(a, b) => {
+                formula_mentions(a, hit);
+                formula_mentions(b, hit);
+            }
+            Formula::Not(x)
+            | Formula::Always(x)
+            | Formula::Eventually(x)
+            | Formula::Before(x)
+            | Formula::Historically(x)
+            | Formula::Once(x)
+            | Formula::Keeping(x)
+            | Formula::Goal(x)
+            | Formula::Restore(x)
+            | Formula::Initially(x)
+            | Formula::Regularly(x)
+            | Formula::Consistently(x)
+            | Formula::OverflowCond(_, x) => formula_mentions(x, hit),
+            Formula::LetBind(binds, body) => {
+                for (_, ex) in binds {
+                    expr_mentions(ex, hit);
+                }
+                formula_mentions(body, hit);
+            }
+            Formula::Call(name, args, _) => {
+                if name == "Real" || REAL_OPS.contains(&name.as_str()) {
+                    *hit = true;
+                    return;
+                }
+                for a in args {
+                    expr_mentions(a, hit);
+                }
+            }
+        }
+    }
+    let mut hit = false;
+    for sd in &module.sigs {
+        if sd.extends.as_deref() == Some("Real") {
+            return true;
+        }
+        for d in &sd.fields {
+            expr_mentions(&d.expr, &mut hit);
+        }
+        if let Some(f) = &sd.fact {
+            formula_mentions(f, &mut hit);
+        }
+        if hit {
+            return true;
+        }
+    }
+    for (_, f) in module.facts.iter().chain(module.soft_facts.iter()) {
+        formula_mentions(f, &mut hit);
+        if hit {
+            return true;
+        }
+    }
+    for p in &module.paras {
+        formula_mentions(&p.body, &mut hit);
+        if let Some(e) = &p.body_expr {
+            expr_mentions(e, &mut hit);
+        }
+        for d in &p.params {
+            expr_mentions(&d.expr, &mut hit);
+        }
+        if hit {
+            return true;
+        }
+    }
+    for pd in &module.partials {
+        for e in &pd.entries {
+            expr_mentions(&e.left, &mut hit);
+            expr_mentions(&e.right, &mut hit);
+        }
+        if hit {
+            return true;
+        }
+    }
+    hit
+}
+
+/// True when the module uses `Real` directly (not merely through
+/// `EReal`): a `Real` type mention, a `real*` operation call, or a user
+/// sig extending/`in`-cluding `Real` (but not `EReal` descendants).
+/// Controls free-`Real`-atom allocation; `EReal`-only models skip it.
+fn real_direct_mention(module: &Module) -> bool {
+    use crate::ast::{Expr, Formula, IntExpr};
+    fn expr_hit(e: &Expr, hit: &mut bool) {
+        if *hit {
+            return;
+        }
+        match e {
+            Expr::Name(n, _) if n == "Real" => *hit = true,
+            Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom
+            | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) => {}
+            Expr::Bin(_, a, b) => {
+                expr_hit(a, hit);
+                expr_hit(b, hit);
+            }
+            Expr::Transpose(x) | Expr::TClosure(x) | Expr::RClosure(x) | Expr::Prime(x)
+            | Expr::AtExpr(x) | Expr::ArrowMult(_, x) | Expr::LeadMult(_, x) => {
+                expr_hit(x, hit)
+            }
+            Expr::Comprehension(ds, body) => {
+                for d in ds {
+                    expr_hit(&d.expr, hit);
+                }
+                formula_hit(body, hit);
+            }
+            Expr::If(c, t, el) => {
+                formula_hit(c, hit);
+                expr_hit(t, hit);
+                expr_hit(el, hit);
+            }
+            Expr::Bracket(base, args) => {
+                expr_hit(base, hit);
+                for a in args {
+                    expr_hit(a, hit);
+                }
+            }
+            Expr::Call(name, args, _) => {
+                if name == "Real" || REAL_OPS.contains(&name.as_str()) {
+                    *hit = true;
+                    return;
+                }
+                for a in args {
+                    expr_hit(a, hit);
+                }
+            }
+            Expr::LetBind(binds, body) => {
+                for (_, ex) in binds {
+                    expr_hit(ex, hit);
+                }
+                expr_hit(body, hit);
+            }
+        }
+    }
+    fn intexpr_hit(e: &IntExpr, hit: &mut bool) {
+        match e {
+            IntExpr::Lit(..) => {}
+            IntExpr::Card(x, _) | IntExpr::Val(x, _) | IntExpr::BitsVal(x, _)
+            | IntExpr::SumOf(x, _) => expr_hit(x, hit),
+            IntExpr::Bin(_, a, b) => {
+                intexpr_hit(a, hit);
+                intexpr_hit(b, hit);
+            }
+            IntExpr::Widen(_, a, b) => {
+                intexpr_hit(a, hit);
+                intexpr_hit(b, hit);
+            }
+            IntExpr::Sum(ds, body, _) => {
+                for d in ds {
+                    expr_hit(&d.expr, hit);
+                }
+                intexpr_hit(body, hit);
+            }
+        }
+    }
+    fn formula_hit(f: &Formula, hit: &mut bool) {
+        if *hit {
+            return;
+        }
+        match f {
+            Formula::Const(_) | Formula::Pin(..) | Formula::BadIn(..) => {}
+            Formula::Cmp(_, a, b, _) => {
+                expr_hit(a, hit);
+                expr_hit(b, hit);
+            }
+            Formula::IntCmp(_, a, b, _) => {
+                intexpr_hit(a, hit);
+                intexpr_hit(b, hit);
+            }
+            Formula::Quant(_, ds, body) | Formula::MaxSomeDecl(ds, body) => {
+                for d in ds {
+                    expr_hit(&d.expr, hit);
+                }
+                formula_hit(body, hit);
+            }
+            Formula::Multi(_, e, _) => expr_hit(e, hit),
+            Formula::MaxSome(e) | Formula::MinSome(e) => expr_hit(e, hit),
+            Formula::Maximize(e) | Formula::Minimize(e) => intexpr_hit(e, hit),
+            Formula::And(a, b) | Formula::Or(a, b) | Formula::Implies(a, b)
+            | Formula::Iff(a, b) | Formula::Until(a, b) | Formula::Releases(a, b)
+            | Formula::Since(a, b) | Formula::Triggered(a, b) => {
+                formula_hit(a, hit);
+                formula_hit(b, hit);
+            }
+            Formula::Not(x)
+            | Formula::Always(x)
+            | Formula::Eventually(x)
+            | Formula::Before(x)
+            | Formula::Historically(x)
+            | Formula::Once(x)
+            | Formula::Keeping(x)
+            | Formula::Goal(x)
+            | Formula::Restore(x)
+            | Formula::Initially(x)
+            | Formula::Regularly(x)
+            | Formula::Consistently(x)
+            | Formula::OverflowCond(_, x) => formula_hit(x, hit),
+            Formula::LetBind(binds, body) => {
+                for (_, ex) in binds {
+                    expr_hit(ex, hit);
+                }
+                formula_hit(body, hit);
+            }
+            Formula::Call(name, args, _) => {
+                if name == "Real" || REAL_OPS.contains(&name.as_str()) {
+                    *hit = true;
+                    return;
+                }
+                for a in args {
+                    expr_hit(a, hit);
+                }
+            }
+        }
+    }
+    let mut hit = false;
+    for sd in &module.sigs {
+        // `extends`/`in Real` (that is not an `EReal` descendant) uses
+        // free `Real` atoms; pure `EReal`-subtree sigs do not.
+        if let Some(p) = &sd.extends {
+            if p == "Real" {
+                return true;
+            }
+            if p != "EReal"
+                && !ereal_extenders(module).contains(p)
+                && real_extenders(module).iter().any(|n| sd.names.contains(n))
+            {
+                return true;
+            }
+        }
+        for d in &sd.fields {
+            expr_hit(&d.expr, &mut hit);
+        }
+        if let Some(f) = &sd.fact {
+            formula_hit(f, &mut hit);
+        }
+        if hit {
+            return true;
+        }
+    }
+    for (_, f) in module.facts.iter().chain(module.soft_facts.iter()) {
+        formula_hit(f, &mut hit);
+        if hit {
+            return true;
+        }
+    }
+    for p in &module.paras {
+        formula_hit(&p.body, &mut hit);
+        if let Some(e) = &p.body_expr {
+            expr_hit(e, &mut hit);
+        }
+        for d in &p.params {
+            expr_hit(&d.expr, &mut hit);
+        }
+        if hit {
+            return true;
+        }
+    }
+    for pd in &module.partials {
+        for e in &pd.entries {
+            expr_hit(&e.left, &mut hit);
+            expr_hit(&e.right, &mut hit);
+        }
+        if hit {
+            return true;
+        }
+    }
+    hit
+}
+
 /// Resolves scopes into universe + per-sig atom allocations.
 pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     let (user, overall, bitwidth, int_count, needs_int) = build_scope_map(module, scope);
     let mepk_widths =
         alloy_kodkod_rs::mepk::MepkWidths::from_env(int_count).map_err(|e| format!("mepk: {e}"))?;
     let needs_ereal = module_mentions_ereal(module, scope);
+    let needs_real = module_mentions_real(module, scope);
     // Lane widths must fit the problem circuit width, but only when lanes
     // are actually allocated: wider lanes would misread (top bits wrap
-    // mod 2^E). Point at the Int scope for relief.
-    if needs_ereal {
+    // mod 2^E). Point at the Int scope for relief. `M`/`E` widths are
+    // shared between `Real` and `EReal` (agreed: no `REAL_*_WIDTH` split).
+    if needs_real {
         for (name, w) in [
             ("MEPK_M_WIDTH", mepk_widths.m_width),
             ("MEPK_E_WIDTH", mepk_widths.e_width),
+        ] {
+            if w > bitwidth {
+                return Err(format!(
+                    "{name}={w} exceeds problem bitwidth {bitwidth}; lane values would wrap. \
+                     Raise it via `for N Int` (need E >= {w}) or lower {name}"
+                ));
+            }
+        }
+    }
+    if needs_ereal {
+        for (name, w) in [
             ("MEPK_P_WIDTH", mepk_widths.p_width),
             ("MEPK_K_WIDTH", mepk_widths.k_width),
         ] {
@@ -406,19 +887,49 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             }
         }
     }
-    let ereal_count = scope
-        .entries
-        .iter()
-        .find(|(n, _)| n == "EReal")
-        .map(|(_, e)| match e {
-            ScopeEntry::Num(n) | ScopeEntry::Exactly(n) => *n,
-        })
-        .unwrap_or(DEFAULT_SCOPE);
-    // `EReal` is a reserved builtin: user declarations are rejected
+    let real_scope = scope.entries.iter().find(|(n, _)| n == "Real");
+    let ereal_scope = scope.entries.iter().find(|(n, _)| n == "EReal");
+    let num_of = |e: &ScopeEntry| match e {
+        ScopeEntry::Num(n) | ScopeEntry::Exactly(n) => *n,
+    };
+    // `EReal extends Real`: the child population cannot exceed the parent
+    // one. When only `EReal` is scoped, the parent defaults up to cover it
+    // (backward compatible: EReal-only models keep working).
+    let mut real_count = real_scope.map(|(_, e)| num_of(e)).unwrap_or(DEFAULT_SCOPE);
+    let mut ereal_count = ereal_scope.map(|(_, e)| num_of(e)).unwrap_or(DEFAULT_SCOPE);
+    if ereal_scope.is_some() && real_scope.is_none() {
+        real_count = real_count.max(ereal_count);
+    }
+    if real_scope.is_some() && ereal_scope.is_none() {
+        ereal_count = ereal_count.min(real_count);
+    }
+    // Free `Real` atoms serve no purpose unless `Real` itself is used
+    // (as a type, scope entry, `real*` operand, or a non-`EReal` extender):
+    // `EReal`-only models keep `real_count = 0` so no garbage-lane `Real`
+    // atoms pollute the instance display. (`Real.m`/`Real.e` lanes are
+    // still allocated via `needs_real` for the `EReal` centre.)
+    let needs_free_real = scope.entries.iter().any(|(n, _)| n == "Real")
+        || real_direct_mention(module);
+    if needs_free_real && needs_ereal && ereal_count > real_count {
+        return Err(format!(
+            "for {ereal_count} EReal exceeds for {real_count} Real; \
+             raise the `Real` scope (`EReal extends Real`)"
+        ));
+    }
+    if !needs_free_real {
+        real_count = 0;
+    }
+    if !needs_real {
+        ereal_count = 0;
+    }
+    let real_count = if needs_real { real_count } else { 0 };
+    // `Real`/`EReal` are reserved builtins: user declarations are rejected
     // (extension is allowed: `in` shares atoms, `extends` partitions).
     for sd in &module.sigs {
-        if sd.names.iter().any(|n| n == "EReal") {
-            return Err("sig EReal is reserved by the builtin EReal signature".to_string());
+        if sd.names.iter().any(|n| n == "EReal" || n == "Real") {
+            return Err(
+                "sig Real/EReal is reserved by the builtin Real signature".to_string(),
+            );
         }
     }
 
@@ -447,6 +958,13 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
                             "sig {n} cannot extend the builtin \"{p}\" signature"
                         ));
                     }
+                    children.entry(p.clone()).or_default().push(n.clone());
+                } else if p == "Real" {
+                    // Builtin `Real`: `in Real` accepted (subset of the
+                    // Real closure); `extends Real` accepted with Alloy
+                    // partition semantics (subset + disjoint siblings;
+                    // `Real` itself is NOT covered: free `Real` values
+                    // keep working alongside extenders).
                     children.entry(p.clone()).or_default().push(n.clone());
                 } else if p == "EReal" {
                     // Builtin `EReal`: `in EReal` accepted (subset of the
@@ -619,15 +1137,27 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     } else {
         Vec::new()
     };
-    // Builtin `EReal` atoms + bit-lane atoms (lazy like Int: allocated
-    // only when the module mentions `EReal`).
+    // Builtin `Real` atoms + `EReal` atoms + bit-lane atoms (lazy like
+    // Int: allocated only when mentioned). `m`/`e` lanes are shared
+    // (`EReal extends Real` reads its centre through `Real.m`/`Real.e`);
+    // `p`/`k` lanes exist only with `EReal`.
+    let real_atoms: Vec<String> = if needs_real {
+        (0..real_count).map(|i| format!("Real${i}")).collect()
+    } else {
+        Vec::new()
+    };
     let ereal_atoms: Vec<String> = if needs_ereal {
         (0..ereal_count).map(|i| format!("EReal${i}")).collect()
     } else {
         Vec::new()
     };
+    // The `Real` closure covers its own atoms plus the `EReal` population
+    // (`EReal extends Real` with distinct atom names: the parent upper
+    // bound is the union, partition enforced by formulas in lower.rs).
+    let real_closure: Vec<String> =
+        real_atoms.iter().chain(ereal_atoms.iter()).cloned().collect();
     let mut lane_atoms: HashMap<u32, Vec<String>> = HashMap::new();
-    if needs_ereal {
+    if needs_real {
         lane_atoms.insert(
             LANE_M,
             (0..mepk_widths.m_width).map(|i| format!("M${i}")).collect(),
@@ -636,6 +1166,8 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             LANE_E,
             (0..mepk_widths.e_width).map(|i| format!("E${i}")).collect(),
         );
+    }
+    if needs_ereal {
         lane_atoms.insert(
             LANE_P,
             (0..mepk_widths.p_width).map(|i| format!("P${i}")).collect(),
@@ -652,9 +1184,17 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
                 cur = next_parent.clone();
             }
             // cur is now the root (non-in) ancestor, or builtin
-            // `Int`/`Signed`/`EReal`
+            // `Int`/`Signed`/`Real`/`EReal`
             if cur == "Int" || cur == "Signed" {
                 in_children_atoms.insert(n.clone(), int_atoms.clone());
+            } else if cur == "Real" || real_extenders(&module).contains(&cur) {
+                // `in Real` (or under a `Real` extender that is not an
+                // `EReal` descendant): the full `Real` closure.
+                if cur == "EReal" || ereal_extenders(&module).contains(&cur) {
+                    in_children_atoms.insert(n.clone(), ereal_atoms.clone());
+                } else {
+                    in_children_atoms.insert(n.clone(), real_closure.clone());
+                }
             } else if cur == "EReal" || ereal_extenders(&module).contains(&cur) {
                 in_children_atoms.insert(n.clone(), ereal_atoms.clone());
             } else {
@@ -668,6 +1208,16 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     // is enforced by formulas in lower.rs.
     for n in ereal_extenders(&module) {
         in_children_atoms.insert(n, ereal_atoms.clone());
+    }
+    // `extends Real` descendants (that are not `EReal` descendants) share
+    // the `Real` closure as their upper bound. (`EReal` itself keeps the
+    // EReal-only bound above; the `EReal ⊆ Real` membership is a formula
+    // in lower.rs.)
+    for n in real_extenders(&module) {
+        if n == "EReal" || ereal_extenders(&module).contains(&n) {
+            continue;
+        }
+        in_children_atoms.insert(n, real_closure.clone());
     }
 
     // closure atoms: include own + descendants
@@ -732,6 +1282,7 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     let mut uni_atoms: Vec<String> = flat.clone();
     uni_atoms.extend(int_names.iter().cloned());
     uni_atoms.extend(step_atoms.iter().cloned());
+    uni_atoms.extend(real_atoms.iter().cloned());
     uni_atoms.extend(ereal_atoms.iter().cloned());
     for atoms in lane_atoms.values() {
         uni_atoms.extend(atoms.iter().cloned());
@@ -764,13 +1315,25 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             atoms: step_atoms.clone(),
         },
     );
+    // Builtin `Real` (atoms allocated lazily; empty when unused).
+    // `EReal extends Real` (builtin parent link).
+    sigs.insert(
+        "Real".to_string(),
+        SigInfo {
+            name: "Real".to_string(),
+            parent: None,
+            rel: SigRel::None,
+            mult: SigMult::None,
+            atoms: real_atoms.clone(),
+        },
+    );
     // Builtin `EReal` (atoms allocated lazily; empty when unused).
     sigs.insert(
         "EReal".to_string(),
         SigInfo {
             name: "EReal".to_string(),
-            parent: None,
-            rel: SigRel::None,
+            parent: Some("Real".to_string()),
+            rel: SigRel::Extends,
             mult: SigMult::None,
             atoms: ereal_atoms.clone(),
         },
@@ -786,10 +1349,13 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         closure_atoms: {
             let mut c = closure;
             c.insert("Step".to_string(), step_atoms);
+            c.insert("Real".to_string(), real_closure.clone());
             c.insert("EReal".to_string(), ereal_atoms.clone());
             c
         },
         in_children_atoms,
+        real_atoms,
+        real_count,
         ereal_atoms,
         ereal_count,
         lane_atoms,
@@ -812,10 +1378,13 @@ pub fn bind_sigs(
 ) -> Result<(), String> {
     use std::collections::HashMap as HM;
     let mut exact: HM<String, bool> = HM::new();
-    // Sigs sharing the EReal population keep flexible bounds even under
+    // Sigs sharing the Real/EReal population keep flexible bounds even under
     // `one`/`exactly` (exact bounds would pin every shared atom);
     // their multiplicities become cardinality formulas in lower.rs.
-    let shared = ereal_shared_sigs(module);
+    let mut shared = ereal_shared_sigs(module);
+    shared.extend(real_shared_sigs(module));
+    shared.insert("Real".to_string());
+    shared.insert("EReal".to_string());
     for sd in &module.sigs {
         for n in &sd.names {
             exact.insert(n.clone(), sd.mult == SigMult::One);

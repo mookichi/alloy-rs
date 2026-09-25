@@ -9,6 +9,7 @@ use alloy_kodkod_rs::ast::{
 };
 use alloy_kodkod_rs::bounds::Bounds;
 use alloy_kodkod_rs::mepk::{decimal_to_mepk, Mepk};
+use alloy_kodkod_rs::real::{decimal_to_real, RealCenter};
 use alloy_kodkod_rs::opt::OptSense;
 use alloy_kodkod_rs::relation::{RelationId, RelationPool};
 use std::collections::HashMap;
@@ -191,17 +192,38 @@ impl<'m> Lowerer<'m> {
                         }
                     }
                 }
-                // `extends EReal` partition (Alloy hierarchy semantics over
-                // the shared EReal atoms): each extender is a subset of its
-                // parent, siblings are disjoint, and a parent is covered by
-                // its direct extenders. Transitive (`A extends B extends
-                // EReal`) handled level by level; `in`-children keep the
+                // `extends Real`/`extends EReal` partition (Alloy hierarchy
+                // semantics over the shared populations): each extender is a
+                // subset of its parent, siblings are disjoint, and an
+                // *abstract-like* parent is covered by its direct extenders.
+                // Roots: builtin `Real` (with the builtin `EReal` as a
+                // direct child, `EReal extends Real`) plus the transitive
+                // user extenders. Transitive (`A extends B extends EReal`)
+                // handled level by level; `in`-children keep the
                 // subset-only rule above.
+                // `Real` itself is NOT covered (free `Real` values keep
+                // working alongside extenders, like the old non-abstract
+                // `EReal` value sort); `EReal` and abstract user parents
+                // keep coverage (with extenders present they collapse onto
+                // the union — sound now that decimal literals are
+                // constant tuples needing no witness atoms).
                 {
                     use std::collections::HashSet;
                     let mut rooted: HashSet<String> = HashSet::new();
-                    rooted.insert("EReal".to_string());
+                    rooted.insert("Real".to_string());
                     let mut kids_of: HashMap<String, Vec<String>> = HashMap::new();
+                    // Builtin edge: `EReal extends Real` (only when the
+                    // `EReal` population is allocated; otherwise `Real`
+                    // has no builtin child).
+                    if ctx.res.ereal_atoms.is_empty() {
+                        // No EReal population: nothing to link.
+                    } else {
+                        kids_of
+                            .entry("Real".to_string())
+                            .or_default()
+                            .push("EReal".to_string());
+                        rooted.insert("EReal".to_string());
+                    }
                     loop {
                         let mut grew = false;
                         for sd in &ctx.module.sigs {
@@ -280,6 +302,12 @@ impl<'m> Lowerer<'m> {
                         // kids never reach this loop, so free `EReal` values
                         // (`some a: EReal`, `for N EReal`) keep working.
                         // Subset/disjoint apply everywhere (Java parity).
+                        // Exception: the builtin `Real` root is never
+                        // covered (free `Real` values coexist with
+                        // extenders, including builtin `EReal`).
+                        if p == "Real" {
+                            continue;
+                        }
                         let mut union = {
                             let first = rel_of(ctx, &kids[0])?;
                             arena.expr_relation(first)
@@ -299,11 +327,12 @@ impl<'m> Lowerer<'m> {
                             .map_err(|e| FrontError::Resolve(e.to_string()))?;
                         parts.push(arena.not(some_diff));
                     }
-                    // Sig multiplicities on the shared EReal population are
+                    // Sig multiplicities on the shared Real/EReal population are
                     // cardinality formulas (Java `BoundsComputer`: `one` /
                     // `some` / `lone` formulas when bounds do not pin);
                     // exact bounds would pin every shared atom.
-                    let shared = crate::bounds::ereal_shared_sigs(ctx.module);
+                    let mut shared = crate::bounds::ereal_shared_sigs(ctx.module);
+                    shared.extend(crate::bounds::real_shared_sigs(ctx.module));
                     for sd in &ctx.module.sigs {
                         let op = match sd.mult {
                             crate::ast::SigMult::One => Multiplicity::One,
@@ -515,9 +544,20 @@ impl<'m> Lowerer<'m> {
             rels.insert(name.clone(), r);
         }
         let mut field_arity: HashMap<String, u32> = HashMap::new();
-        // Builtin `EReal` field lanes (binary `EReal -> lane-atoms`).
-        for (fname, _) in crate::bounds::EREAL_LANES {
-            let key = format!("EReal.{fname}");
+        // Builtin `Real` centre lanes (`Real.m`, `Real.e`) plus the
+        // `EReal`-only lanes (`EReal.p`, `EReal.k`); all binary
+        // `owner -> lane-atoms`. `EReal` reads its centre through the
+        // shared `Real.m`/`Real.e` (`EReal extends Real`).
+        for (owner, fname) in crate::bounds::REAL_LANES
+            .iter()
+            .map(|(f, _)| ("Real", *f))
+            .chain(
+                crate::bounds::EREAL_EXTRA_LANES
+                    .iter()
+                    .map(|(f, _)| ("EReal", *f)),
+            )
+        {
+            let key = format!("{owner}.{fname}");
             let fa = arena.relation(&key, 2);
             field_arity.insert(key.clone(), 2);
             rels.insert(key, fa);
@@ -570,9 +610,17 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
-        // Builtin `EReal` lanes are always Int-flavored (bitmask-readable).
-        for (fname, _) in crate::bounds::EREAL_LANES {
-            field_int.insert(format!("EReal.{fname}"), SetKind::Int);
+        // Builtin `Real`/`EReal` lanes are always Int-flavored (bitmask-readable).
+        for (owner, fname) in crate::bounds::REAL_LANES
+            .iter()
+            .map(|(f, _)| ("Real", *f))
+            .chain(
+                crate::bounds::EREAL_EXTRA_LANES
+                    .iter()
+                    .map(|(f, _)| ("EReal", *f)),
+            )
+        {
+            field_int.insert(format!("{owner}.{fname}"), SetKind::Int);
         }
         let ctx = Ctx {
             module: self.module,
@@ -662,17 +710,33 @@ impl<'m> Lowerer<'m> {
             }
         }
         // ------------------------------------------------------------------
-        // Builtin `EReal` lane relations (`EReal.m` etc., binary over the
-        // dedicated lane atoms). Allocated lazily with the lane atoms.
-        for (fname, group) in crate::bounds::EREAL_LANES {
-            let key = format!("EReal.{fname}");
+        // Builtin lane relations (binary over the dedicated lane atoms).
+        // `Real.m`/`Real.e` range over the full `Real` closure (including
+        // `EReal` atoms, which read their centre through them);
+        // `EReal.p`/`EReal.k` range over the `EReal` population only.
+        // Allocated lazily with the lane atoms.
+        for (owner, fname, group) in crate::bounds::REAL_LANES
+            .iter()
+            .map(|(f, g)| ("Real", *f, *g))
+            .chain(
+                crate::bounds::EREAL_EXTRA_LANES
+                    .iter()
+                    .map(|(f, g)| ("EReal", *f, *g)),
+            )
+        {
+            let key = format!("{owner}.{fname}");
             let fa = arena.relation(&key, 2);
             field_arity.insert(key.clone(), 2);
             let lane = res.lane_atoms.get(&group).cloned().unwrap_or_default();
             let mut ts =
                 alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?;
-            for o in &res.ereal_atoms {
+            let owners: Vec<String> = if owner == "Real" {
+                res.atoms_of("Real")
+            } else {
+                res.ereal_atoms.clone()
+            };
+            for o in &owners {
                 for t in &lane {
                     let tup = bounds::tuple_of(&res, &[o.clone(), t.clone()])
                         .map_err(FrontError::Resolve)?;
@@ -795,9 +859,17 @@ impl<'m> Lowerer<'m> {
             }
         }
 
-        // EReal bit-lane exact bounds (lazy like Int): value `v` is the
+        // Bit-lane exact bounds (lazy like Int): value `v` is the
         // bit position, read with signed-MSB weight via `BitsIn(group)`.
-        for (fname, group) in crate::bounds::EREAL_LANES {
+        for (owner, fname, group) in crate::bounds::REAL_LANES
+            .iter()
+            .map(|(f, g)| ("Real", *f, *g))
+            .chain(
+                crate::bounds::EREAL_EXTRA_LANES
+                    .iter()
+                    .map(|(f, g)| ("EReal", *f, *g)),
+            )
+        {
             let lane = res.lane_atoms.get(&group).cloned().unwrap_or_default();
             for (v, name) in lane.iter().enumerate() {
                 let idx = res
@@ -808,7 +880,7 @@ impl<'m> Lowerer<'m> {
                     .map_err(|e| FrontError::Resolve(e.to_string()))?;
                 ts.insert_index(idx as i64);
                 b.bound_exactly_int_in(group, v as i64, &ts)
-                    .map_err(|e| FrontError::Resolve(format!("EReal.{fname}: {e}")))?;
+                    .map_err(|e| FrontError::Resolve(format!("{owner}.{fname}: {e}")))?;
             }
         }
 
@@ -846,9 +918,17 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
-        // Builtin `EReal` lanes are always Int-flavored (bitmask-readable).
-        for (fname, _) in crate::bounds::EREAL_LANES {
-            field_int.insert(format!("EReal.{fname}"), SetKind::Int);
+        // Builtin `Real`/`EReal` lanes are always Int-flavored (bitmask-readable).
+        for (owner, fname) in crate::bounds::REAL_LANES
+            .iter()
+            .map(|(f, _)| ("Real", *f))
+            .chain(
+                crate::bounds::EREAL_EXTRA_LANES
+                    .iter()
+                    .map(|(f, _)| ("EReal", *f)),
+            )
+        {
+            field_int.insert(format!("{owner}.{fname}"), SetKind::Int);
         }
         let ctx = Ctx {
             module: self.module,
@@ -1328,6 +1408,82 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Try to resolve a builtin `Real` predicate call.
+    /// Returns Some(formula) if the name matches (`realAdd` etc.): desugars
+    /// to exact-centre constraints over the shared `Real.m`/`Real.e` lanes.
+    /// Decimal literals in value positions resolve to `RealConstant`
+    /// centres inline (dyadic only, no witness atoms).
+    fn try_real_pred(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        args: &[Expr],
+        env: &mut Env,
+    ) -> LResult<Option<FormulaId>> {
+        let body = match name {
+            "realAdd" | "realSub" => {
+                if args.len() != 3 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 3 args")));
+                }
+                let wv = self.ereal_shift_width()?;
+                let sign = if name == "realAdd" { 1 } else { -1 };
+                real_add_sub(&self.real_op(&args[0])?, &self.real_op(&args[1])?, &self.real_op(&args[2])?, sign, wv)
+            }
+            "realMul" | "realDiv" => {
+                if args.len() != 3 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 3 args")));
+                }
+                let wv = self.ereal_shift_width_mul()?;
+                if name == "realMul" {
+                    real_mul(&self.real_op(&args[0])?, &self.real_op(&args[1])?, &self.real_op(&args[2])?, wv)
+                } else {
+                    real_div(&self.real_op(&args[0])?, &self.real_op(&args[1])?, &self.real_op(&args[2])?, wv)
+                }
+            }
+            "realWellformed" => {
+                if args.len() != 1 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
+                }
+                real_wellformed(&self.real_op(&args[0])?)
+            }
+            "realEq" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
+                }
+                let wv = self.ereal_shift_width()?;
+                let (a, b) = (self.real_op(&args[0])?, self.real_op(&args[1])?);
+                ereal_and_all(
+                    real_all_wellformed(&[&a, &b])
+                        .into_iter()
+                        .chain(std::iter::once(real_scaled_eq(&a, &b, wv)))
+                        .collect(),
+                )
+            }
+            "realLT" | "realLTE" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
+                }
+                let wv = self.ereal_shift_width()?;
+                let (a, b) = (self.real_op(&args[0])?, self.real_op(&args[1])?);
+                let op = if name == "realLT" { IntCmpOp::Lt } else { IntCmpOp::Lte };
+                ereal_and_all(
+                    real_all_wellformed(&[&a, &b])
+                        .into_iter()
+                        .chain(std::iter::once(real_scaled_cmp(&a, &b, op, wv)))
+                        .collect(),
+                )
+            }
+            "setReal" => {
+                if args.len() != 2 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
+                }
+                real_set(&args[0], &args[1], self.res.mepk_widths.m_width)?
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(self.lower_formula(arena, &body, env)?))
+    }
+
     /// Try to resolve an ordering builtin predicate call.
     /// Returns Some(formula) if the name matches an ordering builtin predicate.
     /// Builtin `EReal` predicates (`erealAdd` etc.): desugar to comparator
@@ -1451,6 +1607,25 @@ impl<'a> Ctx<'a> {
                 Ok(ERealOp::Const(conv.v))
             }
             _ => Ok(ERealOp::Ref(e)),
+        }
+    }
+
+    /// Resolve a `Real` operand: dyadic decimal literals become
+    /// `RealConstant` centres inline (no witness atoms, no scope consumed);
+    /// anything else stays an atom reference. Non-dyadic literals fail
+    /// loudly (`Real` never rounds).
+    fn real_op<'e>(&self, e: &'e Expr) -> LResult<RealOp<'e>> {
+        match e {
+            Expr::RealLit(s, _) => {
+                let mw = self.res.mepk_widths.m_width;
+                let v = decimal_to_real(s, Some(mw)).ok_or_else(|| {
+                    FrontError::Resolve(format!(
+                        "cannot convert {s:?} to Real exactly (non-dyadic, malformed, or outside the m lane)"
+                    ))
+                })?;
+                Ok(RealOp::Const(v))
+            }
+            _ => Ok(RealOp::Ref(e)),
         }
     }
 
@@ -2080,49 +2255,66 @@ impl<'a> Ctx<'a> {
     /// ambiguous and the caller must error loudly, never read 0).
     fn lane_group_of(&self, e: &Expr) -> Option<u32> {
         let field = trailing_field_name(e)?;
-        // Desugared lanes use the qualified `EReal.{lane}` spelling;
-        // match on the trailing segment either way.
+        // Desugared lanes use the qualified `Real.{lane}` / `EReal.{lane}`
+        // spelling; match on the trailing segment either way.
         let short = field.rsplit('.').next().unwrap_or(&field);
         let mut found: Option<u32> = None;
         let mut count = 0;
         for key in self.field_int.keys() {
             if key.rsplit('.').next() == Some(short) {
                 count += 1;
-                if let Some((_, group)) = crate::bounds::EREAL_LANES
-                    .iter()
-                    .find(|(fname, _)| key == &format!("EReal.{fname}"))
-                {
-                    // Ignore the builtin lane while `EReal` is unallocated:
+                // Builtin lanes: `Real.m`/`Real.e` (shared centre) plus
+                // `EReal.p`/`EReal.k`.
+                let group = [
+                    ("Real.m", crate::bounds::LANE_M),
+                    ("Real.e", crate::bounds::LANE_E),
+                    ("EReal.p", crate::bounds::LANE_P),
+                    ("EReal.k", crate::bounds::LANE_K),
+                ]
+                .iter()
+                .find(|(k, _)| key == *k)
+                .map(|(_, g)| *g);
+                if let Some(group) = group {
+                    // Ignore the builtin lane while its group is unallocated:
                     // a lone user field keeps its legacy reading.
                     let allocated = self
                         .res
                         .lane_atoms
-                        .get(group)
+                        .get(&group)
                         .is_some_and(|v| !v.is_empty());
                     if !allocated {
                         count -= 1;
                         continue;
                     }
-                    found = Some(*group);
+                    found = Some(group);
                 }
             }
         }
         if count == 1 { found } else { None }
     }
 
-    /// True when `e`'s trailing label names both an allocated `EReal`
-    /// lane and a user (non-`EReal`) field: genuinely ambiguous.
+    /// True when `e`'s trailing label names both an allocated builtin
+    /// (`Real`/`EReal`) lane and a user field: genuinely ambiguous.
     fn lane_label_ambiguous(&self, e: &Expr) -> bool {
         let Some(field) = trailing_field_name(e) else {
             return false;
         };
         let short = field.rsplit('.').next().unwrap_or(&field);
-        let lane_allocated = crate::bounds::EREAL_LANES.iter().any(|(fname, g)| {
+        let lane_allocated = [
+            ("m", crate::bounds::LANE_M),
+            ("e", crate::bounds::LANE_E),
+            ("p", crate::bounds::LANE_P),
+            ("k", crate::bounds::LANE_K),
+        ]
+        .iter()
+        .any(|(fname, g)| {
             *fname == short && self.res.lane_atoms.get(g).is_some_and(|v| !v.is_empty())
         });
         lane_allocated
             && self.field_int.keys().any(|key| {
-                key.rsplit('.').next() == Some(short) && !key.starts_with("EReal.")
+                key.rsplit('.').next() == Some(short)
+                    && !key.starts_with("Real.")
+                    && !key.starts_with("EReal.")
             })
     }
 
@@ -2185,11 +2377,12 @@ impl<'a> Ctx<'a> {
     }
 
     /// Decimal-literal value equality: `R = 1.2` / `R != 1.2` rewrite to
-    /// the lane equalities (`setEReal`), since `extends` siblings are
-    /// disjoint as sets and atom identity could never hold. Literal-vs-
-    /// literal compares oracle conversions directly. A literal against an
-    /// integer lane read (`x.m = 3.14`) stays a loud error: lanes hold
-    /// integers. Returns None when neither side is a decimal literal.
+    /// the lane equalities (`setEReal` for `EReal`-rooted values,
+    /// `setReal` otherwise since `extends` siblings are disjoint as sets
+    /// and atom identity could never hold). Literal-vs-literal compares
+    /// oracle conversions directly. A literal against an integer lane read
+    /// (`x.m = 3.14`) stays a loud error: lanes hold integers. Returns
+    /// None when neither side is a decimal literal.
     fn rewrite_ereal_lit_cmp(
         &self,
         kind: &CmpKind,
@@ -2225,7 +2418,17 @@ impl<'a> Ctx<'a> {
                             .to_string(),
                     ));
                 }
-                let body = ereal_set(other, lit, max_p)?;
+                // `EReal`-rooted values keep the legacy `setEReal`
+                // reading (pins `m/e/p/k`); everything else (`Real`
+                // values, quantifier variables, unrecognized shapes)
+                // uses the exact-centre `setReal` reading (`m`/`e`
+                // only — still centre-correct for `EReal` atoms, with
+                // `p`/`k` left free).
+                let body = if self.expr_is_ereal_rooted(other) {
+                    ereal_set(other, lit, max_p)?
+                } else {
+                    real_set(other, lit, self.res.mepk_widths.m_width)?
+                };
                 Ok(Some(if neg {
                     Formula::Not(Box::new(body))
                 } else {
@@ -2233,6 +2436,44 @@ impl<'a> Ctx<'a> {
                 }))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Root builtin of a sig name (`Real`/`EReal`/other) following the
+    /// user `extends` chain. `None` for unknown names (quantifier
+    /// variables carry no sig type here).
+    fn sig_root(&self, name: &str) -> Option<String> {
+        if name == "Real" {
+            return Some("Real".to_string());
+        }
+        if name == "EReal" {
+            return Some("EReal".to_string());
+        }
+        let mut cur = name.to_string();
+        loop {
+            let sd = self
+                .module
+                .sigs
+                .iter()
+                .find(|s| s.names.iter().any(|n| n == &cur))?;
+            match &sd.extends {
+                None => return Some(cur),
+                Some(p) if p == "Real" => return Some("Real".to_string()),
+                Some(p) if p == "EReal" => return Some("EReal".to_string()),
+                Some(p) => cur = p.clone(),
+            }
+        }
+    }
+
+    /// True when an expression is rooted at the builtin `EReal` (the
+    /// `EReal` sig itself, an `extends`-descendant, or a join/bracket
+    /// built on one). Used to pick the `setEReal` literal reading.
+    fn expr_is_ereal_rooted(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Name(n, _) => self.sig_root(n).as_deref() == Some("EReal"),
+            Expr::Bin(_, a, _) => self.expr_is_ereal_rooted(a),
+            Expr::Bracket(base, _) => self.expr_is_ereal_rooted(base),
+            _ => false,
         }
     }
 
@@ -3185,6 +3426,10 @@ impl<'a> Ctx<'a> {
                 if let Some(f) = self.try_ereal_pred(arena, name, args, env)? {
                     return Ok(f);
                 }
+                // Builtin `Real` predicates (exact-centre lane constraints).
+                if let Some(f) = self.try_real_pred(arena, name, args, env)? {
+                    return Ok(f);
+                }
                 // Check stdlib builtins (graph, relation)
                 if let Some(f) = self.try_stdlib_pred(arena, name, args, env)? {
                     return Ok(f);
@@ -4117,18 +4362,24 @@ fn scan_total_order_intexpr(e: &IntExpr, out: &mut Vec<(String, String)>) {
 // only an exact-centre rounding encoding is left for the future.
 /// Lane read `base.lane` in integer position.
 fn ereal_lane(base: &Expr, lane: &str) -> IntExpr {
-    // Qualified `EReal.{lane}`: a bare lane name (`e`, `m`, `p`, `k`)
-    // would resolve through the quantifier environment first, so a user
-    // variable named `e` (etc.) shadows the lane relation and produces
-    // a 1+1 join (`join arity too low`). The qualified key always hits
-    // the `EReal.{lane}` relation directly (env names never contain `.`).
+    // Qualified owner: `m`/`e` live in the shared `Real` lanes
+    // (`EReal extends Real`), `p`/`k` in the `EReal`-only lanes.
+    // A bare lane name (`e`, `m`, `p`, `k`) would resolve through the
+    // quantifier environment first, so a user variable named `e` (etc.)
+    // shadows the lane relation and produces a 1+1 join
+    // (`join arity too low`). The qualified key always hits the lane
+    // relation directly (env names never contain `.`).
     // Lane helpers below normalize the trailing segment, so `EReal.m`
     // is still recognised as lane `m`.
+    let owner = match lane {
+        "m" | "e" => "Real",
+        _ => "EReal",
+    };
     IntExpr::BitsVal(
         Box::new(Expr::Bin(
             BinOp::Join,
             Box::new(base.clone()),
-            Box::new(Expr::Name(format!("EReal.{lane}"), 0)),
+            Box::new(Expr::Name(format!("{owner}.{lane}"), 0)),
         )),
         0,
     )
@@ -4928,6 +5179,157 @@ fn ereal_set(x: &Expr, lit: &Expr, max_p: u32) -> LResult<Formula> {
         ));
     }
     Ok(ereal_and_all(parts))
+}
+
+// ---- builtin `Real` desugar (exact-centre counterparts) --------------------
+// `Real` values are `c = m * 2^e` with `m == 0 || odd(m)` (shared `m`/`e`
+// lanes with `EReal`). All arithmetic is exact: scaled to a common
+// exponent `s0 = min(...)` (same widening pattern as `ereal_scaled_cmp`),
+// so every shift amount is non-negative. Division cross-multiplies
+// (`a == r*b`), hence exact with no remainder check.
+
+/// A `Real` operand: atom-valued expression (lane joins) or a constant
+/// centre (`RealConstant`, fixed `(m, e)`, no universe atom).
+#[derive(Clone, Copy)]
+enum RealOp<'e> {
+    Ref(&'e Expr),
+    Const(RealCenter),
+}
+
+/// Lane read through a `Real` operand.
+fn real_lane_of(op: &RealOp, lane: &str) -> IntExpr {
+    match op {
+        RealOp::Ref(e) => ereal_lane(e, lane),
+        RealOp::Const(v) => {
+            let n = match lane {
+                "m" => v.m as i64,
+                "e" => v.e as i64,
+                _ => unreachable!("unknown Real lane {lane}"),
+            };
+            ereal_lit(n)
+        }
+    }
+}
+
+/// `Real` wellformedness: `m == 0` or odd `m` (even check via
+/// `(m/2)*2 == m` is exact under any Div semantics, so `!=` means odd).
+fn real_wellformed(x: &RealOp) -> Formula {
+    let m = real_lane_of(x, "m");
+    let half = IntExpr::Bin(
+        IntBinOp::Div,
+        Box::new(m.clone()),
+        Box::new(ereal_lit(2)),
+    );
+    let twice = IntExpr::Bin(IntBinOp::Mul, Box::new(half), Box::new(ereal_lit(2)));
+    ereal_or_all(vec![
+        ereal_icmp(IntCmpOp::Eq, m.clone(), ereal_lit(0)),
+        ereal_icmp(IntCmpOp::Neq, twice, m),
+    ])
+}
+
+fn real_all_wellformed(ops: &[&RealOp]) -> Vec<Formula> {
+    ops.iter().map(|o| real_wellformed(o)).collect()
+}
+
+/// Exact scaled equality of two centres at `s0 = min(e_a, e_b)`.
+fn real_scaled_eq(a: &RealOp, b: &RealOp, wv: u32) -> Formula {
+    let ea = real_lane_of(a, "e");
+    let eb = real_lane_of(b, "e");
+    let s0 = ereal_min(ea.clone(), eb.clone());
+    let ca = ereal_wshl(real_lane_of(a, "m"), ereal_wsub(ea, s0.clone()), wv);
+    let cb = ereal_wshl(real_lane_of(b, "m"), ereal_wsub(eb, s0), wv);
+    ereal_icmp(IntCmpOp::Eq, ca, cb)
+}
+
+/// Exact scaled comparison `a OP b` at `s0 = min(e_a, e_b)`.
+fn real_scaled_cmp(a: &RealOp, b: &RealOp, op: IntCmpOp, wv: u32) -> Formula {
+    let ea = real_lane_of(a, "e");
+    let eb = real_lane_of(b, "e");
+    let s0 = ereal_min(ea.clone(), eb.clone());
+    let ca = ereal_wshl(real_lane_of(a, "m"), ereal_wsub(ea, s0.clone()), wv);
+    let cb = ereal_wshl(real_lane_of(b, "m"), ereal_wsub(eb, s0), wv);
+    ereal_icmp(op, ca, cb)
+}
+
+/// Exact addition / subtraction: `m_r·2^e_r == m_a·2^e_a ± m_b·2^e_b`
+/// scaled to `s0 = min(e_a, e_b, e_r)`.
+fn real_add_sub(a: &RealOp, b: &RealOp, r: &RealOp, sign: i8, wv: u32) -> Formula {
+    let ea = real_lane_of(a, "e");
+    let eb = real_lane_of(b, "e");
+    let er = real_lane_of(r, "e");
+    let s0 = ereal_min(ereal_min(ea.clone(), eb.clone()), er.clone());
+    let ca = ereal_wshl(real_lane_of(a, "m"), ereal_wsub(ea, s0.clone()), wv);
+    let cb = ereal_wshl(real_lane_of(b, "m"), ereal_wsub(eb, s0.clone()), wv);
+    let cr = ereal_wshl(real_lane_of(r, "m"), ereal_wsub(er, s0), wv);
+    let s = if sign == 1 {
+        ereal_wadd(ca, cb)
+    } else {
+        ereal_wsub(ca, cb)
+    };
+    let mut parts = real_all_wellformed(&[a, b, r]);
+    parts.push(ereal_icmp(IntCmpOp::Eq, cr, s));
+    ereal_and_all(parts)
+}
+
+/// Exact multiplication: `(m_a·m_b)·2^(e_a+e_b) == m_r·2^e_r`
+/// scaled to `s0 = min(e_a+e_b, e_r)`.
+fn real_mul(a: &RealOp, b: &RealOp, r: &RealOp, wv: u32) -> Formula {
+    let eab = ereal_wadd(real_lane_of(a, "e"), real_lane_of(b, "e"));
+    let er = real_lane_of(r, "e");
+    let s0 = ereal_min(eab.clone(), er.clone());
+    let lhs = ereal_wshl(
+        ereal_wmul(real_lane_of(a, "m"), real_lane_of(b, "m")),
+        ereal_wsub(eab, s0.clone()),
+        wv,
+    );
+    let rhs = ereal_wshl(real_lane_of(r, "m"), ereal_wsub(er, s0), wv);
+    let mut parts = real_all_wellformed(&[a, b, r]);
+    parts.push(ereal_icmp(IntCmpOp::Eq, lhs, rhs));
+    ereal_and_all(parts)
+}
+
+/// Exact division by cross-multiplication:
+/// `m_a·2^e_a == (m_r·m_b)·2^(e_r+e_b)`, plus `m_b != 0`.
+fn real_div(a: &RealOp, b: &RealOp, r: &RealOp, wv: u32) -> Formula {
+    let ea = real_lane_of(a, "e");
+    let erb = ereal_wadd(real_lane_of(r, "e"), real_lane_of(b, "e"));
+    let s0 = ereal_min(ea.clone(), erb.clone());
+    let lhs = ereal_wshl(real_lane_of(a, "m"), ereal_wsub(ea, s0.clone()), wv);
+    let rhs = ereal_wshl(
+        ereal_wmul(real_lane_of(r, "m"), real_lane_of(b, "m")),
+        ereal_wsub(erb, s0),
+        wv,
+    );
+    let mut parts = real_all_wellformed(&[a, b, r]);
+    parts.push(ereal_icmp(
+        IntCmpOp::Neq,
+        real_lane_of(b, "m"),
+        ereal_lit(0),
+    ));
+    parts.push(ereal_icmp(IntCmpOp::Eq, lhs, rhs));
+    ereal_and_all(parts)
+}
+
+/// `setReal[x, lit]`: bind `x`'s `(m, e)` lanes to the exact dyadic
+/// conversion. Non-dyadic literals fail loudly (no rounding).
+fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
+    let s = match lit {
+        Expr::RealLit(s, _) => s.clone(),
+        _ => {
+            return Err(FrontError::Resolve(
+                "setReal expects a decimal literal (e.g. 0.5) as its second argument".to_string(),
+            ))
+        }
+    };
+    let v = decimal_to_real(&s, Some(m_width)).ok_or_else(|| {
+        FrontError::Resolve(format!(
+            "setReal: cannot convert {s:?} exactly (non-dyadic, malformed, or outside the lane range)"
+        ))
+    })?;
+    Ok(ereal_and_all(vec![
+        Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "m"), IntExpr::Lit(v.m as i64, 0), 0),
+        Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "e"), IntExpr::Lit(v.e as i64, 0), 0),
+    ]))
 }
 
 

@@ -2152,6 +2152,14 @@ fn print_help() {
     println!("  `EReal` is abstract: extenders partition it (like any Alloy parent);");
     println!("  decimal literals are constants needing no atoms (`for 0 EReal` still works);");
     println!("  lane widths come from `for N Int` (+MEPK_*_WIDTH); `for N EReal` scopes atoms.");
+    println!("notes: builtin `Real` (exact centre `c = m*2^e`, `EReal extends Real`):");
+    println!("  `x.m`, `x.e` read the shared centre lanes (`m == 0` or odd);");
+    println!("  `realAdd/Sub/Mul/Div[a,b,c]` (exact; inexact division is UNSAT),");
+    println!("  `realWellformed[x]`, `realEq`, `realLT`, `realLTE`;");
+    println!("  `setReal[x, 0.5]` binds dyadic literals only (non-dyadic fails loudly);");
+    println!("  `R = 0.5` binds the centre for `Real`-rooted values;");
+    println!("  `Real` is never covered: free values coexist with extenders;");
+    println!("  `for N Real` scopes free atoms (`for M EReal` needs `M <= N`).");
 }
 
 /// Resolve an explicit `:psave` relation argument: exact pool name first,
@@ -2205,11 +2213,11 @@ fn expr_is_signed(e: &Expr) -> bool {
     }
 }
 
-/// True when a field TYPE expression mentions `EReal` (so rows decode to
-/// `c ± R`). Same shape walk as `expr_is_signed`.
+/// True when a field TYPE expression mentions `Real`/`EReal` (so rows
+/// decode to `c` / `c ± R`). Same shape walk as `expr_is_signed`.
 fn expr_is_ereal(e: &Expr) -> bool {
     match e {
-        Expr::Name(n, _) => n == "EReal",
+        Expr::Name(n, _) => n == "Real" || n == "EReal",
         Expr::Bin(_, a, b) => expr_is_ereal(a) || expr_is_ereal(b),
         Expr::Transpose(x)
         | Expr::TClosure(x)

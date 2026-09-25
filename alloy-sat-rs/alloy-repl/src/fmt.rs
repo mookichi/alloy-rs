@@ -187,9 +187,10 @@ pub fn field_rows_alloy(inst: &Instance, owner: &str, field: &str, ts: &TupleSet
     out
 }
 
-/// True for the builtin lane relations (`EReal.m/e/p/k`).
+/// True for the builtin lane relations (`Real.m`/`Real.e` shared centre
+/// lanes plus the `EReal`-only `EReal.p`/`EReal.k`).
 fn is_ereal_lane(name: &str) -> bool {
-    matches!(name, "EReal.m" | "EReal.e" | "EReal.p" | "EReal.k")
+    matches!(name, "Real.m" | "Real.e" | "EReal.p" | "EReal.k")
 }
 
 /// Bit position of a lane atom (`M$3` -> 3) with the expected prefix.
@@ -231,9 +232,10 @@ fn lane_value(width: i64, bits: impl Iterator<Item = i64>) -> Option<i64> {
     Some(total)
 }
 
-/// Decode every `EReal$i` atom to its `(m, e, p, k)` lanes plus a
-/// one-line `c ± R` display: `EReal-atom-idx -> (lanes, text)`.
-/// `None` when the instance carries no EReal lanes (legacy path kept).
+/// Decode every `Real$i`/`EReal$i` atom to its lanes plus a one-line
+/// display: `EReal` members with full lanes show `c ± R`, pure-`Real`
+/// members show the exact centre `c`.
+/// `None` when the instance carries no `Real` lanes (legacy path kept).
 fn decode_ereal(inst: &Instance) -> Option<BTreeMap<u32, ((i64, i64, i64, i64), String)>> {
     let universe = inst.universe();
     let size = universe.size() as i64;
@@ -242,10 +244,10 @@ fn decode_ereal(inst: &Instance) -> Option<BTreeMap<u32, ((i64, i64, i64, i64), 
     for (r, ts) in inst.relation_tuples() {
         let name = inst.pool().name(r);
         match name.as_ref() {
-            "EReal.m" => {
+            "Real.m" => {
                 lanes.insert("m", ts);
             }
-            "EReal.e" => {
+            "Real.e" => {
                 lanes.insert("e", ts);
             }
             "EReal.p" => {
@@ -257,17 +259,22 @@ fn decode_ereal(inst: &Instance) -> Option<BTreeMap<u32, ((i64, i64, i64, i64), 
             _ => {}
         }
     }
-    if lanes.len() != 4 {
+    if lanes.get("m").is_none() || lanes.get("e").is_none() {
         return None;
     }
-    let prefixes = [("m", "M"), ("e", "E"), ("p", "P"), ("k", "K")];
-    let widths: Vec<i64> = prefixes
+    let me_prefixes = [("m", "M"), ("e", "E")];
+    let me_widths: Vec<i64> = me_prefixes
         .iter()
         .map(|(_, pre)| lane_width(universe, pre))
         .collect::<Option<_>>()?;
-    // Owner EReal atom -> lane bits per lane.
-    let mut rows: BTreeMap<u32, [Vec<i64>; 4]> = BTreeMap::new();
-    for (li, (lane, _)) in prefixes.iter().enumerate() {
+    let pk_prefixes = [("p", "P"), ("k", "K")];
+    let pk_widths: Option<Vec<i64>> = pk_prefixes
+        .iter()
+        .map(|(_, pre)| lane_width(universe, pre))
+        .collect();
+    // Owner atom -> (m/e bits, p/k bits).
+    let mut rows: BTreeMap<u32, ([Vec<i64>; 2], [Vec<i64>; 2])> = BTreeMap::new();
+    for (li, (lane, _)) in me_prefixes.iter().enumerate() {
         let ts = lanes[lane];
         if ts.arity() != 2 {
             return None;
@@ -277,38 +284,83 @@ fn decode_ereal(inst: &Instance) -> Option<BTreeMap<u32, ((i64, i64, i64, i64), 
             if d.len() < 2 {
                 return None;
             }
-            let bit = lane_pos(universe, d[1], prefixes[li].1)?;
-            rows.entry(d[0]).or_default()[li].push(bit);
+            let bit = lane_pos(universe, d[1], me_prefixes[li].1)?;
+            rows.entry(d[0]).or_default().0[li].push(bit);
+        }
+    }
+    if lanes.contains_key("p") && lanes.contains_key("k") && pk_widths.is_some() {
+        for (li, (lane, _)) in pk_prefixes.iter().enumerate() {
+            let ts = lanes[lane];
+            if ts.arity() != 2 {
+                return None;
+            }
+            for flat in ts.index_view().iter() {
+                let d = digits(size, 2, flat);
+                if d.len() < 2 {
+                    return None;
+                }
+                let bit = lane_pos(universe, d[1], pk_prefixes[li].1)?;
+                rows.entry(d[0]).or_default().1[li].push(bit);
+            }
         }
     }
     let mut out: BTreeMap<u32, ((i64, i64, i64, i64), String)> = BTreeMap::new();
-    // Only atoms actually in the `EReal` relation decode; sibling atoms
-    // outside the solved extent (e.g. excluded by an extender's `one`)
-    // have unconstrained lanes and would print as noise.
-    let mut members: Option<HashSet<u32>> = None;
+    // Only atoms actually in the `Real`/`EReal` relations decode; sibling
+    // atoms outside the solved extents (e.g. excluded by an extender's
+    // `one`) have unconstrained lanes and would print as noise.
+    let mut members: HashSet<u32> = HashSet::new();
+    let mut ereal_members: HashSet<u32> = HashSet::new();
     for (r, ts) in inst.relation_tuples() {
-        if inst.pool().name(r).as_ref() == "EReal" && ts.arity() == 1 {
-            members = Some(ts.index_view().iter().map(|i| i as u32).collect());
-            break;
+        let name = inst.pool().name(r);
+        if ts.arity() != 1 {
+            continue;
+        }
+        if name.as_ref() == "Real" || name.as_ref() == "EReal" {
+            members.extend(ts.index_view().iter().map(|i| i as u32));
+        }
+        if name.as_ref() == "EReal" {
+            ereal_members.extend(ts.index_view().iter().map(|i| i as u32));
         }
     }
-    for (owner, bits) in rows {
-        if let Some(ref m) = members {
-            if !m.contains(&owner) {
-                continue;
-            }
+    for (owner, (me_bits, pk_bits)) in rows {
+        if !members.contains(&owner) {
+            continue;
         }
-        let vals: Vec<i64> = bits
+        // `EReal`-population atoms (`EReal$i`) outside the solved `EReal`
+        // extent are scope leftovers with unconstrained lanes (legacy
+        // ghost-lane rule); genuine `Real` members always decode.
+        let atom = atom_name(universe, owner);
+        if atom.starts_with("EReal$") && !ereal_members.contains(&owner) {
+            continue;
+        }
+        let me_vals: Vec<i64> = me_bits
             .iter()
-            .zip(widths.iter())
+            .zip(me_widths.iter())
             .map(|(b, w)| lane_value(*w, b.iter().copied()))
             .collect::<Option<_>>()?;
-        let (m, e, p, k) = (vals[0], vals[1], vals[2], vals[3]);
-        let text = match Mepk::new(m as i128, e as i32, p as u32, k as i32) {
-            Some(v) => format!("{} [m={m} e={e} p={p} k={k}]", v.interval_string(0)),
-            None => format!("(ill-formed lanes m={m} e={e} p={p} k={k})"),
+        let (m, e) = (me_vals[0], me_vals[1]);
+        let pk_vals: Option<(i64, i64)> = match (&pk_widths, ereal_members.contains(&owner)) {
+            (Some(ws), true) => {
+                let vs: Option<Vec<i64>> = pk_bits
+                    .iter()
+                    .zip(ws.iter())
+                    .map(|(b, w)| lane_value(*w, b.iter().copied()))
+                    .collect();
+                vs.map(|v| (v[0], v[1]))
+            }
+            _ => None,
         };
-        out.insert(owner, ((m, e, p, k), text));
+        let (lanes4, text) = match pk_vals {
+            Some((p, k)) => match Mepk::new(m as i128, e as i32, p as u32, k as i32) {
+                Some(v) => ((m, e, p, k), format!("{} [m={m} e={e} p={p} k={k}]", v.interval_string(0))),
+                None => ((m, e, p, k), format!("(ill-formed lanes m={m} e={e} p={p} k={k})")),
+            },
+            None => match alloy_kodkod_rs::real::RealCenter::new(m as i128, e as i32) {
+                Some(v) => ((m, e, 0, 0), format!("{} [m={m} e={e}]", v.centre_short())),
+                None => ((m, e, 0, 0), format!("(ill-formed lanes m={m} e={e})")),
+            },
+        };
+        out.insert(owner, (lanes4, text));
     }
     Some(out)
 }
@@ -377,9 +429,10 @@ pub fn instance_alloy_hinted(inst: &Instance, hints: &DisplayHints) -> String {
     for (r, ts) in inst.relation_tuples() {
         let name = inst.pool().name(r);
         let name_s: &str = &name;
-        // Raw `EReal.m/e/p/k` lane tuples are unreadable bit sets; the
-        // decoded per-atom lines (emitted after `EReal = {...}`) replace
-        // them whenever decoding succeeds.
+        // Raw `Real.m`/`Real.e`/`EReal.p`/`EReal.k` lane tuples are
+        // unreadable bit sets; the decoded per-atom lines (emitted after
+        // `Real = {...}` / `EReal = {...}`) replace them whenever decoding
+        // succeeds.
         if ereal.is_some() && is_ereal_lane(name_s) {
             continue;
         }
@@ -400,14 +453,16 @@ pub fn instance_alloy_hinted(inst: &Instance, hints: &DisplayHints) -> String {
         let as_int = ts.arity() == 1 && hints.signed_sigs.contains(name_s);
         let expr = set_alloy_maybe_int(inst.universe(), ts.arity(), ts, as_int);
         out.push_str(&format!("\n {name} = {expr}"));
-        // Decoded `EReal$i = c ± R` lines follow the atom set itself.
-        if name_s == "EReal" {
+        // Decoded `Real$i`/`EReal$i` lines follow their own atom set.
+        if name_s == "Real" || name_s == "EReal" {
             if let Some(ref ev) = ereal {
                 for (idx, (_, text)) in ev.iter() {
-                    out.push_str(&format!(
-                        "\n {} = {text}",
-                        atom_name(inst.universe(), *idx)
-                    ));
+                    let atom = atom_name(inst.universe(), *idx);
+                    let is_ereal_atom = atom.starts_with("EReal$");
+                    if (name_s == "EReal") != is_ereal_atom {
+                        continue;
+                    }
+                    out.push_str(&format!("\n {atom} = {text}"));
                 }
             }
         }
@@ -678,7 +733,10 @@ mod tests {
             ereal_fields: ["X.r".to_string()].into_iter().collect(),
         };
         let s = instance_alloy_hinted(&inst, &hints);
-        assert!(!s.contains("EReal.m ="), "raw lanes leaked: {s}");
+        assert!(!s.contains("Real.m ="), "raw lanes leaked: {s}");
+        assert!(!s.contains("Real.e ="), "raw lanes leaked: {s}");
+        assert!(!s.contains("EReal.p ="), "raw lanes leaked: {s}");
+        assert!(!s.contains("EReal.k ="), "raw lanes leaked: {s}");
         assert!(!s.contains("M$"), "raw lane atoms leaked: {s}");
         assert!(s.contains("EReal$0 = 0.5"), "got: {s}");
         assert!(s.contains("X$0.r = 0.5"), "got: {s}");

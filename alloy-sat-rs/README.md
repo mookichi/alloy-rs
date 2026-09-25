@@ -76,7 +76,7 @@ alloy-engine-rs (Java↔Rust 直列化 ARE1/ARE2 + C ABI/JNI)
 * **partial/pin/avoid** (§5): ASTレベル部分インスタンス (`Sig$tag` ラベルは定義内局所)。
 * **最適化** (§6): `maximize`/`minimize` コマンド、pred内マーカー (時制では `initially`/`goal`/`restore` で時点指定)、`maxsome`/`minsome`/`soft fact` (AlloyMax subset)。
 * **オーバーフロー** (§7–§8): `some/no Overflow {F}`。`run` は溢れなし優先+fallback、`check` は wrapping 優先。評価器は E-bit ラップ。
-* **Mepk/EReal**: `(m,e,p,k)` 形式。`sig A { x: EReal }`、`erealAdd/Sub/Mul/Div`、`setEReal[x, 3.14]`。実数リテラルは `=`/`!=`・`ereal*` 引数で直接使える (`R = 1.2` は値等価; 小数点必須)。区間比較 `erealExactEq`/`erealMayEq`/`erealCovers`/`erealLT`/`erealLTE`/`erealMayLTE` (`[c-R, c+R]` 閉区間)。`EReal` は抽象ソート (`extends` は分割。リテラルは定数でatom不要)。Java 対向物は `org.alloytools.alloy.core` の `MepkOps.java` + `models/util/mepk.als` (`MepkOpsTest`: 10 tests)。
+* **Real/EReal**: `Real` は exact 中心 `c = m*2^e` (`realAdd/Sub/Mul/Div`・`setReal[x, 0.5]` は dyadic のみ、`realEq/LT/LTE`、`R = 0.5` は中心束縛)。`EReal extends Real` で `(m,e,p,k)` 誤差追跡 (`erealAdd/Sub/Mul/Div`、`setEReal[x, 3.14]`、区間比較 `erealExactEq`/`erealMayEq`/`erealCovers`/`erealLT`/`erealLTE`/`erealMayLTE` (`[c-R, c+R]` 閉区間))。実数リテラルは `=`/`!=`・`*` 引数で直接使える (小数点必須)。`EReal` は抽象ソート (`extends` は分割。リテラルは定数でatom不要)、`Real` は非カバー (free 値と extender が共存)。`M/E` 幅共有 (`for N Int` +`MEPK_*_WIDTH`)、`for N Real`/`for M EReal` (`M <= N`)。Java 対向物は `org.alloytools.alloy.core` の `MepkOps.java` + `models/util/mepk.als` (`MepkOpsTest`: 10 tests)。
 
 ## ビルド / テスト
 
