@@ -307,6 +307,25 @@ pub fn translate_conjunct_def<S: SatSolver>(
     if num_vars > solver.num_variables() {
         solver.add_variables(num_vars - solver.num_variables());
     }
+    if std::env::var_os("ALLOY_TIMING").is_some() {
+        let mut max_len = 0usize;
+        let mut total_len = 0u64;
+        let mut over64 = 0u64;
+        for clause in &t.clauses {
+            max_len = max_len.max(clause.len());
+            total_len += clause.len() as u64;
+            if clause.len() > 64 {
+                over64 += 1;
+            }
+        }
+        eprintln!(
+            "[cnfstats] clauses={} maxlen={} avglen={:.1} over64={}",
+            t.clauses.len(),
+            max_len,
+            total_len as f64 / t.clauses.len().max(1) as f64,
+            over64,
+        );
+    }
     for clause in &t.clauses {
         solver.add_clause(clause);
     }
