@@ -19,7 +19,7 @@ pub struct FormulaId(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeclsId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Union,
     Intersection,
@@ -46,7 +46,7 @@ impl BinaryOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryExprOp {
     Transpose,
     Closure,
@@ -63,7 +63,7 @@ impl UnaryExprOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConstantExpr {
     Univ,
     Iden,
@@ -80,12 +80,12 @@ impl ConstantExpr {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TemporalExprOp {
     Prime,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CastToIntOp {
     Cardinality,
     Sum,
@@ -100,7 +100,7 @@ pub enum CastToIntOp {
     BitsIn(u32),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntBinOp {
     Plus,
     Minus,
@@ -136,7 +136,7 @@ impl IntBinOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntCompOp {
     Eq,
     Neq,
@@ -159,7 +159,7 @@ impl IntCompOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExprCompOp {
     Subset,
     Equals,
@@ -174,7 +174,7 @@ impl ExprCompOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Quantifier {
     All,
     Some,
@@ -189,7 +189,7 @@ impl Quantifier {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Multiplicity {
     Lone,
     One,
@@ -208,7 +208,7 @@ impl Multiplicity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FormulaBinOp {
     And,
     Or,
@@ -223,7 +223,7 @@ impl FormulaBinOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TemporalFormulaOp {
     After,
     Always,
@@ -258,7 +258,7 @@ impl TemporalFormulaOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TemporalBinaryOp {
     Until,
     Releases,
@@ -277,7 +277,7 @@ impl TemporalBinaryOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Decl {
     pub mult: Multiplicity,
     pub variable: VarId,
@@ -290,7 +290,7 @@ pub(crate) struct VariableData {
     pub arity: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ExprNode {
     Relation(RelationId),
     Variable(VarId),
@@ -333,7 +333,7 @@ pub enum ExprNode {
     FromInt(IntId),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IntNode {
     Constant(Int),
     OfExpr {
@@ -367,7 +367,7 @@ pub enum IntNode {
 }
 
 /// Widening integer operator (see [`IntNode::Widen`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WidenOp {
     Add,
     Sub,
@@ -381,7 +381,7 @@ pub enum WidenOp {
     Mul,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FormulaNode {
     Constant(bool),
     Not(FormulaId),
@@ -444,6 +444,15 @@ pub struct AstArena {
     ints: Vec<IntNode>,
     formulas: Vec<FormulaNode>,
     decls_list: Vec<Vec<Decl>>,
+    /// Structural hash-consing tables (Java `FOL2BoolCache` counterpart
+    /// at construction time): identical content yields an identical id,
+    /// so repeated subexpressions share one node and the translation
+    /// memos in `fol.rs` can hit across occurrences. First occurrence
+    /// keeps the id it would have had without interning.
+    expr_index: HashMap<ExprNode, ExprId>,
+    int_index: HashMap<IntNode, IntId>,
+    formula_index: HashMap<FormulaNode, FormulaId>,
+    decls_index: HashMap<Vec<Decl>, DeclsId>,
 }
 
 impl Clone for AstArena {
@@ -458,6 +467,10 @@ impl Clone for AstArena {
             ints: self.ints.clone(),
             formulas: self.formulas.clone(),
             decls_list: self.decls_list.clone(),
+            expr_index: self.expr_index.clone(),
+            int_index: self.int_index.clone(),
+            formula_index: self.formula_index.clone(),
+            decls_index: self.decls_index.clone(),
         }
     }
 }
@@ -597,10 +610,27 @@ impl AstArena {
     }
 
     fn push_expr(&mut self, node: ExprNode, arity: u32) -> ExprId {
+        if let Some(&id) = self.expr_index.get(&node) {
+            debug_assert_eq!(self.exprs[id.0 as usize].arity, arity);
+            return id;
+        }
         let id = ExprId(self.exprs.len() as u32);
+        self.expr_index.insert(node.clone(), id);
         self.exprs.push(ExprSlot { node, arity });
         id
     }
+
+    fn push_int(&mut self, node: IntNode) -> IntId {
+        if let Some(&id) = self.int_index.get(&node) {
+            return id;
+        }
+        let id = IntId(self.ints.len() as u32);
+        self.int_index.insert(node.clone(), id);
+        self.ints.push(node);
+        id
+    }
+
+
 
     pub fn expr(&self, id: ExprId) -> &ExprNode {
         &self.exprs[id.0 as usize].node
@@ -772,7 +802,11 @@ impl AstArena {
     }
 
     pub fn add_decls(&mut self, list: Vec<Decl>) -> DeclsId {
+        if let Some(&id) = self.decls_index.get(&list) {
+            return id;
+        }
         let id = DeclsId(self.decls_list.len() as u32);
+        self.decls_index.insert(list.clone(), id);
         self.decls_list.push(list);
         id
     }
@@ -794,42 +828,30 @@ impl AstArena {
     }
 
     pub fn int_constant(&mut self, value: Int) -> IntId {
-        let id = IntId(self.ints.len() as u32);
-        self.ints.push(IntNode::Constant(value));
-        id
+        self.push_int(IntNode::Constant(value))
     }
 
     pub fn cast_to_int(&mut self, op: CastToIntOp, expr: ExprId) -> Result<IntId, AstError> {
         if (op == CastToIntOp::Sum || op == CastToIntOp::Bits) && self.arity(expr) > 1 {
             return Err(AstError::SumRequiresUnary(self.arity(expr)));
         }
-        let id = IntId(self.ints.len() as u32);
-        self.ints.push(IntNode::OfExpr { op, expr });
-        Ok(id)
+        Ok(self.push_int(IntNode::OfExpr { op, expr }))
     }
 
     pub fn binary_int(&mut self, op: IntBinOp, left: IntId, right: IntId) -> IntId {
-        let id = IntId(self.ints.len() as u32);
-        self.ints.push(IntNode::Binary { op, left, right });
-        id
+        self.push_int(IntNode::Binary { op, left, right })
     }
 
     pub fn widen_int(&mut self, op: WidenOp, left: IntId, right: IntId) -> IntId {
-        let id = IntId(self.ints.len() as u32);
-        self.ints.push(IntNode::Widen { op, left, right });
-        id
+        self.push_int(IntNode::Widen { op, left, right })
     }
 
     pub fn if_int(&mut self, cond: FormulaId, then: IntId, els: IntId) -> IntId {
-        let id = IntId(self.ints.len() as u32);
-        self.ints.push(IntNode::If { cond, then, els });
-        id
+        self.push_int(IntNode::If { cond, then, els })
     }
 
     pub fn sum_int(&mut self, decls: DeclsId, body: IntId) -> IntId {
-        let id = IntId(self.ints.len() as u32);
-        self.ints.push(IntNode::Sum { decls, body });
-        id
+        self.push_int(IntNode::Sum { decls, body })
     }
 
     pub fn bool_formula(&mut self, value: bool) -> FormulaId {
@@ -845,7 +867,11 @@ impl AstArena {
     }
 
     fn push_formula(&mut self, node: FormulaNode) -> FormulaId {
+        if let Some(&id) = self.formula_index.get(&node) {
+            return id;
+        }
         let id = FormulaId(self.formulas.len() as u32);
+        self.formula_index.insert(node.clone(), id);
         self.formulas.push(node);
         id
     }
