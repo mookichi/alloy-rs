@@ -1727,7 +1727,6 @@ impl<'a> Ctx<'a> {
                 // Strictness follows the original name (the swap above
                 // preserves it: `GT`→`Lt`, `GTE`→`Lte`).
                 let strict = name == "realLT" || name == "realGT";
-                let op = if strict { IntCmpOp::Lt } else { IntCmpOp::Lte };
                 // Bracket semantics for non-dyadic literals (plain or
                 // `(d)` alike): `X < L ⟺ X ≤ Down(L)`,
                 // `L < X ⟺ Up(L) ≤ X` (verdict-exact: `Down(L) < L`

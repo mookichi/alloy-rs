@@ -33,11 +33,6 @@ pub const REAL_LANES: [(&str, u32); 2] = [("m", LANE_M), ("e", LANE_E)];
 /// Builtin `EReal`-only lanes (precision / error exponent).
 pub const EREAL_EXTRA_LANES: [(&str, u32); 2] = [("p", LANE_P), ("k", LANE_K)];
 
-/// Builtin `Real`+`EReal` field lanes: (field name, bit-lane group).
-/// `m`/`e` are `Real` lanes (shared), `p`/`k` are `EReal`-only.
-pub const EREAL_LANES: [(&str, u32); 4] =
-    [("m", LANE_M), ("e", LANE_E), ("p", LANE_P), ("k", LANE_K)];
-
 /// Builtin `Real` operation/predicate names that imply Real allocation
 /// (exact-centre counterparts of the `ereal*` surface).
 pub const REAL_OPS: &[&str] = &[
@@ -121,6 +116,8 @@ pub struct Resolved {
     /// `Real` values are used with no user extender hosting them).
     /// `EReal` atoms and user-extender own atoms join the `Real`
     /// closure (`EReal extends Real`).
+    /// Kept for scope introspection (cf. `ereal_atoms`).
+    #[allow(dead_code)]
     pub real_atoms: Vec<String>,
     /// Allocated `Real` population (free pool + `EReal` + extenders).
     /// Informational (atom lists are authoritative); kept for scope
