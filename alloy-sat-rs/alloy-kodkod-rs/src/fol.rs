@@ -302,12 +302,16 @@ impl<'a> FolTranslator<'a> {
         // model-independent singletons, so copy them straight from the
         // bounds. Without this, `Evaluator` lane reads (and hence
         // lane-valued optimization costs) see an empty layer and
-        // report 0. Builtin `Int` bounds stay untouched (displayed
-        // `ints:` output must remain byte-identical).
+        // report 0. The builtin `Int` group rides along identically
+        // (its `ints:` display section would otherwise stay empty even
+        // with int atoms in the universe).
         for g in self.bounds.lane_groups() {
             for (i, ts) in self.bounds.int_bounds_in(g) {
                 let _ = inst.add_int_in(g, i, ts);
             }
+        }
+        for (i, ts) in self.bounds.int_bounds_in(crate::bounds::INT_BITS_GROUP) {
+            let _ = inst.add_int(i, ts);
         }
         inst
     }

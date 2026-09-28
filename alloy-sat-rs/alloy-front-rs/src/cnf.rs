@@ -634,6 +634,20 @@ pub(crate) fn materialize(
         }
         let _ = inst.add(r, &ts);
     }
+    // Integer layers (`group -> value -> atoms`) are model-independent
+    // singletons: copy them straight from the bounds, mirroring the
+    // Kodkod translator. Without the builtin-`Int` group the displayed
+    // `ints:` section stays empty even with int atoms in the universe;
+    // without the lane groups `Evaluator` lane reads see an empty layer
+    // and report 0.
+    for g in bounds.lane_groups() {
+        for (i, ts) in bounds.int_bounds_in(g) {
+            let _ = inst.add_int_in(g, i, ts);
+        }
+    }
+    for (i, ts) in bounds.int_bounds_in(alloy_kodkod_rs::bounds::INT_BITS_GROUP) {
+        let _ = inst.add_int(i, ts);
+    }
     Ok(inst)
 }
 

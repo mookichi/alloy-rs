@@ -16,6 +16,13 @@ use std::sync::Arc;
 
 pub const DEFAULT_SCOPE: u32 = 3;
 
+/// Builtin sigs with no allocated atoms bind nothing (like `Int` when
+/// unused): no empty shells in bounds, universe display, or warnings.
+pub fn is_unallocated_builtin(res: &Resolved, name: &str) -> bool {
+    matches!(name, "Real" | "EReal" | "$M" | "$E" | "$P" | "$K")
+        && res.atoms_of(name).is_empty()
+}
+
 /// Builtin flat lane sigs (`$M/$E/$P/$K`): the bit-position domains.
 /// User declaration is prohibited (reserved like `Real`/`EReal`/`Int`);
 /// sizes come from `run ... for N $M` (else the `for W Int` rule).
@@ -1586,6 +1593,10 @@ pub fn bind_sigs(
         }
     }
     for name in res.sigs.keys() {
+        // Unallocated builtins bind nothing (no empty shells).
+        if is_unallocated_builtin(res, name) {
+            continue;
+        }
         let rel = arena.relation(name, 1);
         let mut ts = TupleSet::new(&res.universe, 1).map_err(|e| e.to_string())?;
         // For `in` children, use parent's atoms as upper bound

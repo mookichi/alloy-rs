@@ -547,8 +547,12 @@ impl<'m> Lowerer<'m> {
     ) -> LResult<R> {
         let res = bounds::resolve(self.module, scope).map_err(FrontError::Resolve)?;
         // Re-intern only: names already present keep their IDs.
+        // Unallocated builtins bind nothing (no empty shells).
         let mut rels: HashMap<String, RelationId> = HashMap::new();
         for name in res.sigs.keys() {
+            if crate::bounds::is_unallocated_builtin(&res, name) {
+                continue;
+            }
             let r = arena.relation(name, 1);
             rels.insert(name.clone(), r);
         }
@@ -556,16 +560,24 @@ impl<'m> Lowerer<'m> {
         // Builtin `Real` centre lanes (`Real.m`, `Real.e`) plus the
         // `EReal`-only lanes (`EReal.p`, `EReal.k`); all binary
         // `owner -> lane-atoms`. `EReal` reads its centre through the
-        // shared `Real.m`/`Real.e` (`EReal extends Real`).
-        for (owner, fname) in crate::bounds::REAL_LANES
+        // shared `Real.m`/`Real.e` (`EReal extends Real`). Unallocated
+        // lanes declare nothing (no empty shells, mirroring bounds).
+        for (owner, fname, group) in crate::bounds::REAL_LANES
             .iter()
-            .map(|(f, _)| ("Real", *f))
+            .map(|(f, g)| ("Real", *f, *g))
             .chain(
                 crate::bounds::EREAL_EXTRA_LANES
                     .iter()
-                    .map(|(f, _)| ("EReal", *f)),
+                    .map(|(f, g)| ("EReal", *f, *g)),
             )
         {
+            if res
+                .lane_atoms
+                .get(&group)
+                .map_or(true, |v| v.is_empty())
+            {
+                continue;
+            }
             let key = format!("{owner}.{fname}");
             let fa = arena.relation(&key, 2);
             field_arity.insert(key.clone(), 2);
@@ -619,16 +631,24 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
-        // Builtin `Real`/`EReal` lanes are always Int-flavored (bitmask-readable).
-        for (owner, fname) in crate::bounds::REAL_LANES
+        // Builtin `Real`/`EReal` lanes are Int-flavored (bitmask-readable)
+        // when allocated; unallocated lanes declare nothing.
+        for (owner, fname, group) in crate::bounds::REAL_LANES
             .iter()
-            .map(|(f, _)| ("Real", *f))
+            .map(|(f, g)| ("Real", *f, *g))
             .chain(
                 crate::bounds::EREAL_EXTRA_LANES
                     .iter()
-                    .map(|(f, _)| ("EReal", *f)),
+                    .map(|(f, g)| ("EReal", *f, *g)),
             )
         {
+            if res
+                .lane_atoms
+                .get(&group)
+                .map_or(true, |v| v.is_empty())
+            {
+                continue;
+            }
             field_int.insert(format!("{owner}.{fname}"), SetKind::Int);
         }
         let ctx = Ctx {
@@ -666,9 +686,13 @@ impl<'m> Lowerer<'m> {
         let mut arena = kk::AstArena::with_pool(Arc::clone(&pool));
         let mut b = Bounds::new(&res.universe, &pool);
 
-        // sig relations + exact bounds
+        // sig relations + exact bounds (unallocated builtins bind
+        // nothing: no empty shells, mirroring the invisible `Int`).
         let mut rels: HashMap<String, RelationId> = HashMap::new();
         for name in res.sigs.keys() {
+            if crate::bounds::is_unallocated_builtin(&res, name) {
+                continue;
+            }
             let r = arena.relation(name, 1);
             rels.insert(name.clone(), r);
         }
@@ -736,10 +760,14 @@ impl<'m> Lowerer<'m> {
                     .map(|(f, g)| ("EReal", *f, *g)),
             )
         {
+            let lane = res.lane_atoms.get(&group).cloned().unwrap_or_default();
+            // Unallocated lanes bind nothing (no empty shells).
+            if lane.is_empty() {
+                continue;
+            }
             let key = format!("{owner}.{fname}");
             let fa = arena.relation(&key, 2);
             field_arity.insert(key.clone(), 2);
-            let lane = res.lane_atoms.get(&group).cloned().unwrap_or_default();
             let mut ts =
                 alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?;
@@ -926,16 +954,24 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
-        // Builtin `Real`/`EReal` lanes are always Int-flavored (bitmask-readable).
-        for (owner, fname) in crate::bounds::REAL_LANES
+        // Builtin `Real`/`EReal` lanes are Int-flavored (bitmask-readable)
+        // when allocated; unallocated lanes declare nothing.
+        for (owner, fname, group) in crate::bounds::REAL_LANES
             .iter()
-            .map(|(f, _)| ("Real", *f))
+            .map(|(f, g)| ("Real", *f, *g))
             .chain(
                 crate::bounds::EREAL_EXTRA_LANES
                     .iter()
-                    .map(|(f, _)| ("EReal", *f)),
+                    .map(|(f, g)| ("EReal", *f, *g)),
             )
         {
+            if res
+                .lane_atoms
+                .get(&group)
+                .map_or(true, |v| v.is_empty())
+            {
+                continue;
+            }
             field_int.insert(format!("{owner}.{fname}"), SetKind::Int);
         }
         let ctx = Ctx {

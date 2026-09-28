@@ -113,3 +113,27 @@ fn flat_bitset_query_value_appends_reading() {
     assert!(decode_bitset(u, &[mi]).is_some());
     assert_eq!(decode_bitset(u, &[]), None);
 }
+
+#[test]
+fn ints_section_lists_int_atoms() {
+    // The solved instance carries the builtin-Int int layer, so the
+    // `ints:` section shows entries (`:eval`/`:solve` display parity
+    // with `:query Int`).
+    let inst = solve_first("sig A {}\nrun {} for 8 Int");
+    assert_eq!(inst.int_tuples().count(), 8);
+    let s = format_instance(&inst);
+    assert!(s.contains(" 0->[[0]]"), "got: {s}");
+    assert!(s.contains(" 7->[[7]]"), "got: {s}");
+}
+
+#[test]
+fn unmentioned_real_leaves_no_shells() {
+    // Like `Int` when unused, an unmentioned `Real` binds nothing: no
+    // empty `Real.m`/`$M`/… shells in bounds or display.
+    let inst = solve_first("sig A {}\nrun {}");
+    let s = format_instance(&inst);
+    assert!(!s.contains("Real"), "got: {s}");
+    assert!(!s.contains("$M"), "got: {s}");
+    assert!(!s.contains("$E"), "got: {s}");
+    assert_eq!(inst.int_tuples().count(), 0);
+}
