@@ -970,22 +970,17 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             }
         }
     }
-    let real_scope = scope.entries.iter().find(|(n, _)| n == "Real");
+    // FLAT-EXPERIMENT: `Real` is abstract over the `$M`/`$E` partition.
+    // There is no free `Real$i` pool; `for N Real` is ignored and the
+    // budget derives as M+E (`Real = $M + $E` as sets). `EReal` keeps
+    // its reified population as the control group.
+    let _real_scope = scope.entries.iter().find(|(n, _)| n == "Real");
     let ereal_scope = scope.entries.iter().find(|(n, _)| n == "EReal");
     let num_of = |e: &ScopeEntry| match e {
         ScopeEntry::Num(n) | ScopeEntry::Exactly(n) => *n,
     };
-    // `EReal extends Real`: the child population cannot exceed the parent
-    // one. When only `EReal` is scoped, the parent defaults up to cover it
-    // (backward compatible: EReal-only models keep working).
-    let mut real_budget = real_scope.map(|(_, e)| num_of(e)).unwrap_or(overall);
     let mut ereal_count = ereal_scope.map(|(_, e)| num_of(e)).unwrap_or(DEFAULT_SCOPE);
-    if ereal_scope.is_some() && real_scope.is_none() {
-        real_budget = real_budget.max(ereal_count);
-    }
-    if real_scope.is_some() && ereal_scope.is_none() {
-        ereal_count = ereal_count.min(real_budget);
-    }
+    let mut real_budget = mepk_widths.m_width + mepk_widths.e_width;
     // Bare-`Real` use (as a type, scope entry, `real*` operand, or field
     // type): needs free `Real` atoms when no extender hosts them (decided
     // below, once extenders are known). `EReal`-only models keep zero
@@ -1243,16 +1238,9 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             }
         }
     }
-    // Free pool (`Real$i`): only when no user extender hosts `Real`
-    // values (abstract cover would leave them homeless otherwise).
-    // With extenders, bare `Real` draws from the extenders instead.
-    let real_free: u32 = if real_kids.is_empty()
-        && (real_scope.is_some() || needs_bare_real)
-    {
-        real_budget
-    } else {
-        0
-    };
+    // FLAT-EXPERIMENT: no free pool (`Real$i`) ever; bare `Real`
+    // values live in the `$M`/`$E` partition (closure below).
+    let real_free: u32 = 0;
 
     // For `in` children, their atoms are a subset of the parent's atoms.
     // Do NOT add them to atoms_of (which feeds the universe); instead
@@ -1297,11 +1285,17 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     // The `Real` closure covers the free pool, the `EReal` population,
     // and user `extends Real` own atoms (abstract parent upper bound =
     // union; partition enforced by formulas in lower.rs).
+    // FLAT-EXPERIMENT: plus the `$M`/`$E` partition itself
+    // (`Real = $M + $E` as sets; lane names are deterministic).
     let mut real_closure: Vec<String> = real_atoms
         .iter()
         .chain(ereal_atoms.iter())
         .cloned()
         .collect();
+    if needs_real {
+        real_closure.extend((0..mepk_widths.m_width).map(|i| format!("M${i}")));
+        real_closure.extend((0..mepk_widths.e_width).map(|i| format!("E${i}")));
+    }
     for k in &real_kids {
         if let Some(own) = atoms_of.get(k) {
             real_closure.extend(own.iter().cloned());
@@ -1481,8 +1475,9 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         },
     );
     // Builtin flat lane sigs (`$M`/`$E`/`$P`/`$K`): the lane atoms
-    // themselves, queryable as sets (`some $M`, `X & $M`). Independent
-    // builtins (no parent, like `Int`'s bit domain, not `Real` children).
+    // themselves, queryable as sets (`some $M`, `X & $M`).
+    // FLAT-EXPERIMENT: `$M`/`$E` extend `Real` (partition
+    // `Real = $M + $E`); `$P`/`$K` stay independent (control).
     for (name, group) in [
         ("$M", LANE_M),
         ("$E", LANE_E),
@@ -1490,12 +1485,17 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         ("$K", LANE_K),
     ] {
         let atoms = lane_atoms.get(&group).cloned().unwrap_or_default();
+        let (parent, rel) = if matches!(name, "$M" | "$E") {
+            (Some("Real".to_string()), SigRel::Extends)
+        } else {
+            (None, SigRel::None)
+        };
         sigs.insert(
             name.to_string(),
             SigInfo {
                 name: name.to_string(),
-                parent: None,
-                rel: SigRel::None,
+                parent,
+                rel,
                 mult: SigMult::None,
                 atoms,
             },

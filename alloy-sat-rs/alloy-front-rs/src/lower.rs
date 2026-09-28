@@ -3240,6 +3240,15 @@ impl<'a> Ctx<'a> {
         e: &Expr,
         env: &mut Env,
     ) -> LResult<IntId> {
+        // FLAT-EXPERIMENT: `x & $M` / `x & $E` read through the lane
+        // int-bound groups (the intersect itself is plain-flavored, so
+        // it bypasses the int-flavor gate like lane joins do).
+        if let Some(group) = flat_lane_group(e) {
+            let (ee, _) = self.lower_expr(arena, e, env)?;
+            return arena
+                .cast_to_int(CastToIntOp::BitsIn(group), ee)
+                .map_err(|e| FrontError::Resolve(e.to_string()));
+        }
         if !self.set_int_flavored(e, env).is_int() {
             return Err(FrontError::Resolve(INT_MISMATCH_MSG.to_string()));
         }
@@ -5150,6 +5159,32 @@ fn scan_total_order_intexpr(e: &IntExpr, out: &mut Vec<(String, String)>) {
 // Lane reads lower through the lane-scoped `BitsIn` cast. Result centres
 // are window-pinned (see `ereal_add_window`/`ereal_result_normalized`);
 // only an exact-centre rounding encoding is left for the future.
+/// FLAT-EXPERIMENT: bit-partition read (`x & $M` / `x & $E`): the lane's
+/// bitmask value comes from the `$M`/`$E` int-bound group, not group 0.
+fn flat_lane_group(e: &Expr) -> Option<u32> {
+    if let Expr::Bin(BinOp::Intersect, a, b) = e {
+        for side in [a.as_ref(), b.as_ref()] {
+            if let Expr::Name(n, _) = side {
+                match n.as_str() {
+                    "$M" => return Some(crate::bounds::LANE_M),
+                    "$E" => return Some(crate::bounds::LANE_E),
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
+/// FLAT-EXPERIMENT: `base & $part` as an `Expr`.
+fn flat_partition_read(base: &Expr, part: &str) -> Expr {
+    Expr::Bin(
+        BinOp::Intersect,
+        Box::new(base.clone()),
+        Box::new(Expr::Name(part.to_string(), 0)),
+    )
+}
+
 /// Lane read `base.lane` in integer position.
 fn ereal_lane(base: &Expr, lane: &str) -> IntExpr {
     // Qualified owner: `m`/`e` live in the shared `Real` lanes
@@ -5987,9 +6022,15 @@ enum RealOp<'e> {
 }
 
 /// Lane read through a `Real` operand.
+// FLAT-EXPERIMENT: atom operands read through the bit partition
+// (`x & $M`), not the `Real.m` join.
 fn real_lane_of(op: &RealOp, lane: &str) -> IntExpr {
     match op {
-        RealOp::Ref(e) => ereal_lane(e, lane),
+        RealOp::Ref(e) => match lane {
+            "m" => IntExpr::BitsVal(Box::new(flat_partition_read(e, "$M")), 0),
+            "e" => IntExpr::BitsVal(Box::new(flat_partition_read(e, "$E")), 0),
+            _ => unreachable!("unknown Real lane {lane}"),
+        },
         RealOp::Const(v) => {
             let n = match lane {
                 "m" => v.m as i64,
@@ -6114,6 +6155,22 @@ fn lane_range(w: u32) -> (i64, i64) {
     (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1)
 }
 
+/// FLAT-EXPERIMENT: pin a `Real` value's lane through the bit
+/// partition (`x & $M`), not the `Real.m` join.
+fn real_pin(x: &Expr, lane: &str, v: i64) -> Formula {
+    let part = match lane {
+        "m" => "$M",
+        "e" => "$E",
+        _ => unreachable!("unknown Real lane {lane}"),
+    };
+    Formula::IntCmp(
+        IntCmpOp::Eq,
+        IntExpr::BitsVal(Box::new(flat_partition_read(x, part)), 0),
+        IntExpr::Lit(v, 0),
+        0,
+    )
+}
+
 fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
     // Plain `d`: exact dyadic only; non-dyadic-but-approximable is UNSAT
     // (no dyadic centre equals it). `(d)`: nearest binding.
@@ -6134,14 +6191,14 @@ fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
             ))
         })?;
         return Ok(ereal_and_all(vec![
-            Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "m"), IntExpr::Lit(v.m as i64, 0), 0),
-            Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "e"), IntExpr::Lit(v.e as i64, 0), 0),
+            real_pin(x, "m", v.m as i64),
+            real_pin(x, "e", v.e as i64),
         ]));
     }
     if let Some(v) = decimal_to_real(&s, Some(m_width)) {
         return Ok(ereal_and_all(vec![
-            Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "m"), IntExpr::Lit(v.m as i64, 0), 0),
-            Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "e"), IntExpr::Lit(v.e as i64, 0), 0),
+            real_pin(x, "m", v.m as i64),
+            real_pin(x, "e", v.e as i64),
         ]));
     }
     if decimal_to_real_rounded(&s, Some(m_width), RealRound::Nearest).is_some() {
@@ -6173,8 +6230,8 @@ fn real_set_rounded(x: &Expr, lit: &Expr, m_width: u32, mode: RealRound, name: &
         ))
     })?;
     Ok(ereal_and_all(vec![
-        Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "m"), IntExpr::Lit(v.m as i64, 0), 0),
-        Formula::IntCmp(IntCmpOp::Eq, ereal_lane(x, "e"), IntExpr::Lit(v.e as i64, 0), 0),
+        real_pin(x, "m", v.m as i64),
+        real_pin(x, "e", v.e as i64),
     ]))
 }
 
