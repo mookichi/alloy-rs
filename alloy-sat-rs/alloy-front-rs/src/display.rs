@@ -81,6 +81,136 @@ fn lane_value(width: i64, bits: impl Iterator<Item = i64>) -> Option<i64> {
     Some(total)
 }
 
+/// True for the builtin bit-domain sigs (`$M`/`$E`/`$P`/`$K`):
+/// domains, never decoded as values themselves.
+fn is_lane_domain(name: &str) -> bool {
+    matches!(name, "$M" | "$E" | "$P" | "$K")
+}
+
+/// Real-number reading of a bit set (`{M$0, E$0, ...}` as `0.5 [m=..]`).
+/// `None` for empty sets and unless every atom is a lane atom (`M$` /
+/// `E$` / `P$` / `K$`). Sets with `p`/`k` bits read as `EReal`
+/// intervals, the rest as exact centres; lane groups absent from the
+/// set read as 0. Mirrors the REPL decoder (`alloy-repl/src/fmt.rs`).
+pub fn decode_bitset(universe: &Universe, idxs: &[u32]) -> Option<String> {
+    if idxs.is_empty() {
+        return None;
+    }
+    const PRES: [&str; 4] = ["M", "E", "P", "K"];
+    let mut bits: [Vec<i64>; 4] = Default::default();
+    for &i in idxs {
+        let mut placed = false;
+        for (li, pre) in PRES.iter().enumerate() {
+            if let Some(v) = lane_pos(universe, i, pre) {
+                bits[li].push(v);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            return None;
+        }
+    }
+    // Widths are only needed for groups present in the set (their atoms
+    // live in the universe, so the width lookup cannot fail there).
+    let mut widths = [0i64; 4];
+    for (li, pre) in PRES.iter().enumerate() {
+        if bits[li].is_empty() {
+            continue;
+        }
+        widths[li] = lane_width(universe, pre)?;
+    }
+    let val = |li: usize| -> Option<i64> {
+        if bits[li].is_empty() {
+            Some(0)
+        } else {
+            lane_value(widths[li], bits[li].iter().copied())
+        }
+    };
+    let (m, e) = (val(0)?, val(1)?);
+    if bits[2].is_empty() && bits[3].is_empty() {
+        match RealCenter::new(m as i128, e as i32) {
+            Some(v) => Some(format!("{} [m={m} e={e}]", v.centre_short())),
+            None => Some(format!("(ill-formed lanes m={m} e={e})")),
+        }
+    } else {
+        let (p, k) = (val(2)?, val(3)?);
+        if p < 0 {
+            return Some(format!("(ill-formed lanes m={m} e={e} p={p} k={k})"));
+        }
+        match Mepk::new(m as i128, e as i32, p as u32, k as i32) {
+            Some(v) => Some(format!(
+                "{} [m={m} e={e} p={p} k={k}]",
+                v.interval_string(0)
+            )),
+            None => Some(format!("(ill-formed lanes m={m} e={e} p={p} k={k})")),
+        }
+    }
+}
+
+/// Per-owner rows for a binary relation whose value columns decode as
+/// bit sets: `X$0.r = {M$0, ...} = 0.5 [m=.. e=..]`. `None` when no row
+/// decodes at all (callers keep the legacy full-relation shape), so
+/// lane-free output stays byte-identical.
+pub fn bitset_field_rows(
+    inst: &Instance,
+    owner: &str,
+    field: &str,
+    ts: &TupleSet,
+) -> Option<String> {
+    if ts.arity() != 2 {
+        return None;
+    }
+    let universe = inst.universe();
+    let size = universe.size() as i64;
+    let mut groups: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for flat in ts.index_view().iter() {
+        let d = digits(size, ts.arity(), flat);
+        if d.len() >= 2 {
+            groups.entry(d[0]).or_default().push(d[1]);
+        }
+    }
+    // Owner atoms in instance order: the owner sig relation if present.
+    let mut owners: Vec<u32> = Vec::new();
+    for (r, ots) in inst.relation_tuples() {
+        if inst.pool().name(r).as_ref() == owner && ots.arity() == 1 {
+            for idx in ots.index_view().iter() {
+                owners.push(idx as u32);
+            }
+            break;
+        }
+    }
+    if owners.is_empty() {
+        owners = groups.keys().copied().collect();
+    }
+    let empty: Vec<u32> = Vec::new();
+    let mut any = false;
+    let mut rows: Vec<(u32, String, Option<String>)> = Vec::new();
+    for o in owners {
+        let cols = groups.get(&o).unwrap_or(&empty);
+        let raw = cols
+            .iter()
+            .map(|&c| atom_name(universe, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text = decode_bitset(universe, cols);
+        any |= text.is_some();
+        rows.push((o, raw, text));
+    }
+    if !any {
+        return None;
+    }
+    let mut out = String::new();
+    for (o, raw, text) in rows {
+        let oname = atom_name(universe, o);
+        match text {
+            Some(t) => out.push_str(&format!(" {oname}.{field} = {{{raw}}} = {t}\n")),
+            None => out.push_str(&format!(" {oname}.{field} = {{{raw}}}\n")),
+        }
+    }
+    Some(out)
+}
+
 /// Decode a flat tuple index (base-`size` digits, most significant first)
 /// into per-column atom indices.
 fn digits(size: i64, arity: u32, mut flat: i64) -> Vec<u32> {
@@ -246,8 +376,26 @@ pub fn format_instance(inst: &Instance) -> String {
         if ereal.is_some() && is_ereal_lane(name_s) {
             continue;
         }
+        // Flat bit-set rows decode alongside the raw tuples (fields);
+        // untouched relations keep the legacy shape (byte-identical).
+        if ts.arity() == 2 {
+            if let Some((owner, field)) = name_s.split_once('.') {
+                if let Some(s) = bitset_field_rows(inst, owner, field, ts) {
+                    out.push_str(&s);
+                    continue;
+                }
+            }
+        }
         // Newline shape mirrors the kodkod `Display` (`writeln!` per line)
         // so lane-free output stays byte-identical.
+        // Flat bit sets gain their real-number reading alongside.
+        if ts.arity() == 1 && !is_lane_domain(name_s) {
+            let idxs: Vec<u32> = ts.index_view().iter().map(|i| i as u32).collect();
+            if let Some(t) = decode_bitset(inst.universe(), &idxs) {
+                out.push_str(&format!("\n {name}->{ts} = {t}\n"));
+                continue;
+            }
+        }
         out.push_str(&format!("\n {name}->{ts}\n"));
         if name_s == "Real" || name_s == "EReal" {
             if let Some(ref ev) = ereal {
@@ -283,7 +431,13 @@ pub fn format_query_value(inst: &Instance, v: &crate::snippet::QueryValue) -> St
         QueryValue::Real(c) => format!("{} [m={} e={}]", c.centre_short(), c.m, c.e),
         QueryValue::Set(1, ts) => {
             let decoded = decode_ereal(inst).unwrap_or_default();
-            format_atom_set(inst, &decoded, ts.index_view().iter().map(|i| i as u32))
+            let inner = format_atom_set(inst, &decoded, ts.index_view().iter().map(|i| i as u32));
+            // Flat bit sets gain their real-number reading alongside.
+            let idxs: Vec<u32> = ts.index_view().iter().map(|i| i as u32).collect();
+            match decode_bitset(inst.universe(), &idxs) {
+                Some(t) => format!("{inner} = {t}"),
+                None => inner,
+            }
         }
         QueryValue::Set(n, ts) => {
             let size = inst.universe().size() as i64;

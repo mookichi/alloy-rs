@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use alloy_front_rs::{Instance, TupleSet};
 use alloy_kodkod_rs::mepk::Mepk;
+use alloy_kodkod_rs::real::RealCenter;
 use alloy_kodkod_rs::universe::Universe;
 
 /// Display hints: which names render unary int-atom sets as integers.
@@ -232,6 +233,149 @@ fn lane_value(width: i64, bits: impl Iterator<Item = i64>) -> Option<i64> {
     Some(total)
 }
 
+/// True for the builtin bit-domain sigs (`$M`/`$E`/`$P`/`$K`):
+/// domains, never decoded as values themselves.
+fn is_lane_domain(name: &str) -> bool {
+    matches!(name, "$M" | "$E" | "$P" | "$K")
+}
+
+/// Real-number reading of a bit set (`{M$0, E$0, ...}` as `0.5 [m=..]`).
+/// `None` for empty sets and unless every atom is a lane atom (`M$` /
+/// `E$` / `P$` / `K$`). Sets with `p`/`k` bits read as `EReal`
+/// intervals, the rest as exact centres; lane groups absent from the
+/// set read as 0.
+pub fn decode_bitset(universe: &Universe, idxs: &[u32]) -> Option<String> {
+    if idxs.is_empty() {
+        return None;
+    }
+    const PRES: [&str; 4] = ["M", "E", "P", "K"];
+    let mut bits: [Vec<i64>; 4] = Default::default();
+    for &i in idxs {
+        let mut placed = false;
+        for (li, pre) in PRES.iter().enumerate() {
+            if let Some(v) = lane_pos(universe, i, pre) {
+                bits[li].push(v);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            return None;
+        }
+    }
+    // Widths are only needed for groups present in the set (their atoms
+    // live in the universe, so the width lookup cannot fail there).
+    let mut widths = [0i64; 4];
+    for (li, pre) in PRES.iter().enumerate() {
+        if bits[li].is_empty() {
+            continue;
+        }
+        widths[li] = lane_width(universe, pre)?;
+    }
+    let val = |li: usize| -> Option<i64> {
+        if bits[li].is_empty() {
+            Some(0)
+        } else {
+            lane_value(widths[li], bits[li].iter().copied())
+        }
+    };
+    let (m, e) = (val(0)?, val(1)?);
+    if bits[2].is_empty() && bits[3].is_empty() {
+        match RealCenter::new(m as i128, e as i32) {
+            Some(v) => Some(format!("{} [m={m} e={e}]", v.centre_short())),
+            None => Some(format!("(ill-formed lanes m={m} e={e})")),
+        }
+    } else {
+        let (p, k) = (val(2)?, val(3)?);
+        if p < 0 {
+            return Some(format!("(ill-formed lanes m={m} e={e} p={p} k={k})"));
+        }
+        match Mepk::new(m as i128, e as i32, p as u32, k as i32) {
+            Some(v) => Some(format!(
+                "{} [m={m} e={e} p={p} k={k}]",
+                v.interval_string(0)
+            )),
+            None => Some(format!("(ill-formed lanes m={m} e={e} p={p} k={k})")),
+        }
+    }
+}
+
+/// Per-owner rows for a binary relation whose value columns decode as
+/// bit sets: `X$0.r = {M$0, ...} = 0.5 [m=.. e=..]`. Rows that do not
+/// decode keep the per-owner `{X$0->...}` shape. `None` when no row
+/// decodes at all (callers keep the legacy full-relation shape).
+/// `owners` overrides the row list (empty = first columns seen).
+pub fn bitset_field_rows_ts(
+    universe: &Universe,
+    _owner: &str,
+    field: &str,
+    ts: &TupleSet,
+    owners: Vec<u32>,
+) -> Option<String> {
+    if ts.arity() != 2 {
+        return None;
+    }
+    let size = universe.size() as i64;
+    let mut groups: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for flat in ts.index_view().iter() {
+        let d = digits(size, ts.arity(), flat);
+        if d.len() >= 2 {
+            groups.entry(d[0]).or_default().push(d[1]);
+        }
+    }
+    let owners = if owners.is_empty() {
+        groups.keys().copied().collect()
+    } else {
+        owners
+    };
+    let empty: Vec<u32> = Vec::new();
+    let mut any = false;
+    let mut rows: Vec<(u32, String, Option<String>)> = Vec::new();
+    for o in owners {
+        let cols = groups.get(&o).unwrap_or(&empty);
+        let raw = cols
+            .iter()
+            .map(|&c| atom_name(universe, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text = decode_bitset(universe, cols);
+        any |= text.is_some();
+        rows.push((o, raw, text));
+    }
+    if !any {
+        return None;
+    }
+    let mut out = String::new();
+    for (o, raw, text) in rows {
+        let oname = atom_name(universe, o);
+        match text {
+            Some(t) => out.push_str(&format!("\n {oname}.{field} = {{{raw}}} = {t}")),
+            None => out.push_str(&format!("\n {oname}.{field} = {{{raw}}}")),
+        }
+    }
+    Some(out)
+}
+
+/// Per-owner rows over the solved instance (owners from the `owner` sig
+/// relation when present).
+pub fn bitset_field_rows(
+    inst: &Instance,
+    owner: &str,
+    field: &str,
+    ts: &TupleSet,
+) -> Option<String> {
+    let mut owners: Vec<u32> = Vec::new();
+    for (r, ots) in inst.relation_tuples() {
+        if inst.pool().name(r).as_ref() == owner && ots.arity() == 1 {
+            for idx in ots.index_view().iter() {
+                owners.push(idx as u32);
+            }
+            break;
+        }
+    }
+    bitset_field_rows_ts(inst.universe(), owner, field, ts, owners)
+}
+
 /// Decode every `Real$i`/`EReal$i` atom to its lanes plus a one-line
 /// display: `EReal` members with full lanes show `c ± R`, pure-`Real`
 /// members show the exact centre `c`.
@@ -448,11 +592,24 @@ pub fn instance_alloy_hinted(inst: &Instance, hints: &DisplayHints) -> String {
                         continue;
                     }
                 }
+                // Flat bit-set rows decode alongside the raw tuples.
+                if let Some(s) = bitset_field_rows(inst, owner, field, ts) {
+                    out.push_str(&s);
+                    continue;
+                }
             }
         }
         let as_int = ts.arity() == 1 && hints.signed_sigs.contains(name_s);
         let expr = set_alloy_maybe_int(inst.universe(), ts.arity(), ts, as_int);
-        out.push_str(&format!("\n {name} = {expr}"));
+        // Flat bit sets gain their real-number reading alongside.
+        let mut line = format!("\n {name} = {expr}");
+        if ts.arity() == 1 && !as_int && !is_lane_domain(name_s) {
+            let idxs: Vec<u32> = ts.index_view().iter().map(|i| i as u32).collect();
+            if let Some(t) = decode_bitset(inst.universe(), &idxs) {
+                line.push_str(&format!(" = {t}"));
+            }
+        }
+        out.push_str(&line);
         // Decoded `Real$i`/`EReal$i` lines follow their own atom set.
         if name_s == "Real" || name_s == "EReal" {
             if let Some(ref ev) = ereal {
@@ -770,5 +927,82 @@ mod tests {
         inst.add(r, &ts).unwrap();
         let s = instance_alloy_hinted(&inst, &DisplayHints::default());
         assert!(s.contains("A.f = {A$0->B$0}"), "got: {s}");
+    }
+
+    fn solve_first(src: &str) -> alloy_front_rs::Instance {
+        let m = alloy_front_rs::parse_module(src).unwrap();
+        let cnf = alloy_front_rs::run(&m, 0).unwrap();
+        alloy_front_rs::solve(&cnf).unwrap().expect("SAT")
+    }
+
+    #[test]
+    fn flat_bitset_appends_real_reading() {
+        // Reported case: `X = {M$0, ...}` gains `= 0.5 [m=1 e=-1]`.
+        let inst = solve_first("sig X in Real {}\nfact { setReal[X, 0.5] }\nrun {}");
+        let s = instance_alloy_hinted(&inst, &DisplayHints::default());
+        assert!(s.contains("X = {"), "raw set missing: {s}");
+        assert!(
+            s.contains("= 0.5 [m=1 e=-1]"),
+            "real reading missing: {s}"
+        );
+        // Lane-domain lines themselves stay raw.
+        assert!(s.contains("$M = {"), "got: {s}");
+    }
+
+    #[test]
+    fn flat_bitset_normalizes_on_display() {
+        // Even mantissae display normalized (2 = 1*2^1), lanes echoed raw.
+        let inst = solve_first("sig X in Real {}\nfact { X = mbit[1] }\nrun {}");
+        let s = instance_alloy_hinted(&inst, &DisplayHints::default());
+        assert!(s.contains("X = {M$1} = 2 [m=2 e=0]"), "got: {s}");
+    }
+
+    #[test]
+    fn flat_bitset_field_rows_decode() {
+        // Holder fields decode per owner row.
+        let inst = solve_first(
+            "some sig H { r: Real }\nfact { setReal[H.r, 0.5] }\nrun {}",
+        );
+        let s = instance_alloy_hinted(&inst, &DisplayHints::default());
+        assert!(s.contains("H$0.r = {"), "raw row missing: {s}");
+        assert!(
+            s.contains("= 0.5 [m=1 e=-1]"),
+            "real reading missing: {s}"
+        );
+    }
+
+    #[test]
+    fn flat_bitset_mixed_sets_stay_raw() {
+        // Sets mixing lane and non-lane atoms gain no reading.
+        let inst = solve_first(
+            "sig A {}\nsig X in Real {}\nfact { setReal[X, 0.5] and some A }\nrun {}",
+        );
+        let u = inst.universe();
+        let mi = u.index("M$0").unwrap() as u32;
+        let ai = u.index("A$0").unwrap() as u32;
+        assert_eq!(decode_bitset(u, &[mi, ai]), None);
+        assert_eq!(decode_bitset(u, &[]), None);
+    }
+
+    #[test]
+    fn flat_bitset_ereal_interval() {
+        // Sets with p/k bits read as EReal intervals (direct decode).
+        let inst = solve_first(
+            "one sig R1 extends EReal {}\nfact { setEReal[R1, 0.5] }\nrun {} for 2 EReal",
+        );
+        let u = inst.universe();
+        let idx = |n: &str| u.index(n).unwrap() as u32;
+        // 0.5 is (m=8, e=-1, p=4, k=0): e=-1 needs E$0..E$3 at width 4.
+        let bits = vec![
+            idx("M$3"),
+            idx("E$0"),
+            idx("E$1"),
+            idx("E$2"),
+            idx("E$3"),
+            idx("P$2"),
+        ];
+        let t = decode_bitset(u, &bits).expect("decodes");
+        assert!(t.contains("[m=8 e=-1 p=4 k=0]"), "got: {t}");
+        assert!(t.contains("±"), "got: {t}");
     }
 }

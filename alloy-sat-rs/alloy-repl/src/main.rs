@@ -1481,11 +1481,34 @@ fn wrapping_optimum_note(bitwidth: u32, sol: &OptSolution) -> Option<String> {
                         "{}",
                         fmt::field_rows_alloy(&inst_owned, &owner, &field, &ts)
                     )
+                } else if arity == 2 && dotted.is_some() {
+                    // Flat bit-set rows decode alongside the raw tuples.
+                    let (owner, field) = dotted.unwrap();
+                    match fmt::bitset_field_rows_ts(
+                        ts.universe(),
+                        &owner,
+                        &field,
+                        &ts,
+                        Vec::new(),
+                    ) {
+                        Some(s) => println!("{s}"),
+                        None => println!(
+                            "{}",
+                            fmt::set_alloy_maybe_int(ts.universe(), arity, &ts, as_int)
+                        ),
+                    }
                 } else {
-                    println!(
-                        "{}",
-                        fmt::set_alloy_maybe_int(ts.universe(), arity, &ts, as_int)
-                    )
+                    let base = fmt::set_alloy_maybe_int(ts.universe(), arity, &ts, as_int);
+                    // Flat bit sets gain their real-number reading alongside.
+                    let mut line = base;
+                    if arity == 1 && !as_int {
+                        let idxs: Vec<u32> =
+                            ts.index_view().iter().map(|i| i as u32).collect();
+                        if let Some(t) = fmt::decode_bitset(ts.universe(), &idxs) {
+                            line.push_str(&format!(" = {t}"));
+                        }
+                    }
+                    println!("{line}");
                 }
             }
             Ok(QueryValue::Int(v)) => println!("{v}"),

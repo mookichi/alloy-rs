@@ -1,8 +1,11 @@
 //! EReal-aware solution display (`display::format_instance`,
 //! `display::format_query_value`): decoded per-atom lines replace raw lane
-//! tuples; ghost lanes on non-member atoms are hidden.
+//! tuples; ghost lanes on non-member atoms are hidden. Flat bit sets
+//! (`sig X in Real`) gain their real-number reading alongside.
 
-use alloy_front_rs::display::{decode_ereal, format_instance, format_query_value};
+use alloy_front_rs::display::{
+    decode_bitset, decode_ereal, format_instance, format_query_value,
+};
 use alloy_front_rs::snippet::{query_value, QueryValue};
 use alloy_front_rs::{parse_module, run, solve};
 
@@ -83,4 +86,30 @@ fn query_stable_across_rebuilt_cnfs() {
         let v = query_value(&m, scope, &cnf2, "#x", &inst).expect("query");
         assert_eq!(v, QueryValue::Int(1), "unstable #x");
     }
+}
+
+#[test]
+fn flat_bitset_appends_real_reading() {
+    // Reported case: `X->{...bits...}` gains `= 0.5 [m=1 e=-1]`.
+    let inst = solve_first("sig X in Real {}\nfact { setReal[X, 0.5] }\nrun {}");
+    let s = format_instance(&inst);
+    assert!(s.contains("X->"), "raw set line missing: {s}");
+    assert!(s.contains("= 0.5 [m=1 e=-1]"), "real reading missing: {s}");
+}
+
+#[test]
+fn flat_bitset_query_value_appends_reading() {
+    let src = "sig X in Real {}\nfact { setReal[X, 0.5] }\nrun {}";
+    let m = parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("run");
+    let inst = solve(&cnf).expect("solve").expect("SAT");
+    let scope = &m.commands[0].scope;
+    let v = query_value(&m, scope, &cnf, "X", &inst).expect("query");
+    let line = format_query_value(&inst, &v);
+    assert!(line.contains("= 0.5 [m=1 e=-1]"), "got: {line}");
+    // Direct decode: single bits decode, empty/mixed stay raw (None).
+    let u = inst.universe();
+    let mi = u.index("M$0").unwrap() as u32;
+    assert!(decode_bitset(u, &[mi]).is_some());
+    assert_eq!(decode_bitset(u, &[]), None);
 }
