@@ -970,11 +970,14 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             }
         }
     }
-    // FLAT-EXPERIMENT: `Real` is abstract over the `$M`/`$E` partition.
-    // There is no free `Real$i` pool; `for N Real` is ignored and the
-    // budget derives as M+E (`Real = $M + $E` as sets). `EReal` keeps
-    // its reified population as the control group.
-    let _real_scope = scope.entries.iter().find(|(n, _)| n == "Real");
+    // FLAT-EXPERIMENT: `for N Real` is rejected: the Real population
+    // derives as `$M + $E` (a stale count would silently change
+    // meaning). Scope the lanes instead (`for N $M, M $E`).
+    if scope.entries.iter().any(|(n, _)| n == "Real") {
+        return Err(
+            "for N Real is not scoped in flat mode; the Real population derives as $M + $E (use `for N $M, M $E`)".to_string(),
+        );
+    }
     let ereal_scope = scope.entries.iter().find(|(n, _)| n == "EReal");
     let num_of = |e: &ScopeEntry| match e {
         ScopeEntry::Num(n) | ScopeEntry::Exactly(n) => *n,
@@ -1011,6 +1014,18 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             return Err(
                 "sig Real/EReal/$M/$E/$P/$K is reserved by the builtin Real signature".to_string(),
             );
+        }
+    }
+    // FLAT-EXPERIMENT: user `extends Real` would add value atoms outside
+    // the `$M`/`$E` partition (junk-atom slack breaks bitmask
+    // bijectivity: non-lane atoms read 0). Use `in Real` instead.
+    // (`EReal` is the builtin exception and stays reified as control.)
+    for sd in &module.sigs {
+        if sd.rel == SigRel::Extends && sd.extends.as_deref() == Some("Real") {
+            let n = sd.names.first().map(String::as_str).unwrap_or("sig");
+            return Err(format!(
+                "sig {n} cannot extend Real in flat mode; use `sig {n} in Real` (values are bit sets)"
+            ));
         }
     }
 

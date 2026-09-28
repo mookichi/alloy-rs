@@ -737,7 +737,23 @@ mod tests {
         assert!(!s.contains("Real.e ="), "raw lanes leaked: {s}");
         assert!(!s.contains("EReal.p ="), "raw lanes leaked: {s}");
         assert!(!s.contains("EReal.k ="), "raw lanes leaked: {s}");
-        assert!(!s.contains("M$"), "raw lane atoms leaked: {s}");
+        // `$M`/`$E`/`$P`/`$K` are public builtin sigs: their atoms may
+        // only appear inside their own lines, never in lane tuples.
+        assert!(
+            s.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("$M")
+                        || t.starts_with("$E")
+                        || t.starts_with("$P")
+                        || t.starts_with("$K"))
+                })
+                .all(|l| !l.contains("M$")
+                    && !l.contains("E$")
+                    && !l.contains("P$")
+                    && !l.contains("K$")),
+            "raw lane atoms leaked outside $M/$E/$P/$K lines: {s}"
+        );
         assert!(s.contains("EReal$0 = 0.5"), "got: {s}");
         assert!(s.contains("X$0.r = 0.5"), "got: {s}");
     }

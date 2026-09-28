@@ -642,6 +642,7 @@ impl<'m> Lowerer<'m> {
             open_params,
             expr_binds: std::cell::RefCell::new(HashMap::new()),
             let_binds: std::cell::RefCell::new(Vec::new()),
+            var_roots: std::cell::RefCell::new(HashMap::new()),
             // Query-only: atom references resolve against the solved Cnf's
             // universe (Java's solve-after `frame.a2k` equivalent).
             allow_atoms: true,
@@ -951,6 +952,7 @@ impl<'m> Lowerer<'m> {
             open_params,
             expr_binds: std::cell::RefCell::new(HashMap::new()),
             let_binds: std::cell::RefCell::new(Vec::new()),
+            var_roots: std::cell::RefCell::new(HashMap::new()),
             // Model builds never resolve atom names (Java parity: atoms
             // are solver outputs, not language terms).
             allow_atoms: false,
@@ -1188,6 +1190,10 @@ struct Ctx<'a> {
     field_int: HashMap<String, SetKind>,
     /// let-binding scope: name -> `BindEntry`.
     let_binds: std::cell::RefCell<Vec<HashMap<String, BindEntry>>>,
+    /// FLAT-EXPERIMENT: quantifier/comprehension variable -> declared
+    /// root sig (`Real`/`EReal`/other). Lets `x.m` reads pick the bit
+    /// partition (Real-rooted) or the legacy join (EReal-rooted).
+    var_roots: std::cell::RefCell<HashMap<String, String>>,
     /// Whether universe atom names (`A$0`) resolve as singleton sets.
     /// True only for the `:query` path (solve-after evaluation, mirroring
     /// Java's `frame.a2k`); model text (run/check/eval builds) rejects
@@ -2212,6 +2218,10 @@ impl<'a> Ctx<'a> {
                     .to_string(),
             ));
         }
+        // FLAT-EXPERIMENT: Real-rooted `x.m` reads the partition.
+        if let Some(r) = self.lane_partition_redirect(e) {
+            return Ok(IntExpr::BitsVal(Box::new(r), 0));
+        }
         if self.lane_group_of(e).is_some() {
             return Ok(IntExpr::BitsVal(Box::new(e.clone()), 0));
         }
@@ -2916,7 +2926,40 @@ impl<'a> Ctx<'a> {
         self.lane_label_ambiguous(e)
     }
 
-    /// Lane equality rewritten as integer comparisons: `x.m = 3` means
+    /// FLAT-EXPERIMENT: `x.m` / `x.e` lane reads route to the bit
+/// partition (`x & $M` / `x & $E`) when the base is Real-rooted
+/// (sig-typed or variable-typed, never `EReal`-rooted). Returns the
+/// replacement `Expr`, or `None` for the legacy join reading
+/// (`EReal` control group, `p`/`k` lanes, unresolvable shapes).
+fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
+    let group = self.lane_group_of(e)?;
+    let part = match group {
+        g if g == crate::bounds::LANE_M => "$M",
+        g if g == crate::bounds::LANE_E => "$E",
+        _ => return None,
+    };
+    let Expr::Bin(BinOp::Join, base, _) = e else {
+        return None;
+    };
+    // Root of the base: bound variables consult `var_roots`
+    // (EReal-typed vars keep the legacy join); otherwise the sig
+    // hierarchy decides (`R.m` for `R in Real` redirects).
+    let root: Option<String> = match base.as_ref() {
+        Expr::Name(n, _) => self
+            .var_roots
+            .borrow()
+            .get(n)
+            .cloned()
+            .or_else(|| self.sig_root(n)),
+        _ => None,
+    };
+    match root.as_deref() {
+        Some("Real") => Some(flat_partition_read(base, part)),
+        _ => None,
+    }
+}
+
+/// Lane equality rewritten as integer comparisons: `x.m = 3` means
     /// the lane's bitmask value is 3, and `x.m = y.m` compares values
     /// (relational set equality could never hold across disjoint lane
     /// namespaces). Returns None for non-lane shapes (legacy reading).
@@ -2942,6 +2985,10 @@ impl<'a> Ctx<'a> {
             }
         }
         let lane_int = |e: &Expr| -> Option<IntExpr> {
+            // FLAT-EXPERIMENT: Real-rooted `x.m` reads the partition.
+            if let Some(r) = self.lane_partition_redirect(e) {
+                return Some(IntExpr::BitsVal(Box::new(r), 0));
+            }
             self.lane_group_of(e)?;
             Some(IntExpr::BitsVal(Box::new(e.clone()), 0))
         };
@@ -3248,6 +3295,18 @@ impl<'a> Ctx<'a> {
             return arena
                 .cast_to_int(CastToIntOp::BitsIn(group), ee)
                 .map_err(|e| FrontError::Resolve(e.to_string()));
+        }
+        // FLAT-EXPERIMENT: Real-rooted `x.m` joins (which the parser
+        // routes here directly via `set_eq_int`, bypassing the `Cmp`
+        // rewrites) read the partition instead of the legacy join.
+        // `EReal`-rooted bases keep the legacy reading (control).
+        if let Some(r) = self.lane_partition_redirect(e) {
+            if let Some(group) = flat_lane_group(&r) {
+                let (ee, _) = self.lower_expr(arena, &r, env)?;
+                return arena
+                    .cast_to_int(CastToIntOp::BitsIn(group), ee)
+                    .map_err(|e| FrontError::Resolve(e.to_string()));
+            }
         }
         if !self.set_int_flavored(e, env).is_int() {
             return Err(FrontError::Resolve(INT_MISMATCH_MSG.to_string()));
@@ -3890,9 +3949,20 @@ impl<'a> Ctx<'a> {
         }
         let mut list = Vec::new();
         let mut pushed = 0usize;
+        // FLAT-EXPERIMENT: remember each variable's declared root sig
+        // for lane-read routing (`x.m` -> partition iff Real-rooted).
+        // Removed on exit: all inserts below happen inside this call
+        // (callers pop `env` symmetrically; shadowing restores via
+        // re-insertion on the outer scope's own lowering).
+        let mut added_roots: Vec<String> = Vec::new();
         for d in decls {
             let domain_int = self.set_int_flavored(&d.expr, env);
             let (dom, _da) = self.lower_expr(arena, &d.expr, env)?;
+            // Only plain sig names resolve (joins/arrows keep legacy routing).
+            let decl_root = match &d.expr {
+                Expr::Name(n, _) => self.sig_root(n),
+                _ => None,
+            };
             for n in &d.names {
                 let v = arena.variable(n);
                 let da = arena.decl(v, Multiplicity::One, dom).map_err(|e| {
@@ -3903,10 +3973,18 @@ impl<'a> Ctx<'a> {
                 })?;
                 list.push(da);
                 env.push((n.clone(), v, arena.variable_arity(v), domain_int));
+                if let Some(ref r) = decl_root {
+                    self.var_roots.borrow_mut().insert(n.clone(), r.clone());
+                    added_roots.push(n.clone());
+                }
                 pushed += 1;
             }
         }
-        Ok((arena.add_decls(list), pushed))
+        let out = arena.add_decls(list);
+        for n in added_roots {
+            self.var_roots.borrow_mut().remove(&n);
+        }
+        Ok((out, pushed))
     }
 
     fn lower_int(&self, arena: &mut kk::AstArena, ie: &IntExpr, env: &mut Env) -> LResult<IntId> {
