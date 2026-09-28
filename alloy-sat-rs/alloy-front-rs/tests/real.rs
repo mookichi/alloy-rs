@@ -254,4 +254,19 @@ fn query_real_up_down_uses_oracle() {
         QueryValue::Int(..) => panic!("expected computed Real"),
         QueryValue::Bool(..) => panic!("expected computed Real"),
     }
+    // Predicate-shaped comprehension over the full `Real` type answers
+    // through the same oracle (both orientations).
+    for (src, expect) in [
+        ("{x: Real | x.realSucc[X]}", expect_up),
+        ("{x: Real | x.realPred[X]}", expect_down),
+        ("{x: Real | X.realSucc[x]}", expect_down),
+        ("{x: Real | X.realPred[x]}", expect_up),
+    ] {
+        match query_value(&m, scope, &cnf, src, &inst).expect("query succ comprehension") {
+            QueryValue::Real(v) => assert_eq!(v, expect, "{src}"),
+            QueryValue::Set(..) => panic!("expected computed Real for {src}"),
+            QueryValue::Int(..) => panic!("expected computed Real for {src}"),
+            QueryValue::Bool(..) => panic!("expected computed Real for {src}"),
+        }
+    }
 }

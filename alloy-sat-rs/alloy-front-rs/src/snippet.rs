@@ -158,7 +158,8 @@ pub enum QueryValue {
     Set(u32, TupleSet),
     Int(i64),
     Bool(bool),
-    /// Computed `Real` centre from a `realUp`/`realDown` query. Unlike
+    /// Computed `Real` centre from a `realUp`/`realDown` query or a
+    /// `{ v: Real | v.realSucc[e] }`-shaped comprehension. Unlike
     /// `Set` this is not an instance atom: the lane successor of a value
     /// generally lies outside the solved atom population (e.g. with
     /// `one sig X extends Real`, `Real = {X$0}`), so evaluating the
@@ -210,8 +211,11 @@ pub fn query_value(
             // answer via the lane oracle (see `QueryValue::Real`).
             if let Expr::Call(name, args, _) = &e {
                 if (name == "realUp" || name == "realDown") && args.len() == 1 {
-                    return query_real_fun(module, scope, name == "realUp", &args[0], instance);
+                    return query_real_fun(module, scope, &e, name == "realUp", &args[0], instance);
                 }
+            }
+            if let Some(qv) = query_succ_set(module, scope, &e, instance)? {
+                return Ok(qv);
             }
             let (arity, ts) = query_set_parsed(module, scope, &e, instance)?;
             Ok(QueryValue::Set(arity, ts))
@@ -246,73 +250,72 @@ fn query_set_parsed(
     Ok((arity, ts))
 }
 
-/// Evaluate a `realUp[x]` / `realDown[x]` query via the lane oracle.
-///
-/// The solve-path desugaring (`{ $r: Real | realSucc[$r, x] }`) only
-/// ranges over the solved atom population, so a `:query` of it yields
-/// `{}` whenever the successor is not itself an atom of the instance
-/// (the common case, e.g. `one sig X extends Real`). The argument is
-/// resolved to its exact centre instead — a singleton `Real` atom read
-/// through its `(m, e)` lanes, or a decimal literal folded like
-/// `lower.rs::real_op` — and stepped with `next_up`/`next_down`.
-fn query_real_fun(
-    module: &Module,
-    scope: &Scope,
-    up: bool,
-    arg: &Expr,
-    instance: &Instance,
-) -> Result<QueryValue, FrontError> {
-    let name = if up { "realUp" } else { "realDown" };
+/// Lane widths for oracle queries (`realUp`/`realDown`, successor
+/// comprehensions) from the query command's scope.
+fn real_lane_widths(module: &Module, scope: &Scope) -> Result<(u32, u32), FrontError> {
     let w = crate::bounds::resolve(module, scope)
         .map_err(FrontError::Resolve)?
         .mepk_widths;
-    let (mw, ew) = (w.m_width, w.e_width);
-    let centre = match arg {
-        Expr::RealLit(s, _) => decimal_to_real(s, Some(mw)).ok_or_else(|| {
-            FrontError::Resolve(format!(
-                "cannot convert {s:?} to Real exactly (non-dyadic, malformed, or outside the m lane)"
-            ))
-        })?,
+    Ok((w.m_width, w.e_width))
+}
+
+/// Resolve a Real-valued query argument to its exact centre.
+///
+/// Decimal literals fold like the solve path (`RealLit` exact dyadic
+/// only; `(d)` nearest). Anything else must evaluate to a singleton
+/// atom set whose `(m, e)` lanes are read from the instance.
+/// Returns `None` when no centre applies (non-dyadic plain literal,
+/// empty/multi-element set, undecodable lanes): the caller falls back
+/// to instance enumeration, which stays sound there.
+fn real_arg_centre(
+    module: &Module,
+    scope: &Scope,
+    mw: u32,
+    arg: &Expr,
+    instance: &Instance,
+) -> Option<RealCenter> {
+    match arg {
+        Expr::RealLit(s, _) => {
+            if let Some(v) = decimal_to_real(s, Some(mw)) {
+                return Some(v);
+            }
+            // Approximable-but-plain literal: predicate position treats
+            // it as UNSAT (enumeration), so fall through rather than
+            // erroring here.
+            None
+        }
         Expr::ApproxRealLit(s, _) => {
-            decimal_to_real_rounded(s, Some(mw), RealRound::Nearest).ok_or_else(|| {
-                FrontError::Resolve(format!(
-                    "cannot convert ({s:?}) to Real (malformed or outside the m lane)"
-                ))
-            })?
+            decimal_to_real_rounded(s, Some(mw), RealRound::Nearest)
         }
         _ => {
-            // Atom argument: evaluate to a singleton `Real` set, then
-            // read its `(m, e)` lanes from the instance.
-            let (arity, ts) = query_set_parsed(module, scope, arg, instance)?;
+            let (arity, ts) = query_set_parsed(module, scope, arg, instance).ok()?;
             if arity != 1 {
-                return Err(FrontError::Resolve(format!(
-                    "`{name}` expects a singleton Real argument"
-                )));
+                return None;
             }
             let idxs: Vec<_> = ts.index_view().iter().collect();
             if idxs.len() != 1 {
-                return Err(FrontError::Resolve(format!(
-                    "`{name}` expects a singleton Real argument"
-                )));
+                return None;
             }
-            let decoded = crate::display::decode_ereal(instance).ok_or_else(|| {
-                FrontError::Resolve("cannot decode Real lanes from the instance".to_string())
-            })?;
-            let d = decoded.get(&(idxs[0] as u32)).ok_or_else(|| {
-                FrontError::Resolve("argument is not a Real atom of the instance".to_string())
-            })?;
-            RealCenter::new(d.lanes.0 as i128, d.lanes.1 as i32).ok_or_else(|| {
-                FrontError::Resolve(format!(
-                    "ill-formed Real lanes m={} e={}",
-                    d.lanes.0, d.lanes.1
-                ))
-            })?
+            let decoded = crate::display::decode_ereal(instance)?;
+            let d = decoded.get(&(idxs[0] as u32))?;
+            RealCenter::new(d.lanes.0 as i128, d.lanes.1 as i32)
         }
-    };
+    }
+}
+
+/// Step a centre through the lane oracle, reporting a range exit loudly
+/// (mirrors the solve path, where a missing successor is UNSAT).
+fn real_oracle_step(
+    name: &str,
+    up: bool,
+    centre: &RealCenter,
+    mw: u32,
+    ew: u32,
+) -> Result<QueryValue, FrontError> {
     let next = if up {
-        next_up(&centre, mw, ew)
+        next_up(centre, mw, ew)
     } else {
-        next_down(&centre, mw, ew)
+        next_down(centre, mw, ew)
     };
     match next {
         Some(v) => Ok(QueryValue::Real(v)),
@@ -323,6 +326,105 @@ fn query_real_fun(
             centre.e,
         ))),
     }
+}
+
+/// Evaluate a `realUp[x]` / `realDown[x]` query via the lane oracle.
+///
+/// The solve-path desugaring (`{ $r: Real | realSucc[$r, x] }`) only
+/// ranges over the solved atom population, so a `:query` of it yields
+/// `{}` whenever the successor is not itself an atom of the instance
+/// (the common case, e.g. `one sig X extends Real`). The argument is
+/// resolved to its exact centre instead and stepped with
+/// `next_up`/`next_down`. Non-centre arguments fall back to instance
+/// enumeration.
+fn query_real_fun(
+    module: &Module,
+    scope: &Scope,
+    orig: &Expr,
+    up: bool,
+    arg: &Expr,
+    instance: &Instance,
+) -> Result<QueryValue, FrontError> {
+    let name = if up { "realUp" } else { "realDown" };
+    let (mw, ew) = real_lane_widths(module, scope)?;
+    match real_arg_centre(module, scope, mw, arg, instance) {
+        Some(centre) => real_oracle_step(name, up, &centre, mw, ew),
+        None => {
+            let (arity, ts) = query_set_parsed(module, scope, orig, instance)?;
+            Ok(QueryValue::Set(arity, ts))
+        }
+    }
+}
+
+/// Evaluate a `{ v: Real | v.realSucc[e] }` / `{ v: Real | v.realPred[e] }`
+/// query (either orientation) via the lane oracle.
+///
+/// Same atom-population limitation as [`query_real_fun`]: the successor
+/// is computed from `e`'s centre instead of enumerated. Only the exact
+/// shape qualifies — a single `Real`-typed binding whose body is one
+/// `realSucc`/`realPred` call with the bound variable bare on one side
+/// and a variable-free closed argument (literal or plain name) on the
+/// other. Anything else (domain-restricted bindings, compound bodies,
+/// nested bound variables) falls through to instance enumeration, which
+/// stays sound there.
+fn query_succ_set(
+    module: &Module,
+    scope: &Scope,
+    e: &Expr,
+    instance: &Instance,
+) -> Result<Option<QueryValue>, FrontError> {
+    let (decls, body) = match e {
+        Expr::Comprehension(decls, body) => (decls, body),
+        _ => return Ok(None),
+    };
+    if decls.len() != 1 || decls[0].names.len() != 1 {
+        return Ok(None);
+    }
+    if !matches!(&decls[0].expr, Expr::Name(n, _) if n == "Real") {
+        return Ok(None);
+    }
+    let var = &decls[0].names[0];
+    let (name, args) = match body.as_ref() {
+        Formula::Call(n, a, _) => (n.as_str(), a),
+        _ => return Ok(None),
+    };
+    if args.len() != 2 {
+        return Ok(None);
+    }
+    // `realSucc[B, A]`: B = succ(A); `realPred[B, A]`: B = pred(A).
+    let succ = match name {
+        "realSucc" => true,
+        "realPred" => false,
+        _ => return Ok(None),
+    };
+    let var_side = if matches!(&args[0], Expr::Name(n, _) if n == var) {
+        0
+    } else if matches!(&args[1], Expr::Name(n, _) if n == var) {
+        1
+    } else {
+        return Ok(None);
+    };
+    // The other side must be closed over a literal or a plain,
+    // non-shadowed name (no nesting of the bound variable, no computed
+    // shapes that could rebind it).
+    let other = &args[1 - var_side];
+    let closed = match other {
+        Expr::RealLit(..) | Expr::ApproxRealLit(..) => true,
+        Expr::Name(n, _) => n != var,
+        _ => false,
+    };
+    if !closed {
+        return Ok(None);
+    }
+    let (mw, ew) = real_lane_widths(module, scope)?;
+    let centre = match real_arg_centre(module, scope, mw, other, instance) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    // Forward (solving for the result side) steps with the predicate's
+    // own direction; backward (solving for the input side) inverts it.
+    let fwd = succ == (var_side == 0);
+    Ok(Some(real_oracle_step(name, fwd, &centre, mw, ew)?))
 }
 
 /// Evaluate a bare formula against a solved instance (REPL `:query` of
