@@ -81,10 +81,11 @@ fn lane_value(width: i64, bits: impl Iterator<Item = i64>) -> Option<i64> {
     Some(total)
 }
 
-/// True for the builtin bit-domain sigs (`$M`/`$E`/`$P`/`$K`):
-/// domains, never decoded as values themselves.
+/// True for the builtin bit-domain sigs (`$M`/`$E`/`$P`/`$K`) and the
+/// `Real`/`EReal` type domains themselves: shown raw, never decoded as
+/// values (an exact `Real` line otherwise gains a junk bitmask value).
 fn is_lane_domain(name: &str) -> bool {
-    matches!(name, "$M" | "$E" | "$P" | "$K")
+    matches!(name, "$M" | "$E" | "$P" | "$K" | "Real" | "EReal")
 }
 
 /// Real-number reading of a bit set (`{M$0, E$0, ...}` as `0.5 [m=..]`).

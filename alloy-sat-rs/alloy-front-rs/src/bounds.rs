@@ -1567,12 +1567,13 @@ pub fn bind_sigs(
 ) -> Result<(), String> {
     use std::collections::HashMap as HM;
     let mut exact: HM<String, bool> = HM::new();
-    // Sigs sharing the Real/EReal population keep flexible bounds even under
+    // Sigs sharing the EReal population keep flexible bounds even under
     // `one`/`exactly` (exact bounds would pin every shared atom);
     // their multiplicities become cardinality formulas in lower.rs.
+    // FLAT-EXPERIMENT: `Real` is a type domain like `Int`/`Step`
+    // (exactly `$M + $E`), no longer a shared flexible population.
     let mut shared = ereal_shared_sigs(module);
     shared.extend(real_shared_sigs(module));
-    shared.insert("Real".to_string());
     shared.insert("EReal".to_string());
     for sd in &module.sigs {
         for n in &sd.names {
@@ -1602,8 +1603,10 @@ pub fn bind_sigs(
             || (cmd_scope.overall_exact && !cmd_scope.entries.iter().any(|(n, _)| n == name))
             || name == "Step"
             // Flat lane sigs are type domains like `Int`: always exactly
-            // the full bit-position set (never a free subset).
-            || is_lane_sig(name))
+            // the full bit-position set (never a free subset). `Real`
+            // itself is exact (`$M + $E`, plus `EReal` atoms when present).
+            || is_lane_sig(name)
+            || name == "Real")
             && !shared.contains(name);
         // `some sig` requires a non-empty lower bound (shared EReal
         // populations excepted: first-atom pinning would over-constrain,

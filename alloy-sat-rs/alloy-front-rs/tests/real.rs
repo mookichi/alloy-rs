@@ -153,6 +153,20 @@ fn flat_partition_bans_and_shape() {
     // `Real = $M + $E` as sets; the halves are disjoint and cover.
     sat("pred p { Real = $M + $E }\nrun p");
     sat("pred p { no ($M & $E) and some Real }\nrun p");
+    // `Real` is exact: its population is the full lane set, so its
+    // cardinality is M+E with no scope of its own.
+    sat("pred p { #Real = 13 }\nrun p for 8 $M, 5 $E");
+    // No unconstrained-lane warnings in flat-only models (the legacy
+    // `Real.m`/`Real.e` uppers cover the `EReal` population only).
+    {
+        let m = parse_module("sig X in Real {}\nfact { setReal[X, 0.5] }\nrun {}").expect("parse");
+        let cnf = run(&m, 0).expect("run");
+        assert!(
+            cnf.warnings.iter().all(|w| !w.contains("Real.m") && !w.contains("Real.e")),
+            "lane warnings leaked: {:?}",
+            cnf.warnings
+        );
+    }
     // User `extends Real` would add atoms outside the partition.
     build_err("sig X extends Real {}\nrun {}", "cannot extend Real");
     // `for N Real` is rejected: the population derives as `$M + $E`.

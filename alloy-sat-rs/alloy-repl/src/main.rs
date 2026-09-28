@@ -1499,9 +1499,15 @@ fn wrapping_optimum_note(bitwidth: u32, sol: &OptSolution) -> Option<String> {
                     }
                 } else {
                     let base = fmt::set_alloy_maybe_int(ts.universe(), arity, &ts, as_int);
-                    // Flat bit sets gain their real-number reading alongside.
+                    // Flat bit sets gain their real-number reading alongside,
+                    // except the type domains themselves (shown raw).
+                    let bare_domain = !expr_t.contains('.')
+                        && matches!(
+                            expr_t,
+                            "$M" | "$E" | "$P" | "$K" | "Real" | "EReal"
+                        );
                     let mut line = base;
-                    if arity == 1 && !as_int {
+                    if arity == 1 && !as_int && !bare_domain {
                         let idxs: Vec<u32> =
                             ts.index_view().iter().map(|i| i as u32).collect();
                         if let Some(t) = fmt::decode_bitset(ts.universe(), &idxs) {

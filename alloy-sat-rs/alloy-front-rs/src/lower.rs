@@ -722,10 +722,11 @@ impl<'m> Lowerer<'m> {
         }
         // ------------------------------------------------------------------
         // Builtin lane relations (binary over the dedicated lane atoms).
-        // `Real.m`/`Real.e` range over the full `Real` closure (including
-        // `EReal` atoms, which read their centre through them);
-        // `EReal.p`/`EReal.k` range over the `EReal` population only.
-        // Allocated lazily with the lane atoms.
+        // FLAT-EXPERIMENT: `Real.m`/`Real.e` range over the `EReal`
+        // population only (its sole remaining reader: `EReal` centres;
+        // `Real` values read through the `x & $M`/`x & $E` partition, so
+        // the old full-closure upper only produced unconstrained-tuple
+        // warnings); `EReal.p`/`EReal.k` likewise. Allocated lazily.
         for (owner, fname, group) in crate::bounds::REAL_LANES
             .iter()
             .map(|(f, g)| ("Real", *f, *g))
@@ -742,11 +743,7 @@ impl<'m> Lowerer<'m> {
             let mut ts =
                 alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?;
-            let owners: Vec<String> = if owner == "Real" {
-                res.atoms_of("Real")
-            } else {
-                res.ereal_atoms.clone()
-            };
+            let owners: Vec<String> = res.ereal_atoms.clone();
             for o in &owners {
                 for t in &lane {
                     let tup = bounds::tuple_of(&res, &[o.clone(), t.clone()])

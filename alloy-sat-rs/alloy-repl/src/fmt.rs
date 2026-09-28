@@ -233,10 +233,11 @@ fn lane_value(width: i64, bits: impl Iterator<Item = i64>) -> Option<i64> {
     Some(total)
 }
 
-/// True for the builtin bit-domain sigs (`$M`/`$E`/`$P`/`$K`):
-/// domains, never decoded as values themselves.
+/// True for the builtin bit-domain sigs (`$M`/`$E`/`$P`/`$K`) and the
+/// `Real`/`EReal` type domains themselves: shown raw, never decoded as
+/// values (an exact `Real` line otherwise gains a junk bitmask value).
 fn is_lane_domain(name: &str) -> bool {
-    matches!(name, "$M" | "$E" | "$P" | "$K")
+    matches!(name, "$M" | "$E" | "$P" | "$K" | "Real" | "EReal")
 }
 
 /// Real-number reading of a bit set (`{M$0, E$0, ...}` as `0.5 [m=..]`).
@@ -894,8 +895,9 @@ mod tests {
         assert!(!s.contains("Real.e ="), "raw lanes leaked: {s}");
         assert!(!s.contains("EReal.p ="), "raw lanes leaked: {s}");
         assert!(!s.contains("EReal.k ="), "raw lanes leaked: {s}");
-        // `$M`/`$E`/`$P`/`$K` are public builtin sigs: their atoms may
-        // only appear inside their own lines, never in lane tuples.
+        // `$M`/`$E`/`$P`/`$K` are public builtin sigs, as are the
+        // exact `Real`/`EReal` domains: their atoms may only appear
+        // inside their own lines, never in lane tuples.
         assert!(
             s.lines()
                 .filter(|l| {
@@ -903,7 +905,9 @@ mod tests {
                     !(t.starts_with("$M")
                         || t.starts_with("$E")
                         || t.starts_with("$P")
-                        || t.starts_with("$K"))
+                        || t.starts_with("$K")
+                        || t.starts_with("Real =")
+                        || t.starts_with("EReal ="))
                 })
                 .all(|l| !l.contains("M$")
                     && !l.contains("E$")
