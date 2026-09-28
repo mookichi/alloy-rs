@@ -532,6 +532,17 @@ fn five_var_chain_no_arity_collapse() {
 }
 
 #[test]
+fn bit_singletons_spell_ereal_lanes() {
+    // p = 5 needs {P$0, P$2}, agreeing with the integer reading.
+    sat("pred p { some x: EReal | x.p = pbit[0] + pbit[2] and x.p = 5 }\nrun p for 2 EReal");
+    unsat("pred p { some x: EReal | x.p = pbit[0] + pbit[2] and x.p = 6 }\nrun p for 2 EReal");
+    build_err(
+        "pred p { some x: EReal | x.k = kbit[99] }\nrun p for 2 EReal",
+        "outside the lane range",
+    );
+}
+
+#[test]
 fn compose_ereal_binds_lanes() {
     // EReal stores the MSB exponent (`lsb = e-p+1`): 0.5 is (8,-1,4,0).
     sat("pred p { some x: EReal | x.composeEReal[8, -1, 4, 0] }\nrun p for 2 EReal");

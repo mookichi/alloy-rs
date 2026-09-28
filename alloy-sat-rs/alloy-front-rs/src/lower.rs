@@ -3736,6 +3736,41 @@ impl<'a> Ctx<'a> {
                     self.rup_memo.borrow_mut().insert(key, out);
                     return Ok(out);
                 }
+                // Bit-position singletons (`mbit[0]` = `{M$0}`): the flat
+                // spelling for individual lane bits, so lane sets can be
+                // written directly (`x.m = mbit[0] + mbit[1]`).
+                if matches!(name.as_str(), "mbit" | "ebit" | "pbit" | "kbit") {
+                    if args.len() != 1 {
+                        return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
+                    }
+                    let prefix = name.chars().next().unwrap().to_ascii_uppercase();
+                    let width = match name.as_str() {
+                        "mbit" => self.res.mepk_widths.m_width,
+                        "ebit" => self.res.mepk_widths.e_width,
+                        "pbit" => self.res.mepk_widths.p_width,
+                        _ => self.res.mepk_widths.k_width,
+                    };
+                    let idx_lit = match &args[0] {
+                        Expr::Name(n, _) => n.parse::<i64>().ok(),
+                        Expr::Bits(v, _) => Some(*v),
+                        _ => None,
+                    };
+                    let i = idx_lit.ok_or_else(|| {
+                        FrontError::Resolve(format!("'{name}' expects an integer literal"))
+                    })?;
+                    if i < 0 || i >= width as i64 {
+                        return Err(FrontError::Resolve(format!(
+                            "'{name}[{i}]' outside the lane range [0, {width})"
+                        )));
+                    }
+                    let atom = format!("{prefix}${i}");
+                    let idx = self
+                        .res
+                        .universe
+                        .index(&atom)
+                        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                    return Ok((arena.expr_atoms(vec![idx]), 1));
+                }
                 // Check ordering builtins first
                 if let Some(result) = self.try_ordering_expr(arena, name, args, env)? {
                     return Ok(result);

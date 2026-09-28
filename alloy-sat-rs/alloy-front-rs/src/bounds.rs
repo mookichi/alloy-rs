@@ -62,6 +62,8 @@ pub const REAL_OPS: &[&str] = &[
     "realUp",
     "realDown",
     "composeReal",
+    "mbit",
+    "ebit",
 ];
 
 /// Builtin `EReal` operation/predicate names that imply EReal allocation
@@ -89,6 +91,8 @@ pub const EREAL_OPS: &[&str] = &[
     "erealGTE",
     "setEReal",
     "composeEReal",
+    "pbit",
+    "kbit",
 ];
 
 #[derive(Debug)]
@@ -1581,7 +1585,10 @@ pub fn bind_sigs(
         let lo = TupleSet::new(&res.universe, 1).map_err(|e| e.to_string())?;
         let is_exact = (*exact.get(name).unwrap_or(&false)
             || (cmd_scope.overall_exact && !cmd_scope.entries.iter().any(|(n, _)| n == name))
-            || name == "Step")
+            || name == "Step"
+            // Flat lane sigs are type domains like `Int`: always exactly
+            // the full bit-position set (never a free subset).
+            || is_lane_sig(name))
             && !shared.contains(name);
         // `some sig` requires a non-empty lower bound (shared EReal
         // populations excepted: first-atom pinning would over-constrain,

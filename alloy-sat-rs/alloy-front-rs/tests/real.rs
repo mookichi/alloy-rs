@@ -251,6 +251,23 @@ fn compose_real_binds_lanes() {
 }
 
 #[test]
+fn bit_singletons_spell_lane_sets() {
+    // Flat bit spelling: {M$0, M$1} reads as m = 3.
+    sat("pred p { some x: Real | x.m = mbit[0] + mbit[1] }\nrun p for 2 Real");
+    sat("pred p { some x: Real | x.m = mbit[0] + mbit[1] and x.m = 3 }\nrun p for 2 Real");
+    unsat("pred p { some x: Real | x.m = mbit[0] + mbit[1] and x.m = 4 }\nrun p for 2 Real");
+    sat("pred p { some x: Real | x.e = ebit[0] }\nrun p for 2 Real");
+    // Out-of-range positions fail loudly (M=5 at default widths).
+    build_err(
+        "pred p { some x: Real | x.m = mbit[7] }\nrun p for 2 Real",
+        "outside the lane range",
+    );
+    // `$M` is a builtin domain: always exactly the full bit set.
+    sat("pred p { #$M = 5 }\nrun p for 5 $M");
+    sat("pred p { some $M }\nrun p for 5 $M");
+}
+
+#[test]
 fn query_real_up_down_uses_oracle() {
     // Reported REPL case: with `one sig X extends Real`, `Real = {X$0}`,
     // so the desugared `{ $r: Real | realSucc[$r, X] }` enumerates to
