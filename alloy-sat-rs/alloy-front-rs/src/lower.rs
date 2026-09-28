@@ -1618,7 +1618,7 @@ impl<'a> Ctx<'a> {
                 pos: 0,
                 is_var: false,
             });
-            conj.push(Formula::Call(pred, vec![arg, Expr::Name(v, 0)], 0));
+            conj.push(Formula::Call(pred, vec![Expr::Name(v, 0), arg], 0));
         }
         conj.push(Formula::Call(name.to_string(), hoisted, 0));
         let wrapped = Formula::Quant(
@@ -1652,10 +1652,12 @@ impl<'a> Ctx<'a> {
                 }
                 let wv = self.ereal_shift_width()?;
                 let sign = if name == "realAdd" { 1 } else { -1 };
+                // Arg order is `[R, A, B]` (`R = A +/- B`), so that
+                // `R.realAdd[A, B]` reads naturally.
                 let (a, b, r) = match (
-                    self.real_op_or_unsat(&args[0])?,
                     self.real_op_or_unsat(&args[1])?,
                     self.real_op_or_unsat(&args[2])?,
+                    self.real_op_or_unsat(&args[0])?,
                 ) {
                     (Some(a), Some(b), Some(r)) => (a, b, r),
                     // Plain non-dyadic operand: no dyadic centre can
@@ -1669,10 +1671,12 @@ impl<'a> Ctx<'a> {
                     return Err(FrontError::Resolve(format!("'{name}' expects 3 args")));
                 }
                 let wv = self.ereal_shift_width_mul()?;
+                // Arg order is `[R, A, B]` (`R = A * B`, `R = A / B`), so
+                // that `X.realDiv[N, D]` reads as `X = N / D`.
                 let (a, b, r) = match (
-                    self.real_op_or_unsat(&args[0])?,
                     self.real_op_or_unsat(&args[1])?,
                     self.real_op_or_unsat(&args[2])?,
+                    self.real_op_or_unsat(&args[0])?,
                 ) {
                     (Some(a), Some(b), Some(r)) => (a, b, r),
                     _ => return Ok(Some(self.lower_formula(arena, &Formula::Const(false), env)?)),
@@ -1855,7 +1859,9 @@ impl<'a> Ctx<'a> {
                 let r = (mag_max.max(1).ilog2() + 2) as i64;
                 let emin = -(1i64 << (w.e_width - 1));
                 let emax = (1i64 << (w.e_width - 1)) - 1;
-                let (a, b) = (self.real_op(&args[0])?, self.real_op(&args[1])?);
+                // Arg order is `[B, A]` (`B = succ/pred(A)`), so that
+                // `b.realSucc[a]` reads naturally.
+                let (a, b) = (self.real_op(&args[1])?, self.real_op(&args[0])?);
                 // Both-constant operands constant-fold through the
                 // oracle (instant literal checks).
                 if let (RealOp::Const(va), RealOp::Const(vb)) = (a, b) {
@@ -1947,7 +1953,7 @@ impl<'a> Ctx<'a> {
         args: &[Expr],
         env: &mut Env,
     ) -> LResult<Option<FormulaId>> {
-        // Decimal literals in EReal value positions (`erealAdd[a, 2.5, c]`)
+        // Decimal literals in EReal value positions (`erealAdd[c, a, 2.5]`)
         // resolve to `ERealConstant` tuples inline (no witness atoms).
         // `erealNeedsRefine` takes an integer goal second, so only its
         // first arg is an operand; `setEReal` keeps its literal second arg.
@@ -1963,7 +1969,8 @@ impl<'a> Ctx<'a> {
                 let wv = self.ereal_shift_width()?;
                 let mw = self.res.mepk_widths.m_width;
                 let sign = if name == "erealAdd" { 1 } else { -1 };
-                ereal_add_sub(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, &self.ereal_op(&args[2])?, sign, wv, mw)
+                // Arg order is `[R, A, B]` (see `realAdd`).
+                ereal_add_sub(&self.ereal_op(&args[1])?, &self.ereal_op(&args[2])?, &self.ereal_op(&args[0])?, sign, wv, mw)
             }
             "erealMul" => {
                 if args.len() != 3 {
@@ -1971,7 +1978,7 @@ impl<'a> Ctx<'a> {
                 }
                 let wv = self.ereal_shift_width_mul()?;
                 let mw = self.res.mepk_widths.m_width;
-                ereal_mul(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, &self.ereal_op(&args[2])?, wv, mw)
+                ereal_mul(&self.ereal_op(&args[1])?, &self.ereal_op(&args[2])?, &self.ereal_op(&args[0])?, wv, mw)
             }
             "erealDiv" => {
                 if args.len() != 3 {
@@ -1979,7 +1986,7 @@ impl<'a> Ctx<'a> {
                 }
                 let wv = self.ereal_shift_width_mul()?;
                 let w = &self.res.mepk_widths;
-                ereal_div(&self.ereal_op(&args[0])?, &self.ereal_op(&args[1])?, &self.ereal_op(&args[2])?, wv, w.m_width, w.guard)
+                ereal_div(&self.ereal_op(&args[1])?, &self.ereal_op(&args[2])?, &self.ereal_op(&args[0])?, wv, w.m_width, w.guard)
             }
             "erealWellformed" => {
                 if args.len() != 1 {
@@ -3613,7 +3620,7 @@ impl<'a> Ctx<'a> {
                     };
                     let body = Formula::Call(
                         pred.into(),
-                        vec![args[0].clone(), Expr::Name(v, 0)],
+                        vec![Expr::Name(v, 0), args[0].clone()],
                         0,
                     );
                     // Memoize per call site: the same occurrence is

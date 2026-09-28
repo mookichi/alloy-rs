@@ -96,7 +96,7 @@ fn approx_literal_paren_spelling() {
     sat("pred p { some x, y: Real | setReal[x, (0.5)] and setReal[y, 0.5] and realEq[x, y] }\nrun p for 2 Real");
     sat("pred p { some x, y: Real | setReal[x, (0.1)] and setRealNearest[y, 0.1] and realEq[x, y] }\nrun p for 2 Real");
     // Plain non-dyadic in exact positions is UNSAT (composable).
-    unsat("pred p { some a, b, c: Real | setReal[a, 0.5] and realAdd[a, 0.1, c] }\nrun p for 3 Real");
+    unsat("pred p { some a, b, c: Real | setReal[a, 0.5] and realAdd[c, a, 0.1] }\nrun p for 3 Real");
     unsat("pred p { some x: Real | setReal[x, 0.5] and x = 0.1 }\nrun p for 2 Real");
     // `(d)` in `=` with no dyadic centre equal is likewise UNSAT.
     unsat("pred p { some x: Real | setReal[x, 0.5] and x = (0.1) }\nrun p for 2 Real");
@@ -108,17 +108,17 @@ fn approx_literal_paren_spelling() {
 #[test]
 fn real_arith_is_exact() {
     // 0.5 + 0.5 = 1.0 exactly.
-    sat("pred p { some a, b, c: Real | setReal[a, 0.5] and setReal[b, 0.5] and realAdd[a, b, c] and realEq[c, 1.0] }\nrun p for 3 Real");
-    unsat("pred p { some a, b, c: Real | setReal[a, 0.5] and setReal[b, 0.5] and realAdd[a, b, c] and realLT[1.0, c] }\nrun p for 3 Real");
+    sat("pred p { some a, b, c: Real | setReal[a, 0.5] and setReal[b, 0.5] and realAdd[c, a, b] and realEq[c, 1.0] }\nrun p for 3 Real");
+    unsat("pred p { some a, b, c: Real | setReal[a, 0.5] and setReal[b, 0.5] and realAdd[c, a, b] and realLT[1.0, c] }\nrun p for 3 Real");
     // 1.5 - 0.5 = 1.0.
-    sat("pred p { some a, b, c: Real | setReal[a, 1.5] and setReal[b, 0.5] and realSub[a, b, c] and realEq[c, 1.0] }\nrun p for 3 Real");
+    sat("pred p { some a, b, c: Real | setReal[a, 1.5] and setReal[b, 0.5] and realSub[c, a, b] and realEq[c, 1.0] }\nrun p for 3 Real");
     // 1.5 * 2.0 = 3.0.
-    sat("pred p { some a, c: Real | setReal[a, 1.5] and realMul[a, 2.0, c] and realEq[c, 3.0] }\nrun p for 3 Real");
-    unsat("pred p { some a, c: Real | setReal[a, 1.5] and realMul[a, 2.0, c] and realEq[c, 2.0] }\nrun p for 3 Real");
+    sat("pred p { some a, c: Real | setReal[a, 1.5] and realMul[c, a, 2.0] and realEq[c, 3.0] }\nrun p for 3 Real");
+    unsat("pred p { some a, c: Real | setReal[a, 1.5] and realMul[c, a, 2.0] and realEq[c, 2.0] }\nrun p for 3 Real");
     // 3.0 / 0.5 = 6.0 (cross-multiplied, exact).
-    sat("pred p { some a, c: Real | setReal[a, 3.0] and realDiv[a, 0.5, c] and realEq[c, 6.0] }\nrun p for 3 Real");
+    sat("pred p { some a, c: Real | setReal[a, 3.0] and realDiv[c, a, 0.5] and realEq[c, 6.0] }\nrun p for 3 Real");
     // Division by zero is UNSAT.
-    unsat("pred p { some a, b, c: Real | setReal[b, 0.0] and realDiv[a, b, c] }\nrun p for 2 Real");
+    unsat("pred p { some a, b, c: Real | setReal[b, 0.0] and realDiv[c, a, b] }\nrun p for 2 Real");
 }
 
 #[test]
@@ -191,23 +191,23 @@ fn one_extender_collapses_real() {
 #[test]
 fn real_succ_pred() {
     // Successor is exact and minimal (default widths: succ(0.5) = 0.5625).
-    sat("pred p { some a, b: Real | setReal[a, 0.5] and realSucc[a, b] and realEq[b, 0.5625] }\nrun p for 2 Real");
-    unsat("pred p { some a, b: Real | setReal[a, 0.5] and realSucc[a, b] and realEq[b, 1.5] }\nrun p for 2 Real");
+    sat("pred p { some a, b: Real | setReal[a, 0.5] and realSucc[b, a] and realEq[b, 0.5625] }\nrun p for 2 Real");
+    unsat("pred p { some a, b: Real | setReal[a, 0.5] and realSucc[b, a] and realEq[b, 1.5] }\nrun p for 2 Real");
     // Predecessor mirrors (pred(0.5625) = 0.5).
-    sat("pred p { some a, b: Real | setReal[a, 0.5625] and realPred[a, b] and realEq[b, 0.5] }\nrun p for 2 Real");
+    sat("pred p { some a, b: Real | setReal[a, 0.5625] and realPred[b, a] and realEq[b, 0.5] }\nrun p for 2 Real");
     // Negatives mirror through zero (succ(-0.5) = -pred(0.5)).
-    sat("pred p { some a, b: Real | setReal[a, -0.5] and realSucc[a, b] and realEq[b, -0.46875] }\nrun p for 2 Real");
-    unsat("pred p { some a, b: Real | setReal[a, -0.5] and realSucc[a, b] and realEq[b, -0.5625] }\nrun p for 2 Real");
+    sat("pred p { some a, b: Real | setReal[a, -0.5] and realSucc[b, a] and realEq[b, -0.46875] }\nrun p for 2 Real");
+    unsat("pred p { some a, b: Real | setReal[a, -0.5] and realSucc[b, a] and realEq[b, -0.5625] }\nrun p for 2 Real");
     // Zero steps to ±(1, emin).
-    sat("pred p { some a, b: Real | setReal[a, 0.0] and realSucc[a, b] and realGT[b, 0.0] }\nrun p for 2 Real");
+    sat("pred p { some a, b: Real | setReal[a, 0.0] and realSucc[b, a] and realGT[b, 0.0] }\nrun p for 2 Real");
     // Top of lane has no successor.
-    unsat("pred p { some a, b: Real | realSucc[a, b] and a.m = 15 and a.e = 7 }\nrun p for 2 Real");
+    unsat("pred p { some a, b: Real | realSucc[b, a] and a.m = 15 and a.e = 7 }\nrun p for 2 Real");
 }
 
 #[test]
 fn real_up_down_functions() {
     // Function form in arithmetic position (hoisted to skolem-fast shape).
-    sat("pred p { some a, c: Real | setReal[a, 0.5] and realAdd[realUp[a], 0.25, c] and realEq[c, 0.8125] }\nrun p for 3 Real");
+    sat("pred p { some a, c: Real | setReal[a, 0.5] and realAdd[c, realUp[a], 0.25] and realEq[c, 0.8125] }\nrun p for 3 Real");
     // Round trip: Down(Up(x)) = x.
     sat("pred p { some a, b, c: Real | setReal[a, 0.5] and realEq[realUp[a], b] and realEq[realDown[b], c] and realEq[a, c] }\nrun p for 3 Real");
     // Literal arguments constant-fold (needs an atom to carry lanes).

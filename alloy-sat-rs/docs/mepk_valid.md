@@ -117,8 +117,8 @@ exact 中心 `c = m·2^e` の親ソート。正規形は `m == 0` (e 自由) ま
 
 ### 5.1. 述語と丸めなし原則
 
-`realAdd/Sub/Mul/Div`・`realEq/LT/LTE/GT/GTE`・`realWellformed`・
-`realSucc/Pred`・`realUp/Down` 関数・`setReal`・
+`realAdd/Sub/Mul/Div[c,a,b]`・`realEq/LT/LTE/GT/GTE`・`realWellformed`・
+`realSucc/Pred[b,a]`・`realUp/Down` 関数・`setReal`・
 `setRealNearest/Down/Up`。演算は exact のみ (割切れない除算は UNSAT)。
 `realUp/Down` はレーン successor (指数ウィンドウ探索、brute-force 照合済み);
 関数形は内包 desugar + 述語位置への自動ホイスト (skolem-fast)。

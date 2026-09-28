@@ -45,10 +45,10 @@ fn lane_reads_are_bitmask_values() {
 
 #[test]
 fn ereal_add_is_satisfiable() {
-    sat("pred p { some a, b, c: EReal | erealAdd[a, b, c] }\nrun p for 2 EReal");
-    sat("pred p { some a, b, c: EReal | erealSub[a, b, c] }\nrun p for 2 EReal");
-    sat("pred p { some a, b, c: EReal | erealMul[a, b, c] }\nrun p for 2 EReal");
-    sat("pred p { some a, b, c: EReal | erealDiv[a, b, c] }\nrun p for 2 EReal");
+    sat("pred p { some a, b, c: EReal | erealAdd[c, a, b] }\nrun p for 2 EReal");
+    sat("pred p { some a, b, c: EReal | erealSub[c, a, b] }\nrun p for 2 EReal");
+    sat("pred p { some a, b, c: EReal | erealMul[c, a, b] }\nrun p for 2 EReal");
+    sat("pred p { some a, b, c: EReal | erealDiv[c, a, b] }\nrun p for 2 EReal");
 }
 
 #[test]
@@ -56,12 +56,12 @@ fn add_result_centre_is_pinned() {
     // Phase 1 window-pin: 0.5+0.5 = 1.0, so `c < 0.0` is UNSAT.
     // (With free centres both directions were SAT.)
     // Literals are ERealConstants (no witness atoms needed).
-    unsat("pred p { some a, b, c: EReal | setEReal[a, 0.5] and setEReal[b, 0.5] and erealAdd[a, b, c] and erealLT[c, 0.0] }\nrun p for 5 EReal");
+    unsat("pred p { some a, b, c: EReal | setEReal[a, 0.5] and setEReal[b, 0.5] and erealAdd[c, a, b] and erealLT[c, 0.0] }\nrun p for 5 EReal");
     // Control: the true direction stays SAT.
-    sat("pred p { some a, b, c: EReal | setEReal[a, 0.5] and setEReal[b, 0.5] and erealAdd[a, b, c] and erealLT[0.0, c] }\nrun p for 5 EReal");
+    sat("pred p { some a, b, c: EReal | setEReal[a, 0.5] and setEReal[b, 0.5] and erealAdd[c, a, b] and erealLT[0.0, c] }\nrun p for 5 EReal");
     // Subtraction likewise: 0.5-0.5 = 0.0 is not above 1.0.
-    unsat("pred p { some a, b, c: EReal | setEReal[a, 0.5] and setEReal[b, 0.5] and erealSub[a, b, c] and erealLT[1.0, c] }\nrun p for 5 EReal");
-    sat("pred p { some a, b, c: EReal | setEReal[a, 1.5] and setEReal[b, 0.5] and erealSub[a, b, c] and erealLT[0.0, c] }\nrun p for 5 EReal");
+    unsat("pred p { some a, b, c: EReal | setEReal[a, 0.5] and setEReal[b, 0.5] and erealSub[c, a, b] and erealLT[1.0, c] }\nrun p for 5 EReal");
+    sat("pred p { some a, b, c: EReal | setEReal[a, 1.5] and setEReal[b, 0.5] and erealSub[c, a, b] and erealLT[0.0, c] }\nrun p for 5 EReal");
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn div_guard_violation_is_unsat() {
     // k >= p denies the §5 precondition: no result exists (mirrors
     // `DivGuardUnsat` in mepk.als).
     unsat(
-        "pred p { some a, b, c: EReal | b.k >= b.p and erealDiv[a, b, c] }\nrun p for 2 EReal",
+        "pred p { some a, b, c: EReal | b.k >= b.p and erealDiv[c, a, b] }\nrun p for 2 EReal",
     );
 }
 
@@ -77,20 +77,20 @@ fn div_guard_violation_is_unsat() {
 fn mul_result_centre_is_pinned() {
     // Phase 2 window-pin: 2.0*3.0 = 6.0 (oracle `6 ± 4`), so `c < 0.0`
     // is UNSAT. Scopes allow room for hoisted literals.
-    unsat("pred p { some a, c: EReal | setEReal[a, 2.0] and erealMul[a, 3.0, c] and erealLT[c, 0.0] }\nrun p for 6 EReal");
+    unsat("pred p { some a, c: EReal | setEReal[a, 2.0] and erealMul[c, a, 3.0] and erealLT[c, 0.0] }\nrun p for 6 EReal");
     // Control: the true direction stays SAT.
-    sat("pred p { some a, c: EReal | setEReal[a, 2.0] and erealMul[a, 3.0, c] and erealLT[0.0, c] }\nrun p for 6 EReal");
+    sat("pred p { some a, c: EReal | setEReal[a, 2.0] and erealMul[c, a, 3.0] and erealLT[0.0, c] }\nrun p for 6 EReal");
 }
 
 #[test]
 fn div_result_centre_is_pinned() {
     // Phase 2 window-pin: 3.0/0.5 = 6.0 (oracle `6 ± 4`).
-    unsat("pred p { some a, c: EReal | setEReal[a, 3.0] and erealDiv[a, 0.5, c] and erealLT[c, 0.0] }\nrun p for 6 EReal");
+    unsat("pred p { some a, c: EReal | setEReal[a, 3.0] and erealDiv[c, a, 0.5] and erealLT[c, 0.0] }\nrun p for 6 EReal");
     // Control (high precision, where the radius is tight): the true
     // direction stays SAT. At `max_p = 4` the sound radius (`R' = 8`
     // after the P0-1 Q-fix) genuinely cannot separate `6.0` from `0.0`,
     // so the control runs under `for 12 Int` (`R' = 0.5`).
-    sat("pred p { some a, c: EReal | setEReal[a, 3.0] and erealDiv[a, 0.5, c] and erealLT[0.0, c] }\nrun p for 6 EReal, 12 Int");
+    sat("pred p { some a, c: EReal | setEReal[a, 3.0] and erealDiv[c, a, 0.5] and erealLT[0.0, c] }\nrun p for 6 EReal, 12 Int");
 }
 
 #[test]
@@ -98,10 +98,10 @@ fn handmade_denormalized_lanes_rejected() {
     // m=1, p=4 is denormalized (|m| < 2^(p-1)) with k<p: div must reject
     // loudly (the `k < p` guard alone cannot exclude a zero-spanning
     // denominator here). Documents GIGO-as-UNSAT.
-    unsat("pred p { some a, b, c: EReal | b.m = 1 and b.p = 4 and b.k = 0 and erealWellformed[b] and erealDiv[a, b, c] }\nrun p for 4 EReal");
+    unsat("pred p { some a, b, c: EReal | b.m = 1 and b.p = 4 and b.k = 0 and erealWellformed[b] and erealDiv[c, a, b] }\nrun p for 4 EReal");
     // Upper-bound edge: m=-16, p=4 has |m| = 2^p (not <): the §4 bound
     // `|c| < 2^(e+1)` fails, so mul rejects it too.
-    unsat("pred p { some a, b, c: EReal | a.m = -16 and a.p = 4 and a.k = 0 and a.e = 0 and erealWellformed[a] and erealMul[a, b, c] }\nrun p for 4 EReal");
+    unsat("pred p { some a, b, c: EReal | a.m = -16 and a.p = 4 and a.k = 0 and a.e = 0 and erealWellformed[a] and erealMul[c, a, b] }\nrun p for 4 EReal");
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn div_zero_centre_is_unsat() {
     // rev2 §9.1(a): exact cancellation `b.m = 0` is out of domain even
     // when `k < p` holds (infinite relative error).
     unsat(
-        "pred p { some a, b, c: EReal | b.m = 0 and b.k < b.p and erealWellformed[b] and erealDiv[a, b, c] }\nrun p for 2 EReal",
+        "pred p { some a, b, c: EReal | b.m = 0 and b.k < b.p and erealWellformed[b] and erealDiv[c, a, b] }\nrun p for 2 EReal",
     );
 }
 
@@ -124,13 +124,13 @@ fn wellformed_rejects_bad_precision() {
 fn valid_is_permanent_on_operands() {
     // Denormalized add/sub operands are UNSAT at the point of use
     // (previously only results and div denominators were pinned).
-    unsat("pred p { some a, b, c: EReal | a.m = 1 and a.p = 4 and a.k = 0 and erealWellformed[a] and erealAdd[a, b, c] }\nrun p for 4 EReal");
-    unsat("pred p { some a, b, c: EReal | a.m = 1 and a.p = 4 and a.k = 0 and erealWellformed[a] and erealSub[a, b, c] }\nrun p for 4 EReal");
+    unsat("pred p { some a, b, c: EReal | a.m = 1 and a.p = 4 and a.k = 0 and erealWellformed[a] and erealAdd[c, a, b] }\nrun p for 4 EReal");
+    unsat("pred p { some a, b, c: EReal | a.m = 1 and a.p = 4 and a.k = 0 and erealWellformed[a] and erealSub[c, a, b] }\nrun p for 4 EReal");
     // Precision beyond the mantissa lane is rejected too
     // (default `for 4 Int` widths: m_width = 5, so p = 6 is out of range).
-    unsat("pred p { some a, b, c: EReal | a.m = 32 and a.p = 6 and a.k = 0 and erealWellformed[a] and erealAdd[a, b, c] }\nrun p for 4 EReal");
+    unsat("pred p { some a, b, c: EReal | a.m = 32 and a.p = 6 and a.k = 0 and erealWellformed[a] and erealAdd[c, a, b] }\nrun p for 4 EReal");
     // Control: the normalized shape (m = 8 in [2^3, 2^4)) stays SAT.
-    sat("pred p { some a, b, c: EReal | a.m = 8 and a.p = 4 and a.k = 0 and erealWellformed[a] and erealAdd[a, b, c] }\nrun p for 4 EReal");
+    sat("pred p { some a, b, c: EReal | a.m = 8 and a.p = 4 and a.k = 0 and erealWellformed[a] and erealAdd[c, a, b] }\nrun p for 4 EReal");
 }
 
 #[test]
@@ -349,13 +349,13 @@ fn exact_eq_is_lane_identity() {
 
 #[test]
 fn lits_hoist_in_ereal_args() {
-    // `erealAdd[a, 0.5, c]` with a pinned addend is satisfiable.
-    sat("pred p { some a, c: EReal | setEReal[a, 0.25] and erealAdd[a, 0.5, c] }\nrun p for 3 EReal");
+    // `erealAdd[c, a, 0.5]` with a pinned addend is satisfiable.
+    sat("pred p { some a, c: EReal | setEReal[a, 0.25] and erealAdd[c, a, 0.5] }\nrun p for 3 EReal");
     // Wellformedness of a literal value.
     sat("pred p { erealWellformed[0.5] }\nrun p for 1 EReal");
     // Out-of-range literal in argument position still fails loudly.
     build_err(
-        "pred p { some a, c: EReal | erealAdd[a, 1.0e100, c] }\nrun p for 2 EReal",
+        "pred p { some a, c: EReal | erealAdd[c, a, 1.0e100] }\nrun p for 2 EReal",
         "cannot convert",
     );
 }
@@ -499,7 +499,7 @@ fn interval_pred_shapes() {
     // overlaps R2 = [-13.5, -12.5] but is not above it: `erealLTE[R2, R3]`
     // (`hi_R2 <= lo_R3`) is genuinely false here, so the chained check
     // uses overlap (`erealMayEq`), which holds.
-    sat("one sig R1, R2, R3 extends EReal {}\nfact { R1 = 1.2 and R2 = -1.3e1 and erealAdd[R1, R2, R3] and erealMayEq[R2, R3] }\nrun {} for 3 EReal");
+    sat("one sig R1, R2, R3 extends EReal {}\nfact { R1 = 1.2 and R2 = -1.3e1 and erealAdd[R3, R1, R2] and erealMayEq[R2, R3] }\nrun {} for 3 EReal");
 }
 
 #[test]
@@ -521,12 +521,12 @@ fn five_var_chain_no_arity_collapse() {
     // producing `!resolution error: join arity too low: 1 + 1 - 2 < 1`.
     // Lanes now lower qualified (`EReal.e`), so shadowing is impossible.
     // The issue's original model (well-formed chain) is SAT.
-    sat("pred p { some a, b, c, d, e: EReal | setEReal[a, 1.5] and setEReal[b, 2.5] and erealAdd[a, b, c] and erealMul[c, 2.0, d] and erealAdd[d, 0.5, e] }\nrun p for 7 EReal");
+    sat("pred p { some a, b, c, d, e: EReal | setEReal[a, 1.5] and setEReal[b, 2.5] and erealAdd[c, a, b] and erealMul[d, c, 2.0] and erealAdd[e, d, 0.5] }\nrun p for 7 EReal");
     // Minimal shadowing trigger: one `setEReal` with 5 decls.
     sat("pred p { some a, b, c, d, e: EReal | setEReal[a, 1.5] }\nrun p for 5 EReal");
     // The other lane names shadow likewise when used as variables.
-    sat("pred p { some m, p, k, a, b: EReal | setEReal[m, 1.5] and setEReal[p, 2.5] and erealAdd[m, p, a] }\nrun p for 7 EReal");
+    sat("pred p { some m, p, k, a, b: EReal | setEReal[m, 1.5] and setEReal[p, 2.5] and erealAdd[a, m, p] }\nrun p for 7 EReal");
     // UNSAT direction, true interval semantics: the chain denotes
     // ~8.5, so `e < 0.0` (`hi_e < lo_0`) is genuinely false.
-    unsat("pred p { some a, b, c, d, e: EReal | setEReal[a, 1.5] and setEReal[b, 2.5] and erealAdd[a, b, c] and erealMul[c, 2.0, d] and erealAdd[d, 0.5, e] and erealLT[e, 0.0] }\nrun p for 8 EReal");
+    unsat("pred p { some a, b, c, d, e: EReal | setEReal[a, 1.5] and setEReal[b, 2.5] and erealAdd[c, a, b] and erealMul[d, c, 2.0] and erealAdd[e, d, 0.5] and erealLT[e, 0.0] }\nrun p for 8 EReal");
 }
