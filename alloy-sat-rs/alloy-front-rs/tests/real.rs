@@ -214,3 +214,44 @@ fn real_up_down_functions() {
     sat("pred p { realEq[realUp[0.5], 0.5625] }\nrun p for 1 Real");
     unsat("pred p { realEq[realUp[0.5], 1.5] }\nrun p for 1 Real");
 }
+
+#[test]
+fn query_real_up_down_uses_oracle() {
+    // Reported REPL case: with `one sig X extends Real`, `Real = {X$0}`,
+    // so the desugared `{ $r: Real | realSucc[$r, X] }` enumerates to
+    // `{}`; `:query realUp[X]` must answer via the lane oracle instead.
+    use alloy_front_rs::{effective_int_count, query_value, QueryValue};
+    use alloy_kodkod_rs::mepk::MepkWidths;
+    use alloy_kodkod_rs::real::{decimal_to_real_rounded, next_down, next_up, RealRound};
+    let src = "one sig X extends Real {}\nfact { X.setRealNearest[0.13] }\nrun {} for 12 Int";
+    let m = parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("run");
+    let inst = solve(&cnf).expect("solve").expect("SAT");
+    let scope = &m.commands[0].scope;
+    let w = MepkWidths::from_env(effective_int_count(scope)).expect("widths");
+    let x = decimal_to_real_rounded("0.13", Some(w.m_width), RealRound::Nearest).expect("0.13");
+    let expect_up = next_up(&x, w.m_width, w.e_width).expect("succ");
+    let expect_down = next_down(&x, w.m_width, w.e_width).expect("pred");
+    match query_value(&m, scope, &cnf, "realUp[X]", &inst).expect("query realUp[X]") {
+        QueryValue::Real(v) => assert_eq!(v, expect_up),
+        QueryValue::Set(..) => panic!("expected computed Real"),
+        QueryValue::Int(..) => panic!("expected computed Real"),
+        QueryValue::Bool(..) => panic!("expected computed Real"),
+    }
+    match query_value(&m, scope, &cnf, "realDown[X]", &inst).expect("query realDown[X]") {
+        QueryValue::Real(v) => assert_eq!(v, expect_down),
+        QueryValue::Set(..) => panic!("expected computed Real"),
+        QueryValue::Int(..) => panic!("expected computed Real"),
+        QueryValue::Bool(..) => panic!("expected computed Real"),
+    }
+    // Literal argument folds without an instance atom.
+    match query_value(&m, scope, &cnf, "realUp[0.5]", &inst).expect("query realUp[0.5]") {
+        QueryValue::Real(v) => {
+            let half = decimal_to_real_rounded("0.5", Some(w.m_width), RealRound::Nearest).unwrap();
+            assert_eq!(v, next_up(&half, w.m_width, w.e_width).unwrap());
+        }
+        QueryValue::Set(..) => panic!("expected computed Real"),
+        QueryValue::Int(..) => panic!("expected computed Real"),
+        QueryValue::Bool(..) => panic!("expected computed Real"),
+    }
+}

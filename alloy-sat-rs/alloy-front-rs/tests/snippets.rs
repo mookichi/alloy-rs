@@ -173,12 +173,14 @@ fn query_int_cardinality() {
         QueryValue::Int(v) => assert_eq!(v, n),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     // integer arithmetic over a query
     match query_value(&m, scope, &cnf, "#A + 1", &inst).expect("query #A + 1") {
         QueryValue::Int(v) => assert_eq!(v, n + 1),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     // relational input still yields a set through query_value
     match query_value(&m, scope, &cnf, "A", &inst).expect("query A") {
@@ -188,6 +190,7 @@ fn query_int_cardinality() {
         }
         QueryValue::Int(..) => panic!("expected Set"),
         QueryValue::Bool(..) => panic!("expected Set"),
+        QueryValue::Real(..) => panic!("expected Set"),
     }
     // garbage reports the relational parse error, not the int one
     assert!(query_value(&m, scope, &cnf, "A +", &inst).is_err());
@@ -209,6 +212,7 @@ fn query_int_universe() {
             }
             QueryValue::Int(..) => panic!("expected Set"),
             QueryValue::Bool(..) => panic!("expected Set"),
+            QueryValue::Real(..) => panic!("expected Set"),
         }
     }
     // the set-only entry point accepts it too
@@ -230,12 +234,14 @@ fn query_int_universe_lazy_when_unused() {
         }
         QueryValue::Int(..) => panic!("expected Set"),
         QueryValue::Bool(..) => panic!("expected Set"),
+        QueryValue::Real(..) => panic!("expected Set"),
     }
     // `#Int` is likewise 0 without materialized atoms.
     match query_value(&m, scope, &cnf, "#Int", &inst).expect("query #Int") {
         QueryValue::Int(v) => assert_eq!(v, 0),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
 }
 
@@ -248,11 +254,13 @@ fn query_int_literal_wraps_like_java() {
         QueryValue::Int(v) => assert_eq!(v, -8),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     match query_value(&m, scope, &cnf, "7", &inst).expect("query 7") {
         QueryValue::Int(v) => assert_eq!(v, 7),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     // out-of-range literals wrap (two's complement truncation at the
     // query Cnf's bitwidth 4), matching Java's evaluator: 100 -> 4,
@@ -261,11 +269,13 @@ fn query_int_literal_wraps_like_java() {
         QueryValue::Int(v) => assert_eq!(v, 4),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     match query_value(&m, scope, &cnf, "-9", &inst).expect("query -9") {
         QueryValue::Int(v) => assert_eq!(v, -9),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     let r = inst.find_relation_by_name("A").unwrap();
     let n = inst.tuples(r).unwrap().len() as i64;
@@ -273,6 +283,7 @@ fn query_int_literal_wraps_like_java() {
         QueryValue::Int(v) => assert_eq!(v, n + 4),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
 }
 
@@ -335,6 +346,7 @@ fn query_comprehension_int_filter() {
         }
         QueryValue::Int(..) => panic!("expected Set"),
         QueryValue::Bool(..) => panic!("expected Set"),
+        QueryValue::Real(..) => panic!("expected Set"),
     }
     // unfiltered, the whole pinned set comes back
     let (_, all) = query(&m, scope, &cnf, "X", &inst).expect("query X");
@@ -385,6 +397,7 @@ fn query_arith_over_literals() {
         QueryValue::Int(v) => assert_eq!(v, 2),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     // mixed set/int stays relational: `3 + A` is the union set
     // (needs materialized atoms, so it is covered on the Int model).
@@ -394,6 +407,7 @@ fn query_arith_over_literals() {
         QueryValue::Set(..) => {}
         QueryValue::Int(..) => panic!("expected Set"),
         QueryValue::Bool(..) => panic!("expected Set"),
+        QueryValue::Real(..) => panic!("expected Set"),
     }
     // on the Int-free model the set-position literal is out of scope
     assert!(query_value(&m, scope, &cnf, "5 + A", &inst).is_err());
@@ -438,6 +452,7 @@ fn query_sum_of_set() {
         QueryValue::Int(v) => assert_eq!(v, 6),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
 }
 
@@ -499,6 +514,7 @@ fn query_atom_literal_allowed() {
         }
         QueryValue::Int(..) => panic!("expected Set"),
         QueryValue::Bool(..) => panic!("expected Set"),
+        QueryValue::Real(..) => panic!("expected Set"),
     }
     // atoms compose in larger set expressions too
     let (_, ts) = query(&m, scope, &cnf, "{A$0}", &inst).expect("query {A$0}");
@@ -530,6 +546,7 @@ fn query_closed_formulas() {
             QueryValue::Bool(v) => assert_eq!(v, want, "{src}"),
             QueryValue::Set(..) => panic!("expected Bool for {src}"),
             QueryValue::Int(..) => panic!("expected Bool for {src}"),
+            QueryValue::Real(..) => panic!("expected Bool for {src}"),
         }
     }
     // garbage still reports the expression-parse error, not a formula one
@@ -551,17 +568,20 @@ fn query_brace_set_routing() {
         QueryValue::Int(v) => assert_eq!(v, 6),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     // mixed `+`/`-` with a plain int commits to integer arithmetic as well.
     match query_value(&m, scope, &cnf, "{0, 1} + 2", &inst).expect("query {0,1} + 2") {
         QueryValue::Int(v) => assert_eq!(v, 5),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     match query_value(&m, scope, &cnf, "{0, 1} - 0", &inst).expect("query {0,1} - 0") {
         QueryValue::Int(v) => assert_eq!(v, 3),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     // pure brace `+` keeps the set reading: `{0} + {1}` is `{0, 1}`.
     let (_, u) = query(&m, scope, &cnf, "{0} + {1}", &inst).expect("query {0} + {1}");

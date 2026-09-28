@@ -17,6 +17,9 @@ use std::sync::Arc;
 use alloy_kodkod_rs::ast::AstArena;
 use alloy_kodkod_rs::instance::Instance;
 use alloy_kodkod_rs::intset::IntSet;
+use alloy_kodkod_rs::real::{
+    decimal_to_real, decimal_to_real_rounded, next_down, next_up, RealCenter, RealRound,
+};
 use alloy_kodkod_rs::tupleset::TupleSet;
 
 use crate::ast::{Expr, Formula, IntExpr, Module, Scope};
@@ -142,15 +145,26 @@ pub fn query(
         QueryValue::Bool(_) => Err(FrontError::Resolve(format!(
             "`{expr_src}` is a formula, not a set"
         ))),
+        QueryValue::Real(_) => Err(FrontError::Resolve(format!(
+            "`{expr_src}` is a computed Real value, not a set"
+        ))),
     }
 }
 
-/// A `:query` result: either a tuple set, an integer, or a formula verdict.
+/// A `:query` result: either a tuple set, an integer, a formula verdict,
+/// or a computed exact-centre Real value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValue {
     Set(u32, TupleSet),
     Int(i64),
     Bool(bool),
+    /// Computed `Real` centre from a `realUp`/`realDown` query. Unlike
+    /// `Set` this is not an instance atom: the lane successor of a value
+    /// generally lies outside the solved atom population (e.g. with
+    /// `one sig X extends Real`, `Real = {X$0}`), so evaluating the
+    /// desugared comprehension by instance enumeration would yield `{}`.
+    /// The lane oracle (`next_up`/`next_down`) answers it instead.
+    Real(RealCenter),
 }
 
 /// Evaluate a bare expression against a solved instance, accepting both
@@ -192,13 +206,14 @@ pub fn query_value(
                     .map_err(|_| FrontError::Resolve("cannot build Int tuple set".to_string()))?;
                 return Ok(QueryValue::Set(1, ts));
             }
-            let mut arena = AstArena::with_pool(Arc::clone(instance.pool()));
-            let mut lower = Lowerer::new(module);
-            let (eid, arity) = lower.lower_expr_in_scope(scope, &mut arena, &e)?;
-            let empty_env = Vec::new();
-            let ts = alloy_kodkod_rs::eval::Evaluator::new(instance)
-                .expr_set(&arena, eid, &empty_env)
-                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            // `realUp`/`realDown` are computed functions, not relations:
+            // answer via the lane oracle (see `QueryValue::Real`).
+            if let Expr::Call(name, args, _) = &e {
+                if (name == "realUp" || name == "realDown") && args.len() == 1 {
+                    return query_real_fun(module, scope, name == "realUp", &args[0], instance);
+                }
+            }
+            let (arity, ts) = query_set_parsed(module, scope, &e, instance)?;
             Ok(QueryValue::Set(arity, ts))
         }
         Err(expr_err) => {
@@ -210,6 +225,103 @@ pub fn query_value(
                 Err(_) => Err(expr_err),
             }
         }
+    }
+}
+
+/// Lower a parsed relational expression and evaluate it against
+/// `instance` (shared relational path for `:query`).
+fn query_set_parsed(
+    module: &Module,
+    scope: &Scope,
+    e: &Expr,
+    instance: &Instance,
+) -> Result<(u32, TupleSet), FrontError> {
+    let mut arena = AstArena::with_pool(Arc::clone(instance.pool()));
+    let mut lower = Lowerer::new(module);
+    let (eid, arity) = lower.lower_expr_in_scope(scope, &mut arena, e)?;
+    let empty_env = Vec::new();
+    let ts = alloy_kodkod_rs::eval::Evaluator::new(instance)
+        .expr_set(&arena, eid, &empty_env)
+        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+    Ok((arity, ts))
+}
+
+/// Evaluate a `realUp[x]` / `realDown[x]` query via the lane oracle.
+///
+/// The solve-path desugaring (`{ $r: Real | realSucc[$r, x] }`) only
+/// ranges over the solved atom population, so a `:query` of it yields
+/// `{}` whenever the successor is not itself an atom of the instance
+/// (the common case, e.g. `one sig X extends Real`). The argument is
+/// resolved to its exact centre instead — a singleton `Real` atom read
+/// through its `(m, e)` lanes, or a decimal literal folded like
+/// `lower.rs::real_op` — and stepped with `next_up`/`next_down`.
+fn query_real_fun(
+    module: &Module,
+    scope: &Scope,
+    up: bool,
+    arg: &Expr,
+    instance: &Instance,
+) -> Result<QueryValue, FrontError> {
+    let name = if up { "realUp" } else { "realDown" };
+    let w = crate::bounds::resolve(module, scope)
+        .map_err(FrontError::Resolve)?
+        .mepk_widths;
+    let (mw, ew) = (w.m_width, w.e_width);
+    let centre = match arg {
+        Expr::RealLit(s, _) => decimal_to_real(s, Some(mw)).ok_or_else(|| {
+            FrontError::Resolve(format!(
+                "cannot convert {s:?} to Real exactly (non-dyadic, malformed, or outside the m lane)"
+            ))
+        })?,
+        Expr::ApproxRealLit(s, _) => {
+            decimal_to_real_rounded(s, Some(mw), RealRound::Nearest).ok_or_else(|| {
+                FrontError::Resolve(format!(
+                    "cannot convert ({s:?}) to Real (malformed or outside the m lane)"
+                ))
+            })?
+        }
+        _ => {
+            // Atom argument: evaluate to a singleton `Real` set, then
+            // read its `(m, e)` lanes from the instance.
+            let (arity, ts) = query_set_parsed(module, scope, arg, instance)?;
+            if arity != 1 {
+                return Err(FrontError::Resolve(format!(
+                    "`{name}` expects a singleton Real argument"
+                )));
+            }
+            let idxs: Vec<_> = ts.index_view().iter().collect();
+            if idxs.len() != 1 {
+                return Err(FrontError::Resolve(format!(
+                    "`{name}` expects a singleton Real argument"
+                )));
+            }
+            let decoded = crate::display::decode_ereal(instance).ok_or_else(|| {
+                FrontError::Resolve("cannot decode Real lanes from the instance".to_string())
+            })?;
+            let d = decoded.get(&(idxs[0] as u32)).ok_or_else(|| {
+                FrontError::Resolve("argument is not a Real atom of the instance".to_string())
+            })?;
+            RealCenter::new(d.lanes.0 as i128, d.lanes.1 as i32).ok_or_else(|| {
+                FrontError::Resolve(format!(
+                    "ill-formed Real lanes m={} e={}",
+                    d.lanes.0, d.lanes.1
+                ))
+            })?
+        }
+    };
+    let next = if up {
+        next_up(&centre, mw, ew)
+    } else {
+        next_down(&centre, mw, ew)
+    };
+    match next {
+        Some(v) => Ok(QueryValue::Real(v)),
+        None => Err(FrontError::Resolve(format!(
+            "`{name}` of {} [m={} e={}] leaves the lane range",
+            centre.centre_short(),
+            centre.m,
+            centre.e,
+        ))),
     }
 }
 

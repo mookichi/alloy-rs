@@ -86,6 +86,7 @@ fn pure_int_arithmetic_needs_no_atoms() {
         QueryValue::Int(v) => assert_eq!(v, 2),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
 }
 
@@ -121,12 +122,14 @@ fn int_field_solves_unsigned() {
         QueryValue::Int(v) => assert_eq!(v, 8),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     // literals wrap as E-bit two's complement (E = W + 1 = 9): 300 -> -212
     match query_value(&m, scope, &cnf, "300", &inst).expect("query 300") {
         QueryValue::Int(v) => assert_eq!(v, -212),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
 }
 

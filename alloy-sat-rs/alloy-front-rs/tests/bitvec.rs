@@ -148,6 +148,7 @@ fn int_queries_see_unsigned_atoms() {
         QueryValue::Int(v) => assert_eq!(v, 8),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
 }
 

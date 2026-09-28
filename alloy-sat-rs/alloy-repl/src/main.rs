@@ -1490,6 +1490,9 @@ fn wrapping_optimum_note(bitwidth: u32, sol: &OptSolution) -> Option<String> {
             }
             Ok(QueryValue::Int(v)) => println!("{v}"),
             Ok(QueryValue::Bool(v)) => println!("{v}"),
+            Ok(QueryValue::Real(v)) => {
+                println!("{} [m={} e={}]", v.centre_short(), v.m, v.e)
+            }
             Err(e) => println!("query error: {e}"),
         }
     }

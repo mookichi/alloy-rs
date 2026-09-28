@@ -52,10 +52,12 @@ fn bitwidth_takes_effect() {
         QueryValue::Int(v) => assert_eq!(v, 8),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
     match query_value(&m, scope, &cnf, "100", &inst).expect("query 100") {
         QueryValue::Int(v) => assert_eq!(v, 100),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
+        QueryValue::Real(..) => panic!("expected Int"),
     }
 }

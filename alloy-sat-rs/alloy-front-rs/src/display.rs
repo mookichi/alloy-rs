@@ -280,6 +280,7 @@ pub fn format_query_value(inst: &Instance, v: &crate::snippet::QueryValue) -> St
     match v {
         QueryValue::Int(i) => format!("{i}"),
         QueryValue::Bool(b) => format!("{b}"),
+        QueryValue::Real(c) => format!("{} [m={} e={}]", c.centre_short(), c.m, c.e),
         QueryValue::Set(1, ts) => {
             let decoded = decode_ereal(inst).unwrap_or_default();
             format_atom_set(inst, &decoded, ts.index_view().iter().map(|i| i as u32))
