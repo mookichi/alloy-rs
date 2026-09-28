@@ -16,6 +16,13 @@ use std::sync::Arc;
 
 pub const DEFAULT_SCOPE: u32 = 3;
 
+/// Builtin flat lane sigs (`$M/$E/$P/$K`): the bit-position domains.
+/// User declaration is prohibited (reserved like `Real`/`EReal`/`Int`);
+/// sizes come from `run ... for N $M` (else the `for W Int` rule).
+pub fn is_lane_sig(n: &str) -> bool {
+    matches!(n, "$M" | "$E" | "$P" | "$K")
+}
+
 /// Bit-lane group ids for the builtin `Real`/`EReal` lanes in the kodkod
 /// int-bound group registry (`Bounds::bound_exactly_int_in`).
 /// Group 0 stays the builtin `Int` namespace.
@@ -490,7 +497,11 @@ fn module_mentions_ereal(module: &Module, scope: &Scope) -> bool {
 /// allocation (the `EReal` half is covered by [`module_mentions_ereal`]).
 fn module_mentions_real(module: &Module, scope: &Scope) -> bool {
     use crate::ast::{Expr, Formula, IntExpr};
-    if scope.entries.iter().any(|(n, _)| n == "Real" || n == "EReal") {
+    if scope
+        .entries
+        .iter()
+        .any(|(n, _)| n == "Real" || n == "EReal" || is_lane_sig(n))
+    {
         return true;
     }
     if module_mentions_ereal(module, scope) {
@@ -501,7 +512,7 @@ fn module_mentions_real(module: &Module, scope: &Scope) -> bool {
             return;
         }
         match e {
-            Expr::Name(n, _) if n == "Real" => *hit = true,
+            Expr::Name(n, _) if n == "Real" || is_lane_sig(n) => *hit = true,
             Expr::RealLit(..) | Expr::ApproxRealLit(..) => *hit = true,
             Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom
             | Expr::StepAtom | Expr::Bits(..) => {}
@@ -683,7 +694,7 @@ fn real_direct_mention(module: &Module) -> bool {
             return;
         }
         match e {
-            Expr::Name(n, _) if n == "Real" => *hit = true,
+            Expr::Name(n, _) if n == "Real" || is_lane_sig(n) => *hit = true,
             Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom
             | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => {}
             Expr::Bin(_, a, b) => {
@@ -865,11 +876,64 @@ fn real_direct_mention(module: &Module) -> bool {
 
 /// Resolves scopes into universe + per-sig atom allocations.
 pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
-    let (user, overall, bitwidth, int_count, needs_int) = build_scope_map(module, scope);
-    let mepk_widths =
+    let (user, overall, mut bitwidth, int_count, needs_int) = build_scope_map(module, scope);
+    let mut mepk_widths =
         alloy_kodkod_rs::mepk::MepkWidths::from_env(int_count).map_err(|e| format!("mepk: {e}"))?;
+    // Flat lane sigs: `for N $M` etc. override the `for W Int` rule
+    // (and the `MEPK_*_WIDTH` env, which `from_env` already applied).
+    // Omitted entries keep the rule-based behavior (backward compatible).
+    let lane_scope = |name: &str| -> Option<u32> {
+        scope
+            .entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, e)| match e {
+                ScopeEntry::Num(n) | ScopeEntry::Exactly(n) => *n,
+            })
+    };
+    if let Some(n) = lane_scope("$M") {
+        if n == 0 || n > 30 {
+            return Err(format!("for {n} $M out of range 1..=30"));
+        }
+        mepk_widths.m_width = n;
+    }
+    if let Some(n) = lane_scope("$E") {
+        if n == 0 || n > 30 {
+            return Err(format!("for {n} $E out of range 1..=30"));
+        }
+        mepk_widths.e_width = n;
+    }
+    if let Some(n) = lane_scope("$P") {
+        if n == 0 || n > 30 {
+            return Err(format!("for {n} $P out of range 1..=30"));
+        }
+        mepk_widths.p_width = n;
+    }
+    if let Some(n) = lane_scope("$K") {
+        if n == 0 || n > 30 {
+            return Err(format!("for {n} $K out of range 1..=30"));
+        }
+        mepk_widths.k_width = n;
+    }
     let needs_ereal = module_mentions_ereal(module, scope);
     let needs_real = module_mentions_real(module, scope);
+    // An explicit `for N $M` etc. raises the problem circuit width to
+    // cover it (else lane values would wrap mod 2^E). Without explicit
+    // lane scopes the `for W Int` rule behavior is unchanged (too-narrow
+    // rule widths still fail loudly, backward compatible).
+    let lane_explicit = |names: &[&str]| {
+        names
+            .iter()
+            .any(|n| scope.entries.iter().any(|(e, _)| e == *n))
+    };
+    if needs_real && lane_explicit(&["$M", "$E"]) {
+        bitwidth = bitwidth.max(mepk_widths.m_width).max(mepk_widths.e_width);
+    }
+    if needs_ereal && lane_explicit(&["$P", "$K"]) {
+        bitwidth = bitwidth
+            .max(mepk_widths.p_width)
+            .max(mepk_widths.k_width);
+    }
     // Lane widths must fit the problem circuit width, but only when lanes
     // are actually allocated: wider lanes would misread (top bits wrap
     // mod 2^E). Point at the Int scope for relief. `M`/`E` widths are
@@ -934,12 +998,17 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
         ereal_count = 0;
         real_budget = 0;
     }
-    // `Real`/`EReal` are reserved builtins: user declarations are rejected
-    // (extension is allowed: `in` shares atoms, `extends` partitions).
+    // `Real`/`EReal`/`$M`/`$E`/`$P`/`$K` are reserved builtins: user
+    // declarations are rejected (extension is allowed: `in` shares atoms,
+    // `extends` partitions).
     for sd in &module.sigs {
-        if sd.names.iter().any(|n| n == "EReal" || n == "Real") {
+        if sd
+            .names
+            .iter()
+            .any(|n| n == "EReal" || n == "Real" || is_lane_sig(n))
+        {
             return Err(
-                "sig Real/EReal is reserved by the builtin Real signature".to_string(),
+                "sig Real/EReal/$M/$E/$P/$K is reserved by the builtin Real signature".to_string(),
             );
         }
     }
@@ -1405,6 +1474,27 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             atoms: ereal_atoms.clone(),
         },
     );
+    // Builtin flat lane sigs (`$M`/`$E`/`$P`/`$K`): the lane atoms
+    // themselves, queryable as sets (`some $M`, `X & $M`). Independent
+    // builtins (no parent, like `Int`'s bit domain, not `Real` children).
+    for (name, group) in [
+        ("$M", LANE_M),
+        ("$E", LANE_E),
+        ("$P", LANE_P),
+        ("$K", LANE_K),
+    ] {
+        let atoms = lane_atoms.get(&group).cloned().unwrap_or_default();
+        sigs.insert(
+            name.to_string(),
+            SigInfo {
+                name: name.to_string(),
+                parent: None,
+                rel: SigRel::None,
+                mult: SigMult::None,
+                atoms,
+            },
+        );
+    }
 
     Ok(Resolved {
         universe,
@@ -1418,6 +1508,17 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
             c.insert("Step".to_string(), step_atoms);
             c.insert("Real".to_string(), real_closure.clone());
             c.insert("EReal".to_string(), ereal_atoms.clone());
+            for (name, group) in [
+                ("$M", LANE_M),
+                ("$E", LANE_E),
+                ("$P", LANE_P),
+                ("$K", LANE_K),
+            ] {
+                c.insert(
+                    name.to_string(),
+                    lane_atoms.get(&group).cloned().unwrap_or_default(),
+                );
+            }
             c
         },
         in_children_atoms,

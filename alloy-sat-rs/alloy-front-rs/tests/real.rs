@@ -216,6 +216,18 @@ fn real_up_down_functions() {
 }
 
 #[test]
+fn lane_sig_scope_controls_widths() {
+    // Flat lane sigs: `for N $M` etc. set lane populations directly.
+    sat("pred p { #$M = 8 }\nrun p for 8 $M, 5 $E");
+    unsat("pred p { #$M = 8 }\nrun p for 4 $M, 5 $E");
+    sat("pred p { #$E = 5 }\nrun p for 8 $M, 5 $E");
+    // Lane atoms are visible as builtin sets.
+    sat("pred p { some x: Real | x.m in $M }\nrun p for 2 Real");
+    // Omitted entries keep the `for W Int` rule behavior.
+    sat("pred p { some x: Real | setReal[x, 0.5] }\nrun p for 2 Real");
+}
+
+#[test]
 fn query_real_up_down_uses_oracle() {
     // Reported REPL case: with `one sig X extends Real`, `Real = {X$0}`,
     // so the desugared `{ $r: Real | realSucc[$r, X] }` enumerates to
