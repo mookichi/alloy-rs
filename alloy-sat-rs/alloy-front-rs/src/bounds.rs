@@ -61,6 +61,7 @@ pub const REAL_OPS: &[&str] = &[
     "realPred",
     "realUp",
     "realDown",
+    "composeReal",
 ];
 
 /// Builtin `EReal` operation/predicate names that imply EReal allocation
@@ -87,6 +88,7 @@ pub const EREAL_OPS: &[&str] = &[
     "erealGT",
     "erealGTE",
     "setEReal",
+    "composeEReal",
 ];
 
 #[derive(Debug)]

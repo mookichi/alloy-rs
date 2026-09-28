@@ -530,3 +530,16 @@ fn five_var_chain_no_arity_collapse() {
     // ~8.5, so `e < 0.0` (`hi_e < lo_0`) is genuinely false.
     unsat("pred p { some a, b, c, d, e: EReal | setEReal[a, 1.5] and setEReal[b, 2.5] and erealAdd[c, a, b] and erealMul[d, c, 2.0] and erealAdd[e, d, 0.5] and erealLT[e, 0.0] }\nrun p for 8 EReal");
 }
+
+#[test]
+fn compose_ereal_binds_lanes() {
+    // EReal stores the MSB exponent (`lsb = e-p+1`): 0.5 is (8,-1,4,0).
+    sat("pred p { some x: EReal | x.composeEReal[8, -1, 4, 0] }\nrun p for 2 EReal");
+    // Agrees with setEReal on all four lanes.
+    sat("pred p { some x, y: EReal | x.composeEReal[8, -1, 4, 0] and setEReal[y, 0.5] and erealExactEq[x, y] }\nrun p for 2 EReal");
+    // Out-of-range literals fail loudly.
+    build_err(
+        "pred p { some x: EReal | x.composeEReal[8, -1, 99, 0] }\nrun p for 2 EReal",
+        "outside the p lane range",
+    );
+}

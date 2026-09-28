@@ -228,6 +228,29 @@ fn lane_sig_scope_controls_widths() {
 }
 
 #[test]
+fn compose_real_binds_lanes() {
+    // (1, -1) is 0.5, agreeing with setReal.
+    sat("pred p { some x: Real | x.composeReal[1, -1] }\nrun p for 2 Real");
+    sat("pred p { some x, y: Real | x.composeReal[1, -1] and setReal[y, 0.5] and realEq[x, y] }\nrun p for 2 Real");
+    // Even nonzero mantissae are ill-formed (UNSAT, not error).
+    unsat("pred p { some x: Real | x.composeReal[2, -1] }\nrun p for 2 Real");
+    // Lane-read args copy another value's centre.
+    sat("pred p { some x, y: Real | setReal[x, 1.5] and y.composeReal[x.m, x.e] and realEq[x, y] }\nrun p for 2 Real");
+    // Out-of-range literals fail loudly (m at default widths: [-16, 15]).
+    build_err(
+        "pred p { some x: Real | x.composeReal[16, 0] }\nrun p for 2 Real",
+        "outside the m lane range",
+    );
+    // Quantified variables are rejected loudly, never misread.
+    build_err(
+        "pred p { some r: Real | all mm: Int | r.composeReal[mm, 0] }\nrun p for 2 Real",
+        "integer literal or lane read",
+    );
+    // User fun derivatives work (args substitute pre-lowering).
+    sat("fun mkHalf[]: Real { { r: Real | r.composeReal[1, -1] } }\npred p { some y: Real | setReal[y, 0.5] and some r: mkHalf[] | realEq[r, y] }\nrun p for 2 Real");
+}
+
+#[test]
 fn query_real_up_down_uses_oracle() {
     // Reported REPL case: with `one sig X extends Real`, `Real = {X$0}`,
     // so the desugared `{ $r: Real | realSucc[$r, X] }` enumerates to

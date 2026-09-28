@@ -1839,6 +1839,25 @@ impl<'a> Ctx<'a> {
                 };
                 real_set_rounded(&args[0], &args[1], self.res.mepk_widths.m_width, mode, name)?
             }
+            "composeReal" => {
+                // Lane composition `R.composeReal[M, E]` (`R = (M, E)`):
+                // user-writable counterpart of `setReal`, taking integer
+                // lane values (literals or lane reads like `x.m`) so
+                // `fun` derivatives can be built on top of it.
+                if args.len() != 3 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 3 args")));
+                }
+                let r = self.real_op(&args[0])?;
+                let w = &self.res.mepk_widths;
+                let (mw, ew) = (w.m_width, w.e_width);
+                let m = self.compose_lane_or_lit(&args[1], env, mw, "m")?;
+                let e = self.compose_lane_or_lit(&args[2], env, ew, "e")?;
+                ereal_and_all(vec![
+                    ereal_icmp(IntCmpOp::Eq, real_lane_of(&r, "m"), m),
+                    ereal_icmp(IntCmpOp::Eq, real_lane_of(&r, "e"), e),
+                    real_wellformed(&r),
+                ])
+            }
             "realSucc" | "realPred" => {
                 // Lane successor / predecessor over strictly positive
                 // input (mirrored for negatives, pinned for zero):
@@ -2044,6 +2063,27 @@ impl<'a> Ctx<'a> {
                 // `:mepk lit`: usable mantissa precision).
                 ereal_set(&args[0], &args[1], self.ereal_max_p())?
             }
+            "composeEReal" => {
+                // Lane composition `R.composeEReal[M, E, P, K]`: the
+                // `EReal` counterpart of `composeReal`.
+                if args.len() != 5 {
+                    return Err(FrontError::Resolve(format!("'{name}' expects 5 args")));
+                }
+                let r = self.ereal_op(&args[0])?;
+                let w = &self.res.mepk_widths;
+                let (mw, ew, pw, kw) = (w.m_width, w.e_width, w.p_width, w.k_width);
+                let m = self.compose_lane_or_lit(&args[1], env, mw, "m")?;
+                let e = self.compose_lane_or_lit(&args[2], env, ew, "e")?;
+                let p = self.compose_lane_or_lit(&args[3], env, pw, "p")?;
+                let k = self.compose_lane_or_lit(&args[4], env, kw, "k")?;
+                ereal_and_all(vec![
+                    ereal_icmp(IntCmpOp::Eq, ereal_lane_of(&r, "m"), m),
+                    ereal_icmp(IntCmpOp::Eq, ereal_lane_of(&r, "e"), e),
+                    ereal_icmp(IntCmpOp::Eq, ereal_lane_of(&r, "p"), p),
+                    ereal_icmp(IntCmpOp::Eq, ereal_lane_of(&r, "k"), k),
+                    ereal_wellformed(&r),
+                ])
+            }
             _ => return Ok(None),
         };
         Ok(Some(self.lower_formula(arena, &body, env)?))
@@ -2125,6 +2165,59 @@ impl<'a> Ctx<'a> {
             }
             _ => self.real_op(e).map(Some),
         }
+    }
+
+    /// Integer lane-value argument for `composeReal`/`composeEReal`: an
+    /// integer literal (range-checked against the lane width so
+    /// wraparound never binds silently) or a lane read (`x.m`,
+    /// bitmask-cast). General set expressions are rejected loudly: Int
+    /// singletons need the SUM cast while lanes need the bitmask cast,
+    /// so accepting them would silently misread one side. Bound names
+    /// (quantifier/fun variables, e.g. a fun param named `m`) are never
+    /// read as lanes, even when the label coincides.
+    fn compose_lane_or_lit(
+        &self,
+        e: &Expr,
+        env: &Env,
+        lane_width: u32,
+        lane: &str,
+    ) -> LResult<IntExpr> {
+        let lit = match e {
+            Expr::Name(n, _) => n.parse::<i64>().ok(),
+            Expr::Bits(v, _) => Some(*v),
+            _ => None,
+        };
+        if let Some(v) = lit {
+            let (lo, hi) = lane_range(lane_width);
+            if v < lo || v > hi {
+                return Err(FrontError::Resolve(format!(
+                    "compose argument {v} outside the {lane} lane range [{lo}, {hi}]"
+                )));
+            }
+            return Ok(IntExpr::Lit(v, 0));
+        }
+        if let Expr::Name(n, _) = e {
+            if env.iter().any(|(nm, ..)| nm == n)
+                || self.let_binds.borrow().iter().any(|s| s.contains_key(n))
+                || self.expr_binds.borrow().contains_key(n)
+            {
+                return Err(FrontError::Resolve(format!(
+                    "compose expects an integer literal or lane read for the {lane} lane (got variable `{n}`; pass a literal or `x.{lane}`)"
+                )));
+            }
+        }
+        if self.lane_group_ambiguous(e) {
+            return Err(FrontError::Resolve(
+                "ambiguous EReal lane: a user field shares this label; qualify explicitly"
+                    .to_string(),
+            ));
+        }
+        if self.lane_group_of(e).is_some() {
+            return Ok(IntExpr::BitsVal(Box::new(e.clone()), 0));
+        }
+        Err(FrontError::Resolve(format!(
+            "compose expects an integer literal or lane read for the {lane} lane"
+        )))
     }
 
     /// Static barrel width for scaled interval comparisons:
@@ -5975,6 +6068,17 @@ fn real_div(a: &RealOp, b: &RealOp, r: &RealOp, wv: u32) -> Formula {
 /// `setReal[x, lit]`: bind `x`'s `(m, e)` lanes to the exact dyadic
 /// conversion. Non-dyadic literals fail loudly (no rounding; use the
 /// `setRealNearest/Down/Up` variants below).
+/// Signed range of a lane of `w` bits (two's complement).
+fn lane_range(w: u32) -> (i64, i64) {
+    if w == 0 {
+        return (0, 0);
+    }
+    if w >= 63 {
+        return (i64::MIN, i64::MAX);
+    }
+    (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1)
+}
+
 fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
     // Plain `d`: exact dyadic only; non-dyadic-but-approximable is UNSAT
     // (no dyadic centre equals it). `(d)`: nearest binding.
