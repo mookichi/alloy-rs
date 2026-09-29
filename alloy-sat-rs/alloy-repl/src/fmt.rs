@@ -20,6 +20,12 @@ pub struct DisplayHints {
     /// Field keys `Owner.field` with `EReal` range (rows decode to
     /// `c ± R` instead of raw `->EReal$i` tuples).
     pub ereal_fields: HashSet<String>,
+    /// Unary sig names denoting flat bit sets (`in Real` and friends):
+    /// empty sets read as the Real zero instead of staying raw.
+    pub real_sigs: HashSet<String>,
+    /// Field keys `Owner.field` with flat `Real` range: empty rows read
+    /// as the Real zero instead of staying raw.
+    pub real_fields: HashSet<String>,
 }
 
 fn atom_name(universe: &Universe, idx: u32) -> String {
@@ -301,17 +307,39 @@ pub fn decode_bitset(universe: &Universe, idxs: &[u32]) -> Option<String> {
     }
 }
 
+/// `decode_bitset` plus the Real zero: an empty set reads as
+/// `0 [m=0 e=0]` when known Real-typed (via hints); otherwise empty
+/// stays raw (`None`), so plain empty sigs gain no reading.
+pub fn decode_bitset_typed(
+    universe: &Universe,
+    idxs: &[u32],
+    is_real: bool,
+) -> Option<String> {
+    if idxs.is_empty() {
+        if !is_real {
+            return None;
+        }
+        return match RealCenter::new(0, 0) {
+            Some(v) => Some(format!("{} [m=0 e=0]", v.centre_short())),
+            None => Some("(ill-formed lanes m=0 e=0)".to_string()),
+        };
+    }
+    decode_bitset(universe, idxs)
+}
+
 /// Per-owner rows for a binary relation whose value columns decode as
 /// bit sets: `X$0.r = {M$0, ...} = 0.5 [m=.. e=..]`. Rows that do not
 /// decode keep the per-owner `{X$0->...}` shape. `None` when no row
 /// decodes at all (callers keep the legacy full-relation shape).
 /// `owners` overrides the row list (empty = first columns seen).
+/// `is_real` lets empty rows read as the Real zero.
 pub fn bitset_field_rows_ts(
     universe: &Universe,
     _owner: &str,
     field: &str,
     ts: &TupleSet,
     owners: Vec<u32>,
+    is_real: bool,
 ) -> Option<String> {
     if ts.arity() != 2 {
         return None;
@@ -339,7 +367,7 @@ pub fn bitset_field_rows_ts(
             .map(|&c| atom_name(universe, c))
             .collect::<Vec<_>>()
             .join(", ");
-        let text = decode_bitset(universe, cols);
+        let text = decode_bitset_typed(universe, cols, is_real);
         any |= text.is_some();
         rows.push((o, raw, text));
     }
@@ -358,12 +386,14 @@ pub fn bitset_field_rows_ts(
 }
 
 /// Per-owner rows over the solved instance (owners from the `owner` sig
-/// relation when present).
+/// relation when present). `is_real` lets empty rows read as the Real
+/// zero.
 pub fn bitset_field_rows(
     inst: &Instance,
     owner: &str,
     field: &str,
     ts: &TupleSet,
+    is_real: bool,
 ) -> Option<String> {
     let mut owners: Vec<u32> = Vec::new();
     for (r, ots) in inst.relation_tuples() {
@@ -374,7 +404,7 @@ pub fn bitset_field_rows(
             break;
         }
     }
-    bitset_field_rows_ts(inst.universe(), owner, field, ts, owners)
+    bitset_field_rows_ts(inst.universe(), owner, field, ts, owners, is_real)
 }
 
 /// Decode every `Real$i`/`EReal$i` atom to its lanes plus a one-line
@@ -587,26 +617,36 @@ pub fn instance_alloy_hinted(inst: &Instance, hints: &DisplayHints) -> String {
                     out.push_str(&field_rows_alloy(inst, owner, field, ts));
                     continue;
                 }
+                // Flat bit-set rows first: `EReal`-atom columns never
+                // decode, so reified fields fall through to `ereal_fields`
+                // unchanged, while bit sets gain their reading.
+                if let Some(s) = bitset_field_rows(
+                    inst,
+                    owner,
+                    field,
+                    ts,
+                    hints.real_fields.contains(&format!("{owner}.{field}")),
+                ) {
+                    out.push_str(&s);
+                    continue;
+                }
                 if let Some(ref ev) = ereal {
                     if hints.ereal_fields.contains(&format!("{owner}.{field}")) {
                         out.push_str(&ereal_field_rows(inst, owner, field, ts, ev));
                         continue;
                     }
                 }
-                // Flat bit-set rows decode alongside the raw tuples.
-                if let Some(s) = bitset_field_rows(inst, owner, field, ts) {
-                    out.push_str(&s);
-                    continue;
-                }
             }
         }
         let as_int = ts.arity() == 1 && hints.signed_sigs.contains(name_s);
         let expr = set_alloy_maybe_int(inst.universe(), ts.arity(), ts, as_int);
-        // Flat bit sets gain their real-number reading alongside.
+        // Flat bit sets gain their real-number reading alongside
+        // (empty sets only when Real-typed via hints).
         let mut line = format!("\n {name} = {expr}");
         if ts.arity() == 1 && !as_int && !is_lane_domain(name_s) {
             let idxs: Vec<u32> = ts.index_view().iter().map(|i| i as u32).collect();
-            if let Some(t) = decode_bitset(inst.universe(), &idxs) {
+            let is_real = hints.real_sigs.contains(name_s);
+            if let Some(t) = decode_bitset_typed(inst.universe(), &idxs, is_real) {
                 line.push_str(&format!(" = {t}"));
             }
         }
@@ -626,9 +666,16 @@ pub fn instance_alloy_hinted(inst: &Instance, hints: &DisplayHints) -> String {
         }
     }
     out.push_str("\nints:");
-    for (i, ts) in inst.int_tuples() {
-        let expr = set_alloy(inst.universe(), ts.arity(), ts);
-        out.push_str(&format!("\n {i} = {expr}"));
+    // Builtin ints render as one `Int = {0, 1, ...}` set line like every
+    // other sig (empty layer keeps the bare header).
+    let mut nums: Vec<String> = Vec::new();
+    for (_, ts) in inst.int_tuples() {
+        for i in ts.index_view().iter() {
+            nums.push(atom_name(inst.universe(), i as u32));
+        }
+    }
+    if !nums.is_empty() {
+        out.push_str(&format!("\n Int = {{{}}}", nums.join(", ")));
     }
     out
 }
@@ -640,6 +687,8 @@ pub fn instance_alloy_signed(inst: &Instance, signed: &HashSet<String>) -> Strin
             signed_sigs: signed.clone(),
             signed_fields: HashSet::new(),
             ereal_fields: HashSet::new(),
+            real_sigs: HashSet::new(),
+            real_fields: HashSet::new(),
         },
     )
 }
@@ -818,6 +867,8 @@ mod tests {
         let hints = DisplayHints {
             signed_sigs: HashSet::new(),
             ereal_fields: HashSet::new(),
+            real_sigs: HashSet::new(),
+            real_fields: HashSet::new(),
             signed_fields: ["X.s".to_string()].into_iter().collect(),
         };
         let s = instance_alloy_hinted(&inst, &hints);
@@ -837,6 +888,8 @@ mod tests {
         let hints = DisplayHints {
             signed_sigs: HashSet::new(),
             ereal_fields: HashSet::new(),
+            real_sigs: HashSet::new(),
+            real_fields: HashSet::new(),
             signed_fields: ["X.s".to_string()].into_iter().collect(),
         };
         let s = instance_alloy_hinted(&inst, &hints);
@@ -870,6 +923,8 @@ mod tests {
         let hints = DisplayHints {
             signed_sigs: HashSet::new(),
             ereal_fields: HashSet::new(),
+            real_sigs: HashSet::new(),
+            real_fields: HashSet::new(),
             signed_fields: ["Y.v".to_string()].into_iter().collect(),
         };
         let s = instance_alloy_hinted(&inst, &hints);
@@ -889,6 +944,8 @@ mod tests {
             signed_sigs: HashSet::new(),
             signed_fields: HashSet::new(),
             ereal_fields: ["X.r".to_string()].into_iter().collect(),
+            real_sigs: HashSet::new(),
+            real_fields: HashSet::new(),
         };
         let s = instance_alloy_hinted(&inst, &hints);
         assert!(!s.contains("Real.m ="), "raw lanes leaked: {s}");
@@ -977,6 +1034,7 @@ mod tests {
 
     #[test]
     fn flat_bitset_mixed_sets_stay_raw() {
+
         // Sets mixing lane and non-lane atoms gain no reading.
         let inst = solve_first(
             "sig A {}\nsig X in Real {}\nfact { setReal[X, 0.5] and some A }\nrun {}",
@@ -1008,5 +1066,47 @@ mod tests {
         let t = decode_bitset(u, &bits).expect("decodes");
         assert!(t.contains("[m=8 e=-1 p=4 k=0]"), "got: {t}");
         assert!(t.contains("±"), "got: {t}");
+    }
+
+    fn real_hints() -> DisplayHints {
+        DisplayHints {
+            real_sigs: ["X".to_string()].into_iter().collect(),
+            real_fields: ["H.r".to_string()].into_iter().collect(),
+            ..DisplayHints::default()
+        }
+    }
+
+    #[test]
+    fn flat_empty_real_reads_zero() {
+        // The empty bit set is the Real zero 0.0.
+        let inst = solve_first("sig X in Real {}\nfact { no X }\nrun {}");
+        let s = instance_alloy_hinted(&inst, &real_hints());
+        assert!(s.contains("X = {} = 0 [m=0 e=0]"), "got: {s}");
+        // Plain empty sigs stay raw.
+        let inst = solve_first("sig A {}\nfact { no A }\nrun {}");
+        let s = instance_alloy_hinted(&inst, &real_hints());
+        assert!(s.contains("A = {}"), "got: {s}");
+        assert!(!s.contains("= 0 [m=0 e=0]"), "got: {s}");
+    }
+
+    #[test]
+    fn flat_empty_holder_row_reads_zero() {
+        let inst = solve_first("some sig H { r: Real }\nfact { no H.r }\nrun {}");
+        let s = instance_alloy_hinted(&inst, &real_hints());
+        assert!(s.contains("H$0.r = {} = 0 [m=0 e=0]"), "got: {s}");
+    }
+
+    #[test]
+    fn ints_aggregate_as_int_set() {
+        let inst = solve_first("sig A {}\nrun {} for 8 Int");
+        let s = instance_alloy_hinted(&inst, &DisplayHints::default());
+        assert!(
+            s.contains("Int = {0, 1, 2, 3, 4, 5, 6, 7}"),
+            "got: {s}"
+        );
+        // Empty int layer keeps the bare header.
+        let inst = solve_first("sig A {}\nrun {}");
+        let s = instance_alloy_hinted(&inst, &DisplayHints::default());
+        assert!(!s.contains("Int ="), "got: {s}");
     }
 }

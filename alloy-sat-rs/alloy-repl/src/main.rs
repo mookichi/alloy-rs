@@ -23,7 +23,7 @@ use alloy_front_rs::{
     optimize_with, parse_int_expr, parse_module, query_value, run, run_opt_command_with, solve,
     solve_temporal, validate, validate_temporal, Cnf, CnfKind, CommandKind, Expr,
     IncrementalSession, Instance, KkOptSense, Lowerer, Module, OptSolution, OptTarget,
-    OverflowMode, PartialInstance, QueryValue,
+    OverflowMode, PartialInstance, QueryValue, SigRel,
 };
 use alloy_kodkod_rs::eval::Evaluator;
 use alloy_kodkod_rs::temporal::TemporalEval;
@@ -624,6 +624,16 @@ impl Session {
                             hints.signed_sigs.insert(n.clone());
                             break;
                         }
+                        Some("Real") => {
+                            // Flat bit-set sigs (`in Real` and friends):
+                            // empty sets read as the Real zero.
+                            // (`extends Real` is rejected; `EReal`
+                            // stays reified and excluded here.)
+                            if sd.rel != SigRel::Extends {
+                                hints.real_sigs.insert(n.clone());
+                            }
+                            break;
+                        }
                         Some(p) => cur = p,
                         None => break,
                     }
@@ -639,6 +649,11 @@ impl Session {
                     if expr_is_ereal(&d.expr) {
                         for fname in &d.names {
                             hints.ereal_fields.insert(format!("{owner}.{fname}"));
+                        }
+                    }
+                    if expr_is_real(&d.expr) {
+                        for fname in &d.names {
+                            hints.real_fields.insert(format!("{owner}.{fname}"));
                         }
                     }
                 }
@@ -1475,6 +1490,13 @@ fn wrapping_optimum_note(bitwidth: u32, sol: &OptSolution) -> Option<String> {
                         )
                     }
                 };
+                // Flat bit sets read as Real values when Real-typed
+                // (bare `in Real` sigs, or Real-typed dotted fields);
+                // empty sets then read as the Real zero.
+                let dotted_real = match &dotted {
+                    Some((o, f)) => hints.real_fields.contains(&format!("{o}.{f}")),
+                    None => hints.real_sigs.contains(expr_t),
+                };
                 if as_int && arity == 2 {
                     let (owner, field) = dotted.unwrap();
                     println!(
@@ -1490,6 +1512,7 @@ fn wrapping_optimum_note(bitwidth: u32, sol: &OptSolution) -> Option<String> {
                         &field,
                         &ts,
                         Vec::new(),
+                        dotted_real,
                     ) {
                         Some(s) => println!("{s}"),
                         None => println!(
@@ -1510,7 +1533,9 @@ fn wrapping_optimum_note(bitwidth: u32, sol: &OptSolution) -> Option<String> {
                     if arity == 1 && !as_int && !bare_domain {
                         let idxs: Vec<u32> =
                             ts.index_view().iter().map(|i| i as u32).collect();
-                        if let Some(t) = fmt::decode_bitset(ts.universe(), &idxs) {
+                        if let Some(t) =
+                            fmt::decode_bitset_typed(ts.universe(), &idxs, dotted_real)
+                        {
                             line.push_str(&format!(" = {t}"));
                         }
                     }
@@ -2247,6 +2272,27 @@ fn expr_is_signed(e: &Expr) -> bool {
         | Expr::AtExpr(x) => expr_is_signed(x),
         Expr::Bracket(base, args) => {
             expr_is_signed(base) || args.iter().any(|a| expr_is_signed(a))
+        }
+        _ => false,
+    }
+}
+
+/// True when a field TYPE expression mentions `Real` but not `EReal`
+/// (flat bit-set range: empty rows read as the Real zero). Same shape
+/// walk as `expr_is_signed`.
+fn expr_is_real(e: &Expr) -> bool {
+    match e {
+        Expr::Name(n, _) => n == "Real",
+        Expr::Bin(_, a, b) => expr_is_real(a) || expr_is_real(b),
+        Expr::Transpose(x)
+        | Expr::TClosure(x)
+        | Expr::RClosure(x)
+        | Expr::ArrowMult(_, x)
+        | Expr::LeadMult(_, x)
+        | Expr::Prime(x)
+        | Expr::AtExpr(x) => expr_is_real(x),
+        Expr::Bracket(base, args) => {
+            expr_is_real(base) || args.iter().any(|a| expr_is_real(a))
         }
         _ => false,
     }

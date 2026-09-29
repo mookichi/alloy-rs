@@ -31,7 +31,8 @@ pub use ast::Scope;
 pub use ast::{
     BinOp, CmpKind, Command, CommandKind, Decl, Expr, Formula, IntBinOp, IntCmpOp, IntExpr, Module,
     Open, OpenParam, OptSpec, OverflowMode, PartialDef, PartialEntry, PartialOp, QuantKind, SigDecl,
-    SigMult, DEFAULT_INT_BITWIDTH, effective_bitwidth, effective_int_count, module_needs_int_atoms,
+    SigMult, SigRel, DEFAULT_INT_BITWIDTH, effective_bitwidth, effective_int_count,
+    module_needs_int_atoms,
 };
 pub use lower::{LoweredOpt, LoweredProblem, LoweredTarget, Lowerer, OptMarker, TimePoint};
 pub use cnf::{build_cnf_with, check, run, solve, solve_temporal, validate, validate_temporal, Cnf, CnfKind};
