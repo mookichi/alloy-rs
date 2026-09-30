@@ -37,9 +37,12 @@ Lemma 2 の `+1`（`combine_k`由来）は最悪ケース（項が等大）の�
 ## 3. ERealConstant＋EReal abstract復帰＋als表示
 
 - `als` 出力にEReal認識表示（`front-rs/src/display.rs`、REPLデコーダの移植）。
-  raw lane非表示＋所属atomのみ `EReal$i = c ± R`。lane無し出力はバイト同一維持
-  （`no_lanes_keeps_legacy_shape`）。`-e <name>` は式の値も表示
-  （`format_eval_value`）。非所属atomのゴーストlaneは表示しない
+  lane無し出力はバイト同一維持（`no_ereal_keeps_legacy_shape`）。`-e <name>` は
+  式の値も表示（`format_query_value`）。
+  **2026-09-30 改訂**: 値が「レーン bit の集合」になったため、reify 用の
+  `decode_ereal`/所属 atom 行は削除し、`decode_bitset` がそのまま
+  「集合の横に残り `= c ± R [m=.. e=.. p=.. k=..]` を読む」形になった
+  （`p`/`k` bit が無ければ exact centre）。
 - `-e` は直前実行コマンドのscopeを継承（`inherit_eval_scope`。REPL `:eval` と同則）。
   継承前は既定プロファイルで別解が表示される問題があった。
   `--timing` 側も `run_timed`（parse済み実行）で同一継承
@@ -56,9 +59,15 @@ Lemma 2 の `+1`（`combine_k`由来）は最悪ケース（項が等大）の�
   atom/scope不消費）としてlowering層で解決（`ERealOp::Const`→`IntExpr::Lit`）。
   kodkod AST不変。旧 `$elit` witness hoisting撤廃
   （`wrap_ereal_lit_args`/`fresh_elit` 削除）。`for 0 EReal` でもリテラル述語はSAT
-- 前提が満たされたため `EReal` のカバレッジを復帰（`lower.rs` の exemption 削除）。
-  extenderあり＝親は子に被覆（`one sig x extends EReal` は `EReal=[1 atom]`）。
-  kid無し＝カバレッジなし（自由値・`for N EReal` 維持）。`some EReal - X` 系テスト反転済み
+- **2026-09-30 改訂: `EReal` をフラット型ドメイン化（abstract 復帰は撤回）**。
+  値 atom プールは廃止し、`EReal = $M + $E + $P + $K` を型ドメインとした
+  （`bounds::resolve`）。値は「自己的レーン bit の集合」なので、`extends` の
+  partition/被覆セマンティクス（値 atom を分配するモデル）は成立しない。
+  書き込み側は `sig X in EReal` / holder フィールド、`extends EReal` と
+  `for N EReal` は拒否（`Real` と同形）。`in` sig の多重度は cardinality 式
+  （`one sig X in EReal` は「1 atom = 1 レーン bit」で、値を丸ごと持つには
+  `sig` が要る）。partition/被覆テストは撤销し、ドメイン形（`EReal = $M+…`、
+  `#EReal`）のテストに置き換えた
 
 ## 4. Valid制約の恒久化（前回分）
 
@@ -106,22 +115,28 @@ Valid(m,e,p,k; m_width) :=
   `Mepk::new_valid` を使う。
 - Java 対向物 (`MepkOps.java`)・`mepk.als` ミラーへの反映は未対応。
 
-## 5. builtin `Real` (`EReal extends Real`)
+## 5. builtin `Real` (`Real = $M + $E`)
 
-exact 中心 `c = m·2^e` の親ソート。正規形は `m == 0` (e 自由) または
+exact 中心 `c = m·2^e` の型ドメイン。正規形は `m == 0` (e 自由) または
 `odd(m)`。`M/E` 幅は EReal と共有 (`MEPK_*_WIDTH` 分離なし)。
-`EReal` は `Real` の子として `m/e` を共有し `p/k` のみ独自に持つ。
-`Real` は抽象: extender 存在下では被覆 (`one sig X extends Real` は
-1値に畳む)、`EReal` 単独時は従来通り。`for M EReal <= N Real` を検査
-(互換デフォルトで自動調整)。
+
+**2026-09-30 改訂**: `EReal extends Real` の親リンクは削除。フラット化後は
+`Real = $M+$E` ⊂ `EReal = $M+$E+$P+$K` がドメインとして成り立つので、両者は
+`Int`/`Signed` と同じ「独立した組み込み型ドメイン」である（Alloy の
+`extends` と逆向きの包含になる）。`Real` 値は `p/k` bit を持たないので
+`x.p`/`x.k` は常に 0。`for N Real`/`for N EReal` はともに拒否、幅は
+`for N $M` 等（または `for N Int` の rule）で決める。
 
 ### 5.1. 述語と丸めなし原則
 
 `realAdd/Sub/Mul/Div[c,a,b]`・`realEq/LT/LTE/GT/GTE`・`realWellformed`・
-`realSucc/Pred[b,a]`・`realUp/Down` 関数・`setReal`・
-`setRealNearest/Down/Up`。演算は exact のみ (割切れない除算は UNSAT)。
-`realUp/Down` はレーン successor (指数ウィンドウ探索、brute-force 照合済み);
-関数形は内包 desugar + 述語位置への自動ホイスト (skolem-fast)。
+`realSucc/Pred[b,a]`・`setReal`・`setRealNearest/Down/Up`。演算は exact のみ
+(割切れない除算は UNSAT)。`realSucc/Pred` はレーン successor
+(指数ウィンドウ探索、brute-force 照合済み)。
+**2026-09-30 改訂**: `realUp/Down` 関数形は廃止。値は lane bit の集合で
+「結果を返す 1 atom」が存在しないためで、lowering (`hoist_real_fun[s_call]`)・
+`rup_memo`・`:query` oracle 経路一并に削除。名前を書くと loud error
+(bracket 形の誤読を防ぐ)。
 
 ### 5.2. リテラル近似の明示 opt-in
 
@@ -136,3 +151,41 @@ plain `d` は近似なし (非dyadic は UNSAT、ただし大声エラーでは�
 
 `Down(L) < L` が厳密かつレーン値は全て dyadic のため bracket 判定は
 真値比較と等価。丸め誤差自体は追跡されない (Down+Up で挟む運用)。
+
+### 5.3. 2026-09-30: フラット化の効果測定（**結果は否定**）
+
+`EReal` を `$M+$E+$P+$K` のフラット集合へ移す前後に、同一モデルの
+primary vars を実測した。**変数は減っていない**。
+
+| モデル形状 | reified (HEAD) | flat | 差 |
+|---|---:|---:|---:|
+| `A.x`/`B.y` を `setEReal` で固定 + `erealLT` | 5 729 | 6 800 | +19% |
+| 3 値 holder + `erealAdd` + `erealLT` | 26 718 | 27 402 | +2.6% |
+
+理由は sized upper bound の拮抗である。holder フィールドの上界は
+reified では値 atom プール `N`（`for N EReal` で小さめ）だったが、flat では
+レーンドメイン `Σwidth`（既定 25）になる。一方、消えた 4 本の reified lane
+関係の規模は `N × Σwidth` 程度で、帳尻が合わない。
+
+**得たものはサイズ圧縮ではなく、表現の単純化**である。削除できたもの:
+値 atom プール、`EReal extends Real` の親リンクと包含ガード、partition/被覆/
+cardinality 式、`var_roots`、reified lane 関係 4 本、`decode_ereal` と
+`is_ereal_lane`、unconstrained 行の ill-formed 警告。モデル言語側は
+`{M$3, E$0, P$2}` として値を直接書ける。
+
+### 5.4. 確認した挙動（誤読しやすい点）
+
+- **`EReal` holder フィールド**: `x: set EReal` への `S.x = 3.0` は
+  `m`/`e` を束縛し、`p`/`k` は残りを pinning する（`m=3 e=0` と表示）。
+  `S.x = 3.0 and S.x.p = 5` は `m=3 e=0 p=5` に落ち、明示レーン形の
+  `S.x.m = 3 and S.x.e = 0 and S.x.p = 5 and S.x.k = 0` と**同一**の解に
+  束縛される。owner を限量した `all o: S | o.x = 3.0` も同じ。
+  `expr_is_ereal_rooted` を field join に対応させて `p`/`k` も outright に
+  pin する改造は試みたが**回帰を生む**（arity-2 の whole-relation 形
+  `S.x = 3.0` が `m=12 e=1` に化ける）ので採用せず、現状（m/e 束縛＋
+  p/k は残り）に戻した。
+- **`x: one EReal` は値を保持できない**。値は最低 2 bit（`m` と `e`）を
+  要するが `one` は 1 atom しか許さないため `S.x = 3.0` は UNSAT
+  （`S.x.m = 1` のみ SAT）。値は `x: set EReal` か `sig X in EReal` で
+  保持する。
+- `R.p` の lane ラベルのみの言及は P lane を確保しない。
