@@ -52,6 +52,32 @@ impl SetKind {
 /// parser/lower/snippet diagnostics stay identical).
 pub const INT_MISMATCH_MSG: &str = "type mismatch: integer comparison/arithmetic requires an `Int`/`Signed` set (use `{...}` braces for int literals, e.g. `{0, 2} = 5`)";
 
+/// Faithful-range reading of an integer literal under `W` int atoms:
+/// `v mod 2^W` reinterpreted with signed bitmask weights (the MSB atom
+/// carries `-2^(W-1)`). Integer literals *denote* bit patterns, so `8`
+/// under W=4 is `{3}` = `-8`, `16` is `{}` = `0`, `15` is `{0,1,2,3}` =
+/// `-1`. Values inside `[-2^(W-1), 2^W - 1]` map to themselves
+/// (idempotent). Degenerate widths (`W == 0`, absurdly large `W`) leave
+/// the literal untouched.
+///
+/// Rationale: the W-bit two's-complement vocabulary is exactly the
+/// atom-subset/value bijection (`{1,2} = 6`); the E=`W+1`-bit circuits
+/// keep one headroom bit for computation, but values crossing the
+/// literal boundary are folded here so solver, query and display agree.
+pub fn faithful_int(v: i64, w: u32) -> i64 {
+    if w == 0 || w > 62 {
+        return v;
+    }
+    let m = 1u128 << w;
+    let r = (v as i128).rem_euclid(m as i128) as u128;
+    let half = 1u128 << (w - 1);
+    if r >= half {
+        (r as i128 - m as i128) as i64
+    } else {
+        r as i64
+    }
+}
+
 /// `=`/`!=` rewind rule (`parser.rs::parse_comparison`): when the
 /// relational (set) reading wins over the speculative int reading.
 /// NOTE: deliberately stricter than the `set = int-expr` probe: a
@@ -114,7 +140,7 @@ pub fn leaf_kind(e: &Expr) -> Option<SetKind> {
             }
         }
         Expr::Univ | Expr::None_ | Expr::StepAtom => Some(SetKind::Plain),
-        Expr::Comprehension(..) => Some(SetKind::Unknown),
+        Expr::Comprehension(..) | Expr::Find(..) => Some(SetKind::Unknown),
         _ => None,
     }
 }
@@ -246,5 +272,23 @@ mod tests {
         assert_eq!(leaf_kind(&name("3")), Some(SetKind::Int));
         assert_eq!(leaf_kind(&Expr::Univ), Some(SetKind::Plain));
         assert_eq!(leaf_kind(&name("A")), None);
+    }
+
+    #[test]
+    fn faithful_int_reads() {
+        // W=4: `8` is `{3}` = -8, `16` is `{}` = 0, `15` is `{0,1,2,3}` = -1.
+        assert_eq!(faithful_int(8, 4), -8);
+        assert_eq!(faithful_int(16, 4), 0);
+        assert_eq!(faithful_int(15, 4), -1);
+        // In-range values are fixed points (idempotent).
+        for v in -8..=7 {
+            assert_eq!(faithful_int(v, 4), v);
+        }
+        // W=8: `300` is `{2,3,5}` = 44.
+        assert_eq!(faithful_int(300, 8), 44);
+        assert_eq!(faithful_int(5, 4), 5);
+        assert_eq!(faithful_int(-8, 4), -8);
+        // Degenerate widths leave literals untouched.
+        assert_eq!(faithful_int(100, 0), 100);
     }
 }

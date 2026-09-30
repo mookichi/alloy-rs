@@ -1198,44 +1198,124 @@ impl Parser {
                     return Ok(Expr::Name(v.to_string(), byte));
                 }
             }
-            self.pos = save;
         }
+        // A failed (or unusable) int probe must not consume input.
+        self.pos = save;
         self.rel_expr_top(in_sig)
     }
 
-    /// `{x: D | F}` / `{x: D}` comprehension, or `{a, b, ...}` set
-    /// literal (extension: Java rejects the latter). Declarations win
-    /// when parseable (`{x: X, y: Y}` binds two names); otherwise rewind
-    /// and read a union list. `{}` is the empty set literal (needed so
-    /// the REPL's `{...}` display/save format round-trips); `none` stays
-    /// accepted as before. Called with `{` as the pending token.
+    /// `{x: D | F}` / `{x: D}` comprehension, `{[any|min|max] x in D | F}`
+    /// value-finding form, or `{a, b, ...}` set literal (extension: Java
+    /// rejects the latter). Declarations win when parseable (`{x: X, y: Y}`
+    /// binds two names); otherwise a single-binder `in`-form is tried
+    /// (value sorts `Int`/`Real` only); otherwise rewind and read a union
+    /// list. `{}` is the empty set literal (needed so the REPL's `{...}`
+    /// display/save format round-trips); `none` stays accepted as before.
+    /// Called with `{` as the pending token.
     fn braced_set(&mut self, in_sig: bool) -> PResult<Expr> {
         self.bump();
         if self.eat(&Tok::RBrace) {
             return Ok(Expr::None_);
         }
         let after_brace = self.pos;
-        match self.quant_decls() {
-            Ok(ds) => {
-                let f = if self.eat(&Tok::Bar) {
-                    self.formula()?
-                } else {
-                    Formula::Const(true)
-                };
-                self.expect(&Tok::RBrace)?;
-                Ok(Expr::Comprehension(ds, Box::new(f)))
-            }
-            Err(_) => {
-                self.pos = after_brace;
-                let mut e = self.set_literal_element(in_sig)?;
-                while self.eat(&Tok::Comma) {
-                    let r = self.set_literal_element(in_sig)?;
-                    e = Expr::Bin(BinOp::Union, Box::new(e), Box::new(r));
-                }
-                self.expect(&Tok::RBrace)?;
-                Ok(e)
-            }
+        if let Ok(ds) = self.quant_decls(true) {
+            let f = if self.eat(&Tok::Bar) {
+                self.formula()?
+            } else {
+                Formula::Const(true)
+            };
+            self.expect(&Tok::RBrace)?;
+            return Ok(Expr::Comprehension(ds, Box::new(f)));
         }
+        // Value-finding `{[any|min|max] x in D | F}`: detected by the
+        // exact shape `{` [sel] name `in` (a set literal can never hold
+        // it — `in` is formula-level). Once detected, errors are specific
+        // (no silent fallback to a literal).
+        self.pos = after_brace;
+        if self.at_find_form() {
+            return self.find_form();
+        }
+        self.pos = after_brace;
+        let mut e = self.set_literal_element(in_sig)?;
+        while self.eat(&Tok::Comma) {
+            let r = self.set_literal_element(in_sig)?;
+            e = Expr::Bin(BinOp::Union, Box::new(e), Box::new(r));
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(e)
+    }
+
+    /// Lookahead for the value-finding form (no input consumed):
+    /// `{` [`any`|`min`|`max`] name `in`. The selector words are
+    /// contextual — `{min, X}` stays a literal, `sig min {}` still parses.
+    fn at_find_form(&self) -> bool {
+        // Offset of the binder name: 1 past a leading selector word.
+        let name_at = match self.peek() {
+            Tok::Ident(s) if s == "any" || s == "min" || s == "max" => {
+                match self.peek_at(1) {
+                    Tok::Ident(_) => 1,
+                    _ => return false,
+                }
+            }
+            Tok::Ident(_) => 0,
+            _ => return false,
+        };
+        matches!(
+            if name_at == 0 {
+                self.peek_at(1)
+            } else {
+                self.peek_at(2)
+            },
+            Tok::In
+        )
+    }
+
+    /// Parse `{[any|min|max] x in D | F}` (called only after
+    /// [`Self::at_find_form`]). Single binder; the domain must be a value
+    /// sort — `in` over general sets duplicates `{x: D | F}` and is
+    /// rejected with a pointer to it. `{x in D}` without a filter is the
+    /// subset predicate, not a set.
+    fn find_form(&mut self) -> PResult<Expr> {
+        let sel = match self.peek() {
+            Tok::Ident(s) if s == "any" => FindSel::Any,
+            Tok::Ident(s) if s == "min" => FindSel::Min,
+            Tok::Ident(s) if s == "max" => FindSel::Max,
+            _ => FindSel::All,
+        };
+        if sel != FindSel::All {
+            self.bump();
+        }
+        let pos = self.pos();
+        let name = self.bind_name()?;
+        self.expect(&Tok::In)?;
+        let dom = self.quant_domain(true)?;
+        let value_sort = matches!(&dom, Expr::IntAtom)
+            || matches!(&dom, Expr::Name(n, _) if n == "Real");
+        if !value_sort {
+            return Err(self.err(
+                "`{x in D | F}` needs a value sort (`Int` or `Real`); \
+                 for general sets write the filtering form `{x: D | F}`",
+            ));
+        }
+        if !self.eat(&Tok::Bar) {
+            return Err(self.err(
+                "`{x in D}` is a subset predicate, not a set; \
+                 write `{x in D | F}` to find a value",
+            ));
+        }
+        let body = self.formula()?;
+        self.expect(&Tok::RBrace)?;
+        Ok(Expr::Find(
+            sel,
+            vec![Decl {
+                disj: false,
+                names: vec![name],
+                expr: dom,
+                pos,
+                is_var: false,
+            }],
+            Box::new(body),
+        ))
     }
 
     fn parse_primary(&mut self, in_sig: bool) -> PResult<Expr> {
@@ -1770,7 +1850,7 @@ impl Parser {
                     let e = self.rel_expr_top(false)?;
                     return Ok(Formula::Multi(qk, e, pos));
                 }
-                let ds = self.quant_decls()?;
+                let ds = self.quant_decls(false)?;
                 // both `all x: D | F` and `all x: D { F }` forms
                 let body = if matches!(self.peek(), Tok::Bar) {
                     self.bump(); // consume |
@@ -1793,10 +1873,10 @@ impl Parser {
         }
     }
 
-    fn quant_decls(&mut self) -> PResult<Vec<Decl>> {
+    fn quant_decls(&mut self, strip_set: bool) -> PResult<Vec<Decl>> {
         let mut out = Vec::new();
         loop {
-            let d = self.decl_names_then_domain()?;
+            let d = self.decl_names_then_domain(strip_set)?;
             out.push(d);
             if matches!(self.peek(), Tok::Comma) {
                 self.bump();
@@ -1809,7 +1889,12 @@ impl Parser {
 
     /// names [: domain] — domain optional only in `all x` (unsupported);
     /// here domain is required.
-    fn decl_names_then_domain(&mut self) -> PResult<Decl> {
+    ///
+    /// `strip_set`: tolerate a leading `set` multiplicity on the domain
+    /// (comprehension `{x: set T | F}` reads as `{x: T | F}` — element
+    /// iteration, never a set-of-sets; cf. AlloyMax `set Course` in
+    /// `parse_maxsome`). Quantifiers and `sum` keep the strict reading.
+    fn decl_names_then_domain(&mut self, strip_set: bool) -> PResult<Decl> {
         let pos = self.pos();
         let mut disj = false;
         while self.eat(&Tok::Disj) {
@@ -1835,7 +1920,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::Colon)?;
-        let expr = self.quant_domain()?;
+        let expr = self.quant_domain(strip_set)?;
         Ok(Decl {
             disj,
             names,
@@ -1848,7 +1933,18 @@ impl Parser {
     /// Binding domain (`x: D` in quantifiers, comprehensions, `sum`):
     /// pure literal arithmetic folds (`x: 1+2` binds `{3}`), anything
     /// else parses relationally (`x: A + B` stays a union).
-    fn quant_domain(&mut self) -> PResult<Expr> {
+    ///
+    /// `strip_set`: tolerate a leading `set` multiplicity (comprehension
+    /// only; see `decl_names_then_domain`).
+    fn quant_domain(&mut self, strip_set: bool) -> PResult<Expr> {
+        if strip_set {
+            // `{x: set T | F}`: drop the leading multiplicity so the
+            // comprehension binds elements of `T`. A bare `set` can never
+            // start a relational expression (`parse_primary` rejects
+            // `SetKw`, and no sig can be named `set`), so this only turns
+            // a former parse error into the element reading.
+            self.eat(&Tok::SetKw);
+        }
         let save = self.pos;
         let byte = self.pos();
         if let Ok(ie) = self.int_expr() {
@@ -1860,8 +1956,10 @@ impl Parser {
                     return Ok(Expr::Name(v.to_string(), byte));
                 }
             }
-            self.pos = save;
         }
+        // A failed (or unusable) int probe must not consume input:
+        // `(1.3)` fails as an int tree after `(` but parses relationally.
+        self.pos = save;
         self.rel_expr_top(false)
     }
 
@@ -2198,7 +2296,7 @@ impl Parser {
                 // Quantified `sum x: D | ie`, or `sum e` over a unary set
                 // (Java accepts both; the latter is the SUM cast).
                 let save = self.pos;
-                match self.quant_decls() {
+                match self.quant_decls(false) {
                     Ok(ds) => {
                         self.expect(&Tok::Bar)?;
                         let ie = self.int_expr()?;

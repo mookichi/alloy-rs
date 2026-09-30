@@ -15,6 +15,8 @@ use alloy_kodkod_rs::real::{
 use alloy_kodkod_rs::mepk::decimal_rational;
 use alloy_kodkod_rs::opt::OptSense;
 use alloy_kodkod_rs::relation::{RelationId, RelationPool};
+use alloy_kodkod_rs::universe::Universe;
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -88,6 +90,32 @@ type BindEntry = (ExprId, u32, SetKind);
 /// Variable environment: name -> (kodkod var, arity, abstract flavor).
 type Env = Vec<(String, kk::VarId, u32, SetKind)>;
 
+/// Builtin numeric lanes: (`owner`, `lane`, `group`) for the `Real`
+/// centre (`Real.m`, `Real.e`) plus the `EReal`-only lanes (`EReal.p`,
+/// `EReal.k`). `EReal` reads its centre through the shared `Real.m`/`Real.e`
+/// (`EReal extends Real`).
+fn builtin_lanes() -> Vec<(&'static str, &'static str, u32)> {
+    crate::bounds::REAL_LANES
+        .iter()
+        .map(|(f, g)| ("Real", *f, *g))
+        .chain(
+            crate::bounds::EREAL_EXTRA_LANES
+                .iter()
+                .map(|(f, g)| ("EReal", *f, *g)),
+        )
+        .collect()
+}
+
+/// Relation handles interned once and shared by the query and model-setup
+/// paths (`with_query_ctx` / `with_setup`).
+struct Interned {
+    rels: HashMap<String, RelationId>,
+    field_arity: HashMap<String, u32>,
+    field_int: HashMap<String, SetKind>,
+    ordering_info: HashMap<String, (RelationId, RelationId)>,
+    open_params: HashMap<String, Vec<String>>,
+}
+
 impl<'m> Lowerer<'m> {
     pub fn new(module: &'m Module) -> Lowerer<'m> {
         Lowerer { module }
@@ -151,15 +179,22 @@ impl<'m> Lowerer<'m> {
             || body_soft;
         let (arena, bounds, bitwidth, markers, (formula, objective, overflow)) =
             self.with_setup(&scope, |ctx, arena, _bounds, mut parts| {
+                // Faithful-literal reading is a solver/query-uniform input
+                // doctrine: user-syntax integer literals denote bit patterns
+                // (`8` under W=4 is `{3}` = `-8`). Fold once here so
+                // lowering-internal literals stay raw.
+                let w = crate::ast::effective_int_count(&scope);
                 // global facts
                 for (_, f) in &ctx.module.facts {
-                    parts.push(ctx.lower_formula(arena, f, &mut Vec::new())?);
+                    let ff = fold_user_lits_formula(f, w);
+                    parts.push(ctx.lower_formula(arena, &ff, &mut Vec::new())?);
                 }
                 // sig facts: all this: S | fact
                 for sd in &ctx.module.sigs {
                     if let Some(f) = &sd.fact {
+                        let ff = fold_user_lits_formula(f, w);
                         for owner in &sd.names {
-                            let fid = ctx.lower_sig_fact(arena, f, owner)?;
+                            let fid = ctx.lower_sig_fact(arena, &ff, owner)?;
                             parts.push(fid);
                         }
                     }
@@ -362,10 +397,139 @@ impl<'m> Lowerer<'m> {
                         }
                     }
                 }
+                // General user `extends` hierarchies (everything the
+                // Real-rooted block above does not own): Alloy partition
+                // semantics. Each extender is a subset of its parent,
+                // sibling extenders are disjoint, and an `abstract`
+                // parent is covered by its direct extenders. Without
+                // these, an abstract parent solves to `{}` and `x in
+                // Parent` misses extender atoms. (Parents rooted at
+                // `Real`/`EReal` stay with the block above, which carries
+                // the value-sort exceptions.)
+                {
+                    use std::collections::HashSet;
+                    // Parents owned by the Real-rooted block: `Real` plus
+                    // the transitive `extends` closure beneath it (mirrors
+                    // that block's `rooted` computation).
+                    let mut real_owned: HashSet<String> = HashSet::new();
+                    real_owned.insert("Real".to_string());
+                    if !ctx.res.ereal_atoms.is_empty() {
+                        real_owned.insert("EReal".to_string());
+                    }
+                    loop {
+                        let mut grew = false;
+                        for sd in &ctx.module.sigs {
+                            if sd.rel != crate::ast::SigRel::Extends {
+                                continue;
+                            }
+                            if let Some(p) = &sd.extends {
+                                if real_owned.contains(p) {
+                                    for n in &sd.names {
+                                        if real_owned.insert(n.clone()) {
+                                            grew = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !grew {
+                            break;
+                        }
+                    }
+                    let mut kids_of: HashMap<String, Vec<String>> = HashMap::new();
+                    for sd in &ctx.module.sigs {
+                        if sd.rel != crate::ast::SigRel::Extends {
+                            continue; // `in`-children: subset-only rule above.
+                        }
+                        if let Some(p) = &sd.extends {
+                            if real_owned.contains(p) {
+                                continue;
+                            }
+                            let e = kids_of.entry(p.clone()).or_default();
+                            for n in &sd.names {
+                                if !e.contains(n) {
+                                    e.push(n.clone());
+                                }
+                            }
+                        }
+                    }
+                    let rel_of = |ctx: &Ctx<'_>, name: &str| {
+                        ctx.lookup_rel(name).ok_or_else(|| {
+                            FrontError::Resolve(format!("unknown sig '{name}'"))
+                        })
+                    };
+                    // `no (A op B)` helper (same shape as the Real block).
+                    let no_some = |arena: &mut kk::AstArena,
+                                   op: kk::BinaryOp,
+                                   a: RelationId,
+                                   b: RelationId| {
+                        let ae = arena.expr_relation(a);
+                        let be = arena.expr_relation(b);
+                        let combined = arena
+                            .binary_expr(op, ae, be)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        let some = arena
+                            .multiplicity_formula(Multiplicity::Some, combined)
+                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                        Ok::<_, FrontError>(arena.not(some))
+                    };
+                    let mut parents: Vec<String> = kids_of.keys().cloned().collect();
+                    parents.sort();
+                    for p in &parents {
+                        let kids = &kids_of[p];
+                        let pe = rel_of(ctx, p)?;
+                        // subset: kid in parent.
+                        for k in kids {
+                            let ke = rel_of(ctx, k)?;
+                            parts.push(no_some(arena, kk::BinaryOp::Difference, ke, pe)?);
+                        }
+                        // disjoint siblings.
+                        for (i, a) in kids.iter().enumerate() {
+                            for b in &kids[..i] {
+                                let ae = rel_of(ctx, a)?;
+                                let be = rel_of(ctx, b)?;
+                                parts.push(no_some(
+                                    arena,
+                                    kk::BinaryOp::Intersection,
+                                    ae,
+                                    be,
+                                )?);
+                            }
+                        }
+                        // coverage iff the parent is `abstract`: no
+                        // (parent - union(kids)). Non-abstract parents
+                        // stay flexible (Java parity).
+                        let abstract_parent = ctx.module.sigs.iter().any(|sd| {
+                            sd.names.iter().any(|n| n == p)
+                                && sd.mult == crate::ast::SigMult::Abstract
+                        });
+                        if abstract_parent {
+                            let mut union = {
+                                let first = rel_of(ctx, &kids[0])?;
+                                arena.expr_relation(first)
+                            };
+                            for k in &kids[1..] {
+                                let ke = arena.expr_relation(rel_of(ctx, k)?);
+                                union = arena
+                                    .binary_expr(kk::BinaryOp::Union, union, ke)
+                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            }
+                            let pe2 = arena.expr_relation(pe);
+                            let diff = arena
+                                .binary_expr(kk::BinaryOp::Difference, pe2, union)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            let some_diff = arena
+                                .multiplicity_formula(Multiplicity::Some, diff)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                            parts.push(arena.not(some_diff));
+                        }
+                    }
+                }
                 // AlloyMax `soft fact`s: lowered and wrapped as soft
                 // formulas (optimized, not asserted).
                 for (_, f) in &ctx.module.soft_facts {
-                    let bf = ctx.lower_formula(arena, f, &mut Vec::new())?;
+                    let ff = fold_user_lits_formula(f, w);
+                    let bf = ctx.lower_formula(arena, &ff, &mut Vec::new())?;
                     parts.push(arena.soft_fact(bf));
                 }
                 // command body
@@ -412,7 +576,10 @@ impl<'m> Lowerer<'m> {
                             body => (body, None),
                         };
                         overflow = mode;
-                        let bf = ctx.lower_formula(arena, body, &mut Vec::new())?;
+                        let bf = {
+                            let fb = fold_user_lits_formula(body, w);
+                            ctx.lower_formula(arena, &fb, &mut Vec::new())?
+                        };
                         // `check F` searches for a counterexample to F
                         if negate {
                             parts.push(arena.not(bf));
@@ -437,7 +604,8 @@ impl<'m> Lowerer<'m> {
                     (Some(sense), Some(spec)) => {
                         let target = match spec {
                             OptSpec::Int(ie) => {
-                                LoweredTarget::Int(ctx.lower_int(arena, &ie, &mut Vec::new())?)
+                                let ie2 = fold_user_lits_int(&ie, w);
+                                LoweredTarget::Int(ctx.lower_int(arena, &ie2, &mut Vec::new())?)
                             }
                             OptSpec::Weights(pairs) => {
                                 let mut weights = HashMap::new();
@@ -503,8 +671,13 @@ impl<'m> Lowerer<'m> {
         arena: &mut kk::AstArena,
         e: &Expr,
     ) -> LResult<(kk::ExprId, u32)> {
+        // Faithful-literal reading is a query/solve-uniform input doctrine:
+        // fold user-syntax literals before lowering (lowering-internal
+        // literals are built later and stay raw).
+        let w = crate::ast::effective_int_count(scope);
+        let e = fold_user_lits_expr(e, w);
         self.with_query_ctx(scope, arena, |ctx, arena| {
-            ctx.lower_expr(arena, e, &mut Vec::new())
+            ctx.lower_expr(arena, &e, &mut Vec::new())
         })
     }
 
@@ -517,8 +690,10 @@ impl<'m> Lowerer<'m> {
         arena: &mut kk::AstArena,
         ie: &IntExpr,
     ) -> LResult<kk::IntId> {
+        let w = crate::ast::effective_int_count(scope);
+        let ie = fold_user_lits_int(ie, w);
         self.with_query_ctx(scope, arena, |ctx, arena| {
-            ctx.lower_int(arena, ie, &mut Vec::new())
+            ctx.lower_int(arena, &ie, &mut Vec::new())
         })
     }
 
@@ -531,51 +706,35 @@ impl<'m> Lowerer<'m> {
         arena: &mut kk::AstArena,
         f: &Formula,
     ) -> LResult<kk::FormulaId> {
+        let w = crate::ast::effective_int_count(scope);
+        let f = fold_user_lits_formula(f, w);
         self.with_query_ctx(scope, arena, |ctx, arena| {
-            ctx.lower_formula(arena, f, &mut Vec::new())
+            ctx.lower_formula(arena, &f, &mut Vec::new())
         })
     }
 
     /// Shared query-time setup: resolve the scope, re-intern relation names
     /// into the caller-provided arena, and run `f` with the lowering
     /// context. Typing info only; no bounds are (re)built here.
-    fn with_query_ctx<R>(
-        &mut self,
-        scope: &Scope,
-        arena: &mut kk::AstArena,
-        f: impl FnOnce(&Ctx<'_>, &mut kk::AstArena) -> LResult<R>,
-    ) -> LResult<R> {
-        let res = bounds::resolve(self.module, scope).map_err(FrontError::Resolve)?;
-        // Re-intern only: names already present keep their IDs.
-        // Unallocated builtins bind nothing (no empty shells).
+    /// Interns sig/field/lane/ordering relations and collects the
+    /// arity/flavor/param side tables. Unallocated builtins bind nothing
+    /// (no empty shells, mirroring the invisible `Int`). Re-interning is
+    /// idempotent: names already present keep their IDs.
+    fn intern_relations(&self, res: &Resolved, arena: &mut kk::AstArena) -> LResult<Interned> {
+        // Sig relations.
         let mut rels: HashMap<String, RelationId> = HashMap::new();
         for name in res.sigs.keys() {
-            if crate::bounds::is_unallocated_builtin(&res, name) {
+            if crate::bounds::is_unallocated_builtin(res, name) {
                 continue;
             }
             let r = arena.relation(name, 1);
             rels.insert(name.clone(), r);
         }
         let mut field_arity: HashMap<String, u32> = HashMap::new();
-        // Builtin `Real` centre lanes (`Real.m`, `Real.e`) plus the
-        // `EReal`-only lanes (`EReal.p`, `EReal.k`); all binary
-        // `owner -> lane-atoms`. `EReal` reads its centre through the
-        // shared `Real.m`/`Real.e` (`EReal extends Real`). Unallocated
-        // lanes declare nothing (no empty shells, mirroring bounds).
-        for (owner, fname, group) in crate::bounds::REAL_LANES
-            .iter()
-            .map(|(f, g)| ("Real", *f, *g))
-            .chain(
-                crate::bounds::EREAL_EXTRA_LANES
-                    .iter()
-                    .map(|(f, g)| ("EReal", *f, *g)),
-            )
-        {
-            if res
-                .lane_atoms
-                .get(&group)
-                .map_or(true, |v| v.is_empty())
-            {
+        // Builtin numeric lanes (binary `owner -> lane-atoms`); unallocated
+        // lanes declare nothing.
+        for (owner, fname, group) in builtin_lanes() {
+            if res.lane_atoms.get(&group).map_or(true, |v| v.is_empty()) {
                 continue;
             }
             let key = format!("{owner}.{fname}");
@@ -583,12 +742,13 @@ impl<'m> Lowerer<'m> {
             field_arity.insert(key.clone(), 2);
             rels.insert(key, fa);
         }
+        // Field relations (per owning sig name).
         for sd in &self.module.sigs {
             for owner in &sd.names {
                 for d in &sd.fields {
                     for fname in &d.names {
                         let key = format!("{owner}.{fname}");
-                        let ta = self.type_arity(&d.expr, &res)?;
+                        let ta = self.type_arity(&d.expr, res)?;
                         let fa = arena.relation(&key, 1 + ta);
                         field_arity.insert(key.clone(), 1 + ta);
                         rels.insert(key, fa);
@@ -596,6 +756,7 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
+        // `util/ordering` expansion relations.
         let mut ordering_info: HashMap<String, (RelationId, RelationId)> = HashMap::new();
         for open in &self.module.opens {
             if open.path != "util/ordering" || open.params.is_empty() {
@@ -605,6 +766,7 @@ impl<'m> Lowerer<'m> {
             let next_rel = arena.relation(&format!("${}_next", open.alias), 2);
             ordering_info.insert(open.alias.clone(), (first_rel, next_rel));
         }
+        // Open params: alias -> parameter type names.
         let mut open_params: HashMap<String, Vec<String>> = HashMap::new();
         for open in &self.module.opens {
             let params: Vec<String> = open
@@ -618,6 +780,7 @@ impl<'m> Lowerer<'m> {
                 open_params.insert(open.alias.clone(), params);
             }
         }
+        // Int-flavored fields, plus Int-flavored builtin lanes when allocated.
         let mut field_int: HashMap<String, SetKind> = HashMap::new();
         for sd in &self.module.sigs {
             for owner in &sd.names {
@@ -631,35 +794,38 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
-        // Builtin `Real`/`EReal` lanes are Int-flavored (bitmask-readable)
-        // when allocated; unallocated lanes declare nothing.
-        for (owner, fname, group) in crate::bounds::REAL_LANES
-            .iter()
-            .map(|(f, g)| ("Real", *f, *g))
-            .chain(
-                crate::bounds::EREAL_EXTRA_LANES
-                    .iter()
-                    .map(|(f, g)| ("EReal", *f, *g)),
-            )
-        {
-            if res
-                .lane_atoms
-                .get(&group)
-                .map_or(true, |v| v.is_empty())
-            {
+        for (owner, fname, group) in builtin_lanes() {
+            if res.lane_atoms.get(&group).map_or(true, |v| v.is_empty()) {
                 continue;
             }
             field_int.insert(format!("{owner}.{fname}"), SetKind::Int);
         }
+        Ok(Interned {
+            rels,
+            field_arity,
+            field_int,
+            ordering_info,
+            open_params,
+        })
+    }
+
+    fn with_query_ctx<R>(
+        &mut self,
+        scope: &Scope,
+        arena: &mut kk::AstArena,
+        f: impl FnOnce(&Ctx<'_>, &mut kk::AstArena) -> LResult<R>,
+    ) -> LResult<R> {
+        let res = bounds::resolve(self.module, scope).map_err(FrontError::Resolve)?;
+        let it = self.intern_relations(&res, &mut *arena)?;
         let ctx = Ctx {
             module: self.module,
             res: &res,
-            rels: &rels,
-            field_arity: &field_arity,
-            field_int,
-            ordering_info: &ordering_info,
+            rels: &it.rels,
+            field_arity: &it.field_arity,
+            field_int: it.field_int,
+            ordering_info: &it.ordering_info,
             depth: std::cell::Cell::new(0),
-            open_params,
+            open_params: it.open_params,
             expr_binds: std::cell::RefCell::new(HashMap::new()),
             let_binds: std::cell::RefCell::new(Vec::new()),
             var_roots: std::cell::RefCell::new(HashMap::new()),
@@ -686,36 +852,27 @@ impl<'m> Lowerer<'m> {
         let mut arena = kk::AstArena::with_pool(Arc::clone(&pool));
         let mut b = Bounds::new(&res.universe, &pool);
 
-        // sig relations + exact bounds (unallocated builtins bind
-        // nothing: no empty shells, mirroring the invisible `Int`).
-        let mut rels: HashMap<String, RelationId> = HashMap::new();
-        for name in res.sigs.keys() {
-            if crate::bounds::is_unallocated_builtin(&res, name) {
-                continue;
-            }
-            let r = arena.relation(name, 1);
-            rels.insert(name.clone(), r);
-        }
+        // Relation handles are interned once (see `intern_relations`); below
+        // only adds bounds and `var` markings.
+        let mut it = self.intern_relations(&res, &mut arena)?;
         // mark var sig relations as variable (atoms may change between states)
         for sd in &self.module.sigs {
             if sd.is_var {
                 for name in &sd.names {
-                    if let Some(&r) = rels.get(name.as_str()) {
+                    if let Some(&r) = it.rels.get(name.as_str()) {
                         arena.set_variable(r, true);
                     }
                 }
             }
         }
-        // field relations (per owning sig name)
-        let mut field_arity: HashMap<String, u32> = HashMap::new();
+        // Field upper bounds (relations already interned above).
         for sd in &self.module.sigs {
             for owner in &sd.names {
                 for d in &sd.fields {
                     for fname in &d.names {
                         let key = format!("{owner}.{fname}");
                         let ta = self.type_arity(&d.expr, &res)?;
-                        let fa = arena.relation(&key, 1 + ta);
-                        field_arity.insert(key.clone(), 1 + ta);
+                        let fa = it.rels[&key];
                         // upper bound: owner atoms x type tuples
                         let owner_atoms = res.atoms_of(owner);
                         let tuples = self.type_tuples(&d.expr, &res)?;
@@ -739,7 +896,6 @@ impl<'m> Lowerer<'m> {
                         }
                         b.bound(fa, &lo, &ts)
                             .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        rels.insert(key.clone(), fa);
                     }
                 }
             }
@@ -751,23 +907,14 @@ impl<'m> Lowerer<'m> {
         // `Real` values read through the `x & $M`/`x & $E` partition, so
         // the old full-closure upper only produced unconstrained-tuple
         // warnings); `EReal.p`/`EReal.k` likewise. Allocated lazily.
-        for (owner, fname, group) in crate::bounds::REAL_LANES
-            .iter()
-            .map(|(f, g)| ("Real", *f, *g))
-            .chain(
-                crate::bounds::EREAL_EXTRA_LANES
-                    .iter()
-                    .map(|(f, g)| ("EReal", *f, *g)),
-            )
-        {
+        for (owner, fname, group) in builtin_lanes() {
             let lane = res.lane_atoms.get(&group).cloned().unwrap_or_default();
             // Unallocated lanes bind nothing (no empty shells).
             if lane.is_empty() {
                 continue;
             }
             let key = format!("{owner}.{fname}");
-            let fa = arena.relation(&key, 2);
-            field_arity.insert(key.clone(), 2);
+            let fa = it.rels[&key];
             let mut ts =
                 alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
                     .map_err(|e| FrontError::Resolve(e.to_string()))?;
@@ -784,7 +931,6 @@ impl<'m> Lowerer<'m> {
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
             b.bound(fa, &lo, &ts)
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
-            rels.insert(key, fa);
         }
         // `totalOrder[S, S.next]`: pin the binary field relation
         // (i.e. `S<:next`) to the canonical chain
@@ -794,7 +940,7 @@ impl<'m> Lowerer<'m> {
         // ------------------------------------------------------------------
         for (sig_name, field_name) in collect_total_order_pins(self.module) {
             let key = format!("{sig_name}.{field_name}");
-            let Some(&fr) = rels.get(&key) else {
+            let Some(&fr) = it.rels.get(&key) else {
                 return Err(FrontError::Resolve(format!(
                     "totalOrder: unknown field '{key}'"
                 )));
@@ -805,7 +951,7 @@ impl<'m> Lowerer<'m> {
                     "totalOrder: unknown sig '{sig_name}'"
                 )));
             }
-            let fa = field_arity.get(&key).copied().unwrap_or(2);
+            let fa = it.field_arity.get(&key).copied().unwrap_or(2);
             if fa != 2 {
                 return Err(FrontError::Resolve(format!(
                     "totalOrder: field '{key}' must be binary (got arity {fa})"
@@ -832,7 +978,6 @@ impl<'m> Lowerer<'m> {
         // Native ordering expansion: pin fresh relations to a fixed total
         // order for `open util/ordering[T] as ord`.
         // ------------------------------------------------------------------
-        let mut ordering_info: HashMap<String, (RelationId, RelationId)> = HashMap::new();
         for open in &self.module.opens {
             if open.path != "util/ordering" || open.params.is_empty() {
                 continue;
@@ -844,7 +989,7 @@ impl<'m> Lowerer<'m> {
             let alias = &open.alias;
 
             // $alias_first: unary relation = {a0} (the first atom)
-            let first_rel = arena.relation(&format!("${alias}_first"), 1);
+            let first_rel = it.ordering_info[alias].0;
             let mut first_ts = alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 1)
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
             if let Some(a0) = atoms.first() {
@@ -859,7 +1004,7 @@ impl<'m> Lowerer<'m> {
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
 
             // $alias_next: binary relation = {(a0,a1), (a1,a2), ..., (a_{n-2},a_{n-1})}
-            let next_rel = arena.relation(&format!("${alias}_next"), 2);
+            let next_rel = it.ordering_info[alias].1;
             let mut next_ts = alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
             for w in atoms.windows(2) {
@@ -873,7 +1018,6 @@ impl<'m> Lowerer<'m> {
             b.bound_exactly(next_rel, &next_ts)
                 .map_err(|e| FrontError::Resolve(e.to_string()))?;
 
-            ordering_info.insert(alias.clone(), (first_rel, next_rel));
         }
 
         // int atom exact bounds (lazy: skipped entirely when the module
@@ -921,68 +1065,20 @@ impl<'m> Lowerer<'m> {
         }
 
         // Insert ordering relations into rels so name resolution can find them
-        for (alias, &(first_rel, next_rel)) in &ordering_info {
-            rels.insert(format!("{alias}/first"), first_rel);
-            rels.insert(format!("{alias}/next"), next_rel);
+        for (alias, &(first_rel, next_rel)) in &it.ordering_info {
+            it.rels.insert(format!("{alias}/first"), first_rel);
+            it.rels.insert(format!("{alias}/next"), next_rel);
         }
 
-        // Build open_params: alias -> parameter type names
-        let mut open_params: HashMap<String, Vec<String>> = HashMap::new();
-        for open in &self.module.opens {
-            let params: Vec<String> = open
-                .params
-                .iter()
-                .map(|p| match p {
-                    OpenParam::Exactly(n) | OpenParam::Set(n) => n.clone(),
-                })
-                .collect();
-            if !params.is_empty() {
-                open_params.insert(open.alias.clone(), params);
-            }
-        }
-
-        let mut field_int: HashMap<String, SetKind> = HashMap::new();
-        for sd in &self.module.sigs {
-            for owner in &sd.names {
-                for d in &sd.fields {
-                    for fname in &d.names {
-                        field_int.insert(
-                            format!("{owner}.{fname}"),
-                            SetKind::from_bool(mentions_int_expr(&d.expr)),
-                        );
-                    }
-                }
-            }
-        }
-        // Builtin `Real`/`EReal` lanes are Int-flavored (bitmask-readable)
-        // when allocated; unallocated lanes declare nothing.
-        for (owner, fname, group) in crate::bounds::REAL_LANES
-            .iter()
-            .map(|(f, g)| ("Real", *f, *g))
-            .chain(
-                crate::bounds::EREAL_EXTRA_LANES
-                    .iter()
-                    .map(|(f, g)| ("EReal", *f, *g)),
-            )
-        {
-            if res
-                .lane_atoms
-                .get(&group)
-                .map_or(true, |v| v.is_empty())
-            {
-                continue;
-            }
-            field_int.insert(format!("{owner}.{fname}"), SetKind::Int);
-        }
         let ctx = Ctx {
             module: self.module,
             res: &res,
-            rels: &rels,
-            field_arity: &field_arity,
-            field_int,
-            ordering_info: &ordering_info,
+            rels: &it.rels,
+            field_arity: &it.field_arity,
+            field_int: it.field_int,
+            ordering_info: &it.ordering_info,
             depth: std::cell::Cell::new(0),
-            open_params,
+            open_params: it.open_params,
             expr_binds: std::cell::RefCell::new(HashMap::new()),
             let_binds: std::cell::RefCell::new(Vec::new()),
             var_roots: std::cell::RefCell::new(HashMap::new()),
@@ -1540,6 +1636,24 @@ impl<'a> Ctx<'a> {
                     .collect();
                 if changed {
                     Some(Expr::Comprehension(nds, body.clone()))
+                } else {
+                    None
+                }
+            }
+            Expr::Find(sel, ds, body) => {
+                let mut changed = false;
+                let nds: Vec<Decl> = ds
+                    .iter()
+                    .map(|d| match self.hoist_real_fun(&d.expr, out) {
+                        None => d.clone(),
+                        Some(ne) => {
+                            changed = true;
+                            Decl { expr: ne, ..d.clone() }
+                        }
+                    })
+                    .collect();
+                if changed {
+                    Some(Expr::Find(*sel, nds, body.clone()))
                 } else {
                     None
                 }
@@ -2270,17 +2384,23 @@ impl<'a> Ctx<'a> {
     /// spread and mantissae never exceed `m` bits, so every scaled edge
     /// fits with sign room to spare. Absurdly wide lane configurations
     /// fail loudly instead of hanging the solver.
+    /// Caps a static barrel width loudly, or the shift circuits would
+    /// silently wrap.
+    fn cap_shift_width(wv: u64, cap: u64, detail: String) -> LResult<u32> {
+        if wv > cap {
+            return Err(FrontError::Resolve(detail));
+        }
+        Ok(wv as u32)
+    }
+
     fn ereal_shift_width(&self) -> LResult<u32> {
         let w = &self.res.mepk_widths;
         let spread = Self::ereal_scale_spread(w);
         let wv = (w.m_width as u64).saturating_add(spread).saturating_add(2);
-        if wv > 256 {
-            return Err(FrontError::Resolve(format!(
-                "interval comparison needs {wv}-bit shifts (m={}, scale spread={spread}); narrow MEPK_*_WIDTH so that m_width + spread + 2 <= 256",
-                w.m_width,
-            )));
-        }
-        Ok(wv as u32)
+        Self::cap_shift_width(wv, 256, format!(
+            "interval comparison needs {wv}-bit shifts (m={}, scale spread={spread}); narrow MEPK_*_WIDTH so that m_width + spread + 2 <= 256",
+            w.m_width,
+        ))
     }
 
     /// Static barrel width for mul/div centre windows (Phase 2): products
@@ -2293,13 +2413,10 @@ impl<'a> Ctx<'a> {
         let wv = (2 * w.m_width as u64)
             .saturating_add(2 * spread)
             .saturating_add(4);
-        if wv > 512 {
-            return Err(FrontError::Resolve(format!(
-                "mul/div centre window needs {wv}-bit shifts (m={}, scale spread={spread}); narrow MEPK_*_WIDTH so that 2*m_width + 2*spread + 4 <= 512",
-                w.m_width,
-            )));
-        }
-        Ok(wv as u32)
+        Self::cap_shift_width(wv, 512, format!(
+            "mul/div centre window needs {wv}-bit shifts (m={}, scale spread={spread}); narrow MEPK_*_WIDTH so that 2*m_width + 2*spread + 4 <= 512",
+            w.m_width,
+        ))
     }
 
     /// Widest representable gap between the `lsb`/`r` scale exponents.
@@ -3359,344 +3476,73 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
             .map_err(|e| FrontError::Resolve(e.to_string()))
     }
 
+    /// Shared comprehension lowering (used by both `{x: D | F}` and the
+    /// bare `{x in D | F}` find-form, which denotes a set in the solver).
+    fn lower_comprehension_like(
+        &self,
+        arena: &mut kk::AstArena,
+        decls: &[Decl],
+        body: &Formula,
+        env: &mut Env,
+    ) -> LResult<(ExprId, u32)> {
+        let disj_pairs = collect_disj_pairs(decls, arena);
+        let (ds, pushed) = self.lower_decls(arena, decls, env)?;
+        let mut bf = self.lower_formula(arena, body, env)?;
+        for &(a, b) in &disj_pairs {
+            let neq = var_neq(arena, a, b);
+            bf = arena.and(&[bf, neq]);
+        }
+        for _ in 0..pushed {
+            env.pop();
+        }
+        let id = arena
+            .comprehension(ds, bf)
+            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+        Ok((id, arena.arity(id)))
+    }
+
     fn lower_expr(
         &self,
         arena: &mut kk::AstArena,
         e: &Expr,
         env: &mut Env,
-    ) -> LResult<(ExprId, u32)> {
-        let lowered = match e {
+    ) -> LResult<(ExprId, u32)> {        let lowered = match e {
             Expr::Univ => (arena.constant(kk::ConstantExpr::Univ), 1),
             Expr::None_ => (arena.constant(kk::ConstantExpr::Empty), 1),
             Expr::Iden => (arena.constant(kk::ConstantExpr::Iden), 2),
-            Expr::IntAtom => {
-                // Bare `Int` as a set value: the union of materialized int
-                // atoms (same reading as `:query Int`). Int-as-a-set
-                // implies lazy allocation, so the atoms always exist here.
-                let w = self.res.int_count;
-                let mut acc: Option<ExprId> = None;
-                for v in 0..w {
-                    let s = self.int_atom_singleton(arena, v as i64)?;
-                    acc = Some(match acc {
-                        Some(a) => arena
-                            .binary_expr(kk::BinaryOp::Union, a, s)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?,
-                        None => s,
-                    });
-                }
-                match acc {
-                    Some(a) => (a, 1),
-                    None => (arena.constant(kk::ConstantExpr::Empty), 1),
-                }
-            }
-            Expr::StepAtom => {
-                // Builtin `Step`: the interned unary relation (exact over
-                // `Step$*`; empty in static commands).
-                if let Some(r) = self.lookup_rel("Step") {
-                    let ar = arena.relation_arity(r);
-                    return Ok((arena.expr_relation(r), ar));
-                }
-                // Fallback: union of singletons (query ctx without rels).
-                let mut acc: Option<ExprId> = None;
-                for a in &self.res.step_atoms {
-                    let idx = self.res.universe.index(a).map_err(|e| {
-                        FrontError::Resolve(format!("Step atom '{a}' missing: {e}"))
-                    })?;
-                    let s = arena.expr_atoms(vec![idx]);
-                    acc = Some(match acc {
-                        Some(x) => arena
-                            .binary_expr(kk::BinaryOp::Union, x, s)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?,
-                        None => s,
-                    });
-                }
-                match acc {
-                    Some(a) => (a, 1),
-                    None => (arena.constant(kk::ConstantExpr::Empty), 1),
-                }
-            }
-            Expr::Bits(n, _) => {
-                // Bitset of an integer literal: `{i < W : bit i of the
-                // E-bit wrap of n is set}` (mirrors
-                // `IntCircuit::constant` truncation).
-                let w = self.res.int_count as usize;
-                let e = self.res.bitwidth;
-                let mask: i64 = if e >= 63 { -1 } else { (1i64 << e) - 1 };
-                let mut rest = (*n & mask) as u64;
-                let mut acc: Option<ExprId> = None;
-                while rest != 0 {
-                    let i = rest.trailing_zeros() as usize;
-                    rest &= rest - 1;
-                    if i >= w {
-                        continue;
-                    }
-                    let s = self.int_atom_singleton(arena, i as i64)?;
-                    acc = Some(match acc {
-                        Some(a) => arena
-                            .binary_expr(kk::BinaryOp::Union, a, s)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?,
-                        None => s,
-                    });
-                }
-                match acc {
-                    Some(a) => (a, 1),
-                    None => (arena.constant(kk::ConstantExpr::Empty), 1),
-                }
-            }
+            Expr::IntAtom => self.lower_expr_int_atom(arena)?,
+            Expr::StepAtom => self.lower_expr_step_atom(arena)?,
+            Expr::Bits(n, _) => self.lower_expr_bits(arena, *n)?,
             Expr::RealLit(..) | Expr::ApproxRealLit(..) => {
                 return Err(FrontError::Resolve(
                     "decimal literals are only valid in Real/EReal value positions (`=`, `!=`, `setReal`, `setEReal`, `real*`, `ereal*`); approximable literals `(d)` additionally allow `real*` rounding positions".to_string(),
                 ));
             }
-            Expr::Name(n, pos) => {
-                // Check let-binding scopes (innermost first)
-                {
-                    let binds = self.let_binds.borrow();
-                    for scope in binds.iter().rev() {
-                        if let Some(&(eid, a, _)) = scope.get(n) {
-                            return Ok((eid, a));
-                        }
-                    }
-                }
-                if let Some((_, v, a, _fl)) = env.iter().rev().find(|(nm, ..)| nm == n) {
-                    let (v, a) = (*v, *a);
-                    return Ok((arena.expr_variable(v), a));
-                }
-                // Check expression-level bindings (sig fact field qualification)
-                if let Some(&(eid, a, _)) = self.expr_binds.borrow().get(n) {
-                    return Ok((eid, a));
-                }
-                if let Some(r) = self.lookup_rel(n) {
-                    let ar = arena.relation_arity(r);
-                    return Ok((arena.expr_relation(r), ar));
-                }
-                // Ambiguous field name: union of all matching relations
-                let all_hits = self.lookup_rel_all(n);
-                if all_hits.len() > 1 {
-                    let mut cur = arena.expr_relation(all_hits[0]);
-                    let mut car = arena.relation_arity(all_hits[0]);
-                    for &r in &all_hits[1..] {
-                        let ar = arena.relation_arity(r);
-                        let other = arena.expr_relation(r);
-                        if ar > car {
-                            let univ = arena.constant(kk::ConstantExpr::Univ);
-                            for _ in car..ar {
-                                cur = arena
-                                    .binary_expr(kk::BinaryOp::Product, cur, univ)
-                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            }
-                            car = ar;
-                        } else if ar < car {
-                            let univ = arena.constant(kk::ConstantExpr::Univ);
-                            let mut promoted = other;
-                            for _ in ar..car {
-                                promoted = arena
-                                    .binary_expr(kk::BinaryOp::Product, promoted, univ)
-                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            }
-                            cur = arena
-                                .binary_expr(kk::BinaryOp::Union, cur, promoted)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            continue;
-                        }
-                        cur = arena
-                            .binary_expr(kk::BinaryOp::Union, cur, other)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                    }
-                    return Ok((cur, car));
-                }
-                // ordering builtins without args (e.g., ord/first, ord/last, ord/prev)
-                if let Some(result) = self.try_ordering_expr(arena, n, &[], env)? {
-                    return Ok(result);
-                }
-                // zero-arg function reference: inline its body
-                if let Some(p) = self
-                    .module
-                    .paras
-                    .iter()
-                    .find(|p| p.is_fun && p.name == *n && p.params.is_empty())
-                {
-                    let body = p
-                        .body_expr
-                        .clone()
-                        .ok_or_else(|| FrontError::Resolve(format!("'{n}' has no body")))?;
-                    let d = self.depth.get();
-                    if d > 64 {
-                        return Err(FrontError::Resolve("call recursion too deep".into()));
-                    }
-                    self.depth.set(d + 1);
-                    let out = self.lower_expr(arena, &body, env)?;
-                    self.depth.set(d);
-                    return Ok(out);
-                }
-                // Bit-vector builtins (fallback: declared names win since
-                // sigs/fields/lets were checked above).
-                if n == "Signed" {
-                    return Ok((arena.constant(kk::ConstantExpr::Ints), 1));
-                }
-                if n == "MSB" {
-                    // Sign-bit alias: the top atom index `W - 1`.
-                    let w = self.res.int_count;
-                    let s = self.int_atom_singleton(arena, (w as i64) - 1)?;
-                    return Ok((s, 1));
-                }
-                // Atom literal (`A$0` in `:query`): a universe atom name
-                // denotes its singleton set. Declared names win (checked
-                // above), so this is strictly a fallback. Positions are
-                // scope-local: re-lowering under another scope re-resolves
-                // by name. Model builds reject `$` names (Java parity).
-                if self.allow_atoms {
-                    if let Ok(idx) = self.res.universe.index(n) {
-                        return Ok((arena.expr_atoms(vec![idx]), 1));
-                    }
-                } else if n.contains('$') {
-                    return Err(FrontError::Parse {
-                        pos: *pos,
-                        msg: "The name cannot contain the '$' symbol.".to_string(),
-                    });
-                } else if let Ok(idx) = self.res.universe.index(n) {
-                    // Numeric int atoms (`5`, `-5`) stay resolvable in
-                    // models: they carry no `$`.
-                    return Ok((arena.expr_atoms(vec![idx]), 1));
-                }
-                // A-plan lazy allocation: integer literals in set position need
-                // materialized int atoms. On Int-free models the universe
-                // has none, so explain instead of a bare "unresolved".
-                if n.parse::<i64>().is_ok() {
-                    return Err(FrontError::Parse {
-                        pos: *pos,
-                        msg: format!("integer '{n}' is not in scope (this model materializes no Int atoms; mention Int in the model or add `for N Int` to the scope)"),
-                    });
-                }
-                return Err(FrontError::Parse {
-                    pos: *pos,
-                    msg: format!(
-                        "unresolved name '{}' (env has: {:?})",
-                        n,
-                        env.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>()
-                    ),
-                });
-            }
-            Expr::Bin(op, a, b) => {
-                let (ea, aa) = self.lower_expr(arena, a, env)?;
-                let (eb, ab) = self.lower_expr(arena, b, env)?;
-                let id = (match op {
-                    BinOp::Join => {
-                        if aa + ab < 2 {
-                            return Err(FrontError::Resolve(format!(
-                                "join arity too small ({aa}.{ab})"
-                            )));
-                        }
-                        arena.binary_expr(kk::BinaryOp::Join, ea, eb)
-                    }
-                    BinOp::DomainRestrict => {
-                        // A <: B = (A × univ^(b-1)) & B
-                        // This restricts B to tuples whose first column is in A
-                        let bx_ar = ab;
-                        let mut ax = ea;
-                        let univ = arena.constant(kk::ConstantExpr::Univ);
-                        for _ in 1..bx_ar {
-                            ax = arena
-                                .binary_expr(kk::BinaryOp::Product, ax, univ)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        }
-                        arena.binary_expr(kk::BinaryOp::Intersection, ax, eb)
-                    }
-                    BinOp::RangeRestrict => {
-                        // A :> B = (univ^(a-1) × B) & A
-                        // This restricts A to tuples whose last column is in B
-                        let ax_ar = aa;
-                        let mut bx = eb;
-                        let univ = arena.constant(kk::ConstantExpr::Univ);
-                        for _ in 1..ax_ar {
-                            bx = arena
-                                .binary_expr(kk::BinaryOp::Product, univ, bx)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        }
-                        arena.binary_expr(kk::BinaryOp::Intersection, bx, ea)
-                    }
-                    _ => {
-                        // For Union, Intersect, Difference, Override, Product:
-                        // Auto-promote lower-arity side with univ padding
-                        let kk_op = match op {
-                            BinOp::Union => kk::BinaryOp::Union,
-                            BinOp::Intersect => kk::BinaryOp::Intersection,
-                            BinOp::Difference => kk::BinaryOp::Difference,
-                            BinOp::Override => kk::BinaryOp::Override,
-                            BinOp::Product => kk::BinaryOp::Product,
-                            _ => unreachable!(),
-                        };
-                        if aa == ab || matches!(op, BinOp::Product) {
-                            arena.binary_expr(kk_op, ea, eb)
-                        } else if aa < ab {
-                            // Promote ea to match eb's arity
-                            let mut promoted = ea;
-                            let univ = arena.constant(kk::ConstantExpr::Univ);
-                            for _ in aa..ab {
-                                promoted = arena
-                                    .binary_expr(kk::BinaryOp::Product, promoted, univ)
-                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            }
-                            arena.binary_expr(kk_op, promoted, eb)
-                        } else {
-                            // Promote eb to match ea's arity
-                            let mut promoted = eb;
-                            let univ = arena.constant(kk::ConstantExpr::Univ);
-                            for _ in ab..aa {
-                                promoted = arena
-                                    .binary_expr(kk::BinaryOp::Product, univ, promoted)
-                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            }
-                            arena.binary_expr(kk_op, ea, promoted)
-                        }
-                    }
-                })
-                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                let ar = arena.arity(id);
-                let _ = (aa, ab);
-                (id, ar)
-            }
+            Expr::Name(n, pos) => self.lower_expr_name(arena, n, *pos, env)?,
+            Expr::Bin(op, a, b) => self.lower_expr_bin(arena, op, a, b, env)?,
             Expr::Transpose(x) => {
-                let (ex, ax) = self.lower_expr(arena, x, env)?;
-                if ax < 2 {
-                    return Err(FrontError::Resolve("~ needs arity >= 2".into()));
-                }
-                let id = arena.unary_expr(kk::UnaryExprOp::Transpose, ex).unwrap();
-                (id, ax)
+                self.lower_expr_closure(arena, x, env, kk::UnaryExprOp::Transpose, "~")?
             }
             Expr::TClosure(x) => {
-                let (ex, ax) = self.lower_expr(arena, x, env)?;
-                if ax < 2 {
-                    return Err(FrontError::Resolve("^ needs arity >= 2".into()));
-                }
-                let id = arena.unary_expr(kk::UnaryExprOp::Closure, ex).unwrap();
-                (id, ax)
+                self.lower_expr_closure(arena, x, env, kk::UnaryExprOp::Closure, "^")?
             }
             Expr::RClosure(x) => {
-                let (ex, ax) = self.lower_expr(arena, x, env)?;
-                if ax < 2 {
-                    return Err(FrontError::Resolve("* needs arity >= 2".into()));
-                }
-                let id = arena
-                    .unary_expr(kk::UnaryExprOp::ReflexiveClosure, ex)
-                    .unwrap();
-                (id, ax)
+                self.lower_expr_closure(arena, x, env, kk::UnaryExprOp::ReflexiveClosure, "*")?
             }
             Expr::Comprehension(decls, body) => {
-                let disj_pairs = collect_disj_pairs(decls, arena);
-                let (ds, pushed) = self.lower_decls(arena, decls, env)?;
-                let mut bf = self.lower_formula(arena, body, env)?;
-                for &(a, b) in &disj_pairs {
-                    let neq = var_neq(arena, a, b);
-                    bf = arena.and(&[bf, neq]);
+                self.lower_comprehension_like(arena, decls, body, env)?
+            }
+            Expr::Find(sel, decls, body) => {
+                // Selector forms (`any`/`min`/`max`) are query-only: the
+                // solver has no selection semantics. The bare form denotes
+                // a set and lowers exactly like a comprehension.
+                if *sel != crate::ast::FindSel::All {
+                    return Err(FrontError::Unsupported(format!(
+                        "`{sel:?} x in ...` selection is query-only; \
+                         use `:query` (or the bare `{{x in ...}}` form in models)"
+                    )));
                 }
-                for _ in 0..pushed {
-                    env.pop();
-                }
-                let id = arena
-                    .comprehension(ds, bf)
-                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                (id, arena.arity(id))
+                self.lower_comprehension_like(arena, decls, body, env)?
             }
             Expr::If(c, t, e2) => {
                 let cf = self.lower_formula(arena, c, env)?;
@@ -3714,239 +3560,13 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
             }
             Expr::Bracket(base, args) => {
                 // Box join slices the FIRST column: `r[a]` == `a.r`.
-                let (mut cur, mut car) = self.lower_expr(arena, base, env)?;
-                for a in args {
-                    let (ai, aa) = self.lower_expr(arena, a, env)?;
-                    if car + aa < 2 {
-                        return Err(FrontError::Resolve("bracket join arity".into()));
-                    }
-                    cur = arena
-                        .binary_expr(kk::BinaryOp::Join, ai, cur)
-                        .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                    car = arena.arity(cur);
-                }
-                (cur, car)
+                let (b, c) = self.lower_expr(arena, base, env)?;
+                self.bracket_join(arena, b, c, args, env)?
             }
             Expr::ArrowMult(..) | Expr::LeadMult(..) => {
                 return self.unsup("multiplicity outside field declaration")
             }
-            Expr::Call(name, args, pos) => {
-                // Builtin `Real` successor functions (desugared to a
-                // singleton comprehension over `realSucc`/`realPred`, so
-                // no witness relations are needed and nesting works
-                // through the standard comprehension path).
-                // Decimal literals constant-fold through the oracle
-                // (`ERealConstant` philosophy): the result pins exact
-                // lanes, keeping literal-heavy models trivial. Only
-                // dyadic literals fold (round explicitly first).
-                if name == "realUp" || name == "realDown" {
-                    if args.len() != 1 {
-                        return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
-                    }
-                    if let Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) = &args[0] {
-                        let approx = matches!(&args[0], Expr::ApproxRealLit(..));
-                        let w = &self.res.mepk_widths;
-                        let v = if approx {
-                            decimal_to_real_rounded(s, Some(w.m_width), RealRound::Nearest).ok_or_else(|| {
-                                FrontError::Resolve(format!(
-                                    "cannot convert ({s:?}) to Real (malformed or outside the m lane)"
-                                ))
-                            })?
-                        } else {
-                            decimal_to_real(s, Some(w.m_width)).ok_or_else(|| {
-                                FrontError::Resolve(format!(
-                                    "cannot convert {s:?} to Real exactly; round it with setRealNearest first"
-                                ))
-                            })?
-                        };
-                        let nv = if name == "realUp" {
-                            alloy_kodkod_rs::real::next_up(&v, w.m_width, w.e_width)
-                        } else {
-                            alloy_kodkod_rs::real::next_down(&v, w.m_width, w.e_width)
-                        }
-                        .ok_or_else(|| {
-                            FrontError::Resolve(format!(
-                                "'{name}' of {s:?} leaves the lane range"
-                            ))
-                        })?;
-                        let n = self.pin_seq.get();
-                        self.pin_seq.set(n + 1);
-                        let vnm = format!("$rup{n}");
-                        let decl = Decl {
-                            disj: false,
-                            names: vec![vnm.clone()],
-                            expr: Expr::Name("Real".into(), 0),
-                            pos: 0,
-                            is_var: false,
-                        };
-                        // Pin the witness lanes to the computed centre.
-                        let pin = ereal_and_all(vec![
-                            Formula::IntCmp(
-                                IntCmpOp::Eq,
-                                ereal_lane(&Expr::Name(vnm.clone(), 0), "m"),
-                                IntExpr::Lit(nv.m as i64, 0),
-                                0,
-                            ),
-                            Formula::IntCmp(
-                                IntCmpOp::Eq,
-                                ereal_lane(&Expr::Name(vnm.clone(), 0), "e"),
-                                IntExpr::Lit(nv.e as i64, 0),
-                                0,
-                            ),
-                        ]);
-                        return self.lower_expr(
-                            arena,
-                            &Expr::Comprehension(vec![decl], Box::new(pin)),
-                            env,
-                        );
-                    }
-                    let pred = if name == "realUp" { "realSucc" } else { "realPred" };
-                    let n = self.pin_seq.get();
-                    self.pin_seq.set(n + 1);
-                    let v = format!("$rup{n}");
-                    let decl = Decl {
-                        disj: false,
-                        names: vec![v.clone()],
-                        expr: Expr::Name("Real".into(), 0),
-                        pos: 0,
-                        is_var: false,
-                    };
-                    let body = Formula::Call(
-                        pred.into(),
-                        vec![Expr::Name(v, 0), args[0].clone()],
-                        0,
-                    );
-                    // Memoize per call site: the same occurrence is
-                    // lowered once per lane join (plus once per use);
-                    // sharing one lowering lets the kodkod matrix memo
-                    // hit instead of re-expanding the core per lane.
-                    let key = (
-                        name.clone(),
-                        *pos,
-                        env.iter().map(|(_, vid, _, _)| *vid).collect::<Vec<_>>(),
-                        self.marker_time.get(),
-                    );
-                    if let Some(hit) = self.rup_memo.borrow().get(&key) {
-                        return Ok(*hit);
-                    }
-                    let out = self.lower_expr(
-                        arena,
-                        &Expr::Comprehension(vec![decl], Box::new(body)),
-                        env,
-                    )?;
-                    self.rup_memo.borrow_mut().insert(key, out);
-                    return Ok(out);
-                }
-                // Bit-position singletons (`mbit[0]` = `{M$0}`): the flat
-                // spelling for individual lane bits, so lane sets can be
-                // written directly (`x.m = mbit[0] + mbit[1]`).
-                if matches!(name.as_str(), "mbit" | "ebit" | "pbit" | "kbit") {
-                    if args.len() != 1 {
-                        return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
-                    }
-                    let prefix = name.chars().next().unwrap().to_ascii_uppercase();
-                    let width = match name.as_str() {
-                        "mbit" => self.res.mepk_widths.m_width,
-                        "ebit" => self.res.mepk_widths.e_width,
-                        "pbit" => self.res.mepk_widths.p_width,
-                        _ => self.res.mepk_widths.k_width,
-                    };
-                    let idx_lit = match &args[0] {
-                        Expr::Name(n, _) => n.parse::<i64>().ok(),
-                        Expr::Bits(v, _) => Some(*v),
-                        _ => None,
-                    };
-                    let i = idx_lit.ok_or_else(|| {
-                        FrontError::Resolve(format!("'{name}' expects an integer literal"))
-                    })?;
-                    if i < 0 || i >= width as i64 {
-                        return Err(FrontError::Resolve(format!(
-                            "'{name}[{i}]' outside the lane range [0, {width})"
-                        )));
-                    }
-                    let atom = format!("{prefix}${i}");
-                    let idx = self
-                        .res
-                        .universe
-                        .index(&atom)
-                        .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                    return Ok((arena.expr_atoms(vec![idx]), 1));
-                }
-                // Check ordering builtins first
-                if let Some(result) = self.try_ordering_expr(arena, name, args, env)? {
-                    return Ok(result);
-                }
-                // Check stdlib builtins (graph, relation)
-                if let Some(result) = self.try_stdlib_expr(arena, name, args, env)? {
-                    return Ok(result);
-                }
-                if args.is_empty() {
-                    if let Some(r) = self.lookup_rel(name) {
-                        let ar = arena.relation_arity(r);
-                        return Ok((arena.expr_relation(r), ar));
-                    }
-                }
-                // name(args) where name is a relation: treat as bracket indexing
-                // Check expr_binds first (sig fact context), then lookup_rel
-                if !args.is_empty() {
-                    let base = if let Some(&(eid, ea, _fl)) = self.expr_binds.borrow().get(name) {
-                        Some((eid, ea))
-                    } else {
-                        self.lookup_rel(name).map(|r| {
-                            let ar = arena.relation_arity(r);
-                            (arena.expr_relation(r), ar)
-                        })
-                    };
-                    if let Some((base_e, mut car)) = base {
-                        // Box join slices the FIRST column: `r[a]` == `a.r`.
-                        let mut cur = base_e;
-                        for a in args {
-                            let (ai, aa) = self.lower_expr(arena, a, env)?;
-                            if car + aa < 2 {
-                                return Err(FrontError::Resolve("bracket join arity".into()));
-                            }
-                            cur = arena
-                                .binary_expr(kk::BinaryOp::Join, ai, cur)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            car = arena.arity(cur);
-                        }
-                        return Ok((cur, car));
-                    }
-                }
-                let para = self
-                    .module
-                    .paras
-                    .iter()
-                    .find(|p| p.name == *name && p.is_fun)
-                    .ok_or_else(|| FrontError::Resolve(format!("unknown function '{name}'")))?;
-                let total_param_names: usize = para.params.iter().map(|d| d.names.len()).sum();
-                if total_param_names != args.len() {
-                    return Err(FrontError::Resolve(format!(
-                        "'{name}' expects {} args, got {}",
-                        total_param_names,
-                        args.len()
-                    )));
-                }
-                let d = self.depth.get();
-                if d > 64 {
-                    return Err(FrontError::Resolve("call recursion too deep".into()));
-                }
-                self.depth.set(d + 1);
-                let mut body = para
-                    .body_expr
-                    .clone()
-                    .ok_or_else(|| FrontError::Resolve(format!("'{name}' has no body")))?;
-                let mut arg_idx = 0;
-                for pd in &para.params {
-                    for pn in &pd.names {
-                        body = replace_var_expr(&body, pn, &args[arg_idx]);
-                        arg_idx += 1;
-                    }
-                }
-                let out = self.lower_expr(arena, &body, env)?;
-                self.depth.set(d);
-                out
-            }
+            Expr::Call(name, args, pos) => self.lower_expr_call(arena, name, args, *pos, env)?,
             Expr::Prime(inner) => {
                 let (ex, ax) = self.lower_expr(arena, inner, env)?;
                 let id = arena.prime(ex);
@@ -3970,6 +3590,584 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         Ok(lowered)
     }
 
+    /// Folds singletons with union; empty input is the empty set.
+    fn union_all(&self, arena: &mut kk::AstArena, ids: Vec<ExprId>) -> LResult<ExprId> {
+        let mut acc: Option<ExprId> = None;
+        for s in ids {
+            acc = Some(match acc {
+                Some(a) => arena
+                    .binary_expr(kk::BinaryOp::Union, a, s)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?,
+                None => s,
+            });
+        }
+        Ok(match acc {
+            Some(a) => a,
+            None => arena.constant(kk::ConstantExpr::Empty),
+        })
+    }
+
+    /// Pads `id` from arity `from` to `to` with `univ` products
+    /// (trailing by default, leading when `leading`).
+    fn promote_arity(
+        &self,
+        arena: &mut kk::AstArena,
+        id: ExprId,
+        from: u32,
+        to: u32,
+        leading: bool,
+    ) -> LResult<ExprId> {
+        let mut cur = id;
+        let univ = arena.constant(kk::ConstantExpr::Univ);
+        for _ in from..to {
+            cur = if leading {
+                arena.binary_expr(kk::BinaryOp::Product, univ, cur)
+            } else {
+                arena.binary_expr(kk::BinaryOp::Product, cur, univ)
+            }
+            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+        }
+        Ok(cur)
+    }
+
+    /// Box join over argument list: `r[a][b]` slices the first column
+    /// (`r[a]` == `a.r`), threading arity through each step.
+    fn bracket_join<A: Borrow<Expr>>(
+        &self,
+        arena: &mut kk::AstArena,
+        base: ExprId,
+        base_ar: u32,
+        args: &[A],
+        env: &mut Env,
+    ) -> LResult<(ExprId, u32)> {
+        let (mut cur, mut car) = (base, base_ar);
+        for a in args {
+            let (ai, aa) = self.lower_expr(arena, a.borrow(), env)?;
+            if car + aa < 2 {
+                return Err(FrontError::Resolve("bracket join arity".into()));
+            }
+            cur = arena
+                .binary_expr(kk::BinaryOp::Join, ai, cur)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            car = arena.arity(cur);
+        }
+        Ok((cur, car))
+    }
+
+    /// Bare `Int` as a set value: the union of materialized int atoms
+    /// (same reading as `:query Int`).
+    fn lower_expr_int_atom(&self, arena: &mut kk::AstArena) -> LResult<(ExprId, u32)> {
+        // Int-as-a-set implies lazy allocation, so the atoms always exist here.
+        let mut ids = Vec::new();
+        for v in 0..self.res.int_count {
+            ids.push(self.int_atom_singleton(arena, v as i64)?);
+        }
+        Ok((self.union_all(arena, ids)?, 1))
+    }
+
+    /// Builtin `Step`: the interned unary relation (exact over `Step$*`;
+    /// empty in static commands), falling back to a union of singletons.
+    fn lower_expr_step_atom(&self, arena: &mut kk::AstArena) -> LResult<(ExprId, u32)> {
+        if let Some(r) = self.lookup_rel("Step") {
+            let ar = arena.relation_arity(r);
+            return Ok((arena.expr_relation(r), ar));
+        }
+        // Fallback: union of singletons (query ctx without rels).
+        let mut ids = Vec::new();
+        for a in &self.res.step_atoms {
+            let idx = self
+                .res
+                .universe
+                .index(a)
+                .map_err(|e| FrontError::Resolve(format!("Step atom '{a}' missing: {e}")))?;
+            ids.push(arena.expr_atoms(vec![idx]));
+        }
+        Ok((self.union_all(arena, ids)?, 1))
+    }
+
+    /// Bitset of an integer literal: `{i < W : bit i of the E-bit wrap
+    /// of n is set}` (mirrors `IntCircuit::constant` truncation).
+    fn lower_expr_bits(&self, arena: &mut kk::AstArena, n: i64) -> LResult<(ExprId, u32)> {
+        let w = self.res.int_count as usize;
+        let e = self.res.bitwidth;
+        let mask: i64 = if e >= 63 { -1 } else { (1i64 << e) - 1 };
+        let mut rest = (n & mask) as u64;
+        let mut ids = Vec::new();
+        while rest != 0 {
+            let i = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            if i >= w {
+                continue;
+            }
+            ids.push(self.int_atom_singleton(arena, i as i64)?);
+        }
+        Ok((self.union_all(arena, ids)?, 1))
+    }
+
+    /// Unary closures (`~`, `^`, `*`): same shape, differing only in the
+    /// kodkod operator and the arity-error label.
+    fn lower_expr_closure(
+        &self,
+        arena: &mut kk::AstArena,
+        x: &Expr,
+        env: &mut Env,
+        op: kk::UnaryExprOp,
+        what: &str,
+    ) -> LResult<(ExprId, u32)> {
+        let (ex, ax) = self.lower_expr(arena, x, env)?;
+        if ax < 2 {
+            return Err(FrontError::Resolve(format!("{what} needs arity >= 2")));
+        }
+        let id = arena.unary_expr(op, ex).unwrap();
+        Ok((id, ax))
+    }
+    /// Function calls: builtin sugars (`realUp`/`realDown`, lane
+    /// bits), ordering/stdlib builtins, relation bracket indexing,
+    /// and user `fun` inlining (with recursion guard).
+    fn lower_expr_call(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        args: &[Expr],
+        pos: usize,
+        env: &mut Env,
+    ) -> LResult<(ExprId, u32)> {
+        // Builtin `Real` successor functions (desugared to a
+        // singleton comprehension over `realSucc`/`realPred`, so
+        // no witness relations are needed and nesting works
+        // through the standard comprehension path).
+        // Decimal literals constant-fold through the oracle
+        // (`ERealConstant` philosophy): the result pins exact
+        // lanes, keeping literal-heavy models trivial. Only
+        // dyadic literals fold (round explicitly first).
+        if name == "realUp" || name == "realDown" {
+            return self.lower_expr_call_real_step(arena, name, args, pos, env);
+        }
+        // Bit-position singletons (`mbit[0]` = `{M$0}`): the flat
+        // spelling for individual lane bits, so lane sets can be
+        // written directly (`x.m = mbit[0] + mbit[1]`).
+        if matches!(name, "mbit" | "ebit" | "pbit" | "kbit") {
+            return self.lower_expr_call_lane_bit(arena, name, args);
+        }
+        // Check ordering builtins first
+        if let Some(result) = self.try_ordering_expr(arena, name, args, env)? {
+            return Ok(result);
+        }
+        // Check stdlib builtins (graph, relation)
+        if let Some(result) = self.try_stdlib_expr(arena, name, args, env)? {
+            return Ok(result);
+        }
+        if args.is_empty() {
+            if let Some(r) = self.lookup_rel(name) {
+                let ar = arena.relation_arity(r);
+                return Ok((arena.expr_relation(r), ar));
+            }
+        }
+        // name(args) where name is a relation: treat as bracket indexing
+        // Check expr_binds first (sig fact context), then lookup_rel
+        if !args.is_empty() {
+            let base = if let Some(&(eid, ea, _fl)) = self.expr_binds.borrow().get(name) {
+                Some((eid, ea))
+            } else {
+                self.lookup_rel(name).map(|r| {
+                    let ar = arena.relation_arity(r);
+                    (arena.expr_relation(r), ar)
+                })
+            };
+            if let Some((base_e, car)) = base {
+                // Box join slices the FIRST column: `r[a]` == `a.r`.
+                return self.bracket_join(arena, base_e, car, args, env);
+            }
+        }
+        let para = self
+            .module
+            .paras
+            .iter()
+            .find(|p| p.name == *name && p.is_fun)
+            .ok_or_else(|| FrontError::Resolve(format!("unknown function '{name}'")))?;
+        let total_param_names: usize = para.params.iter().map(|d| d.names.len()).sum();
+        if total_param_names != args.len() {
+            return Err(FrontError::Resolve(format!(
+                "'{name}' expects {} args, got {}",
+                total_param_names,
+                args.len()
+            )));
+        }
+        let d = self.depth.get();
+        if d > 64 {
+            return Err(FrontError::Resolve("call recursion too deep".into()));
+        }
+        self.depth.set(d + 1);
+        let mut body = para
+            .body_expr
+            .clone()
+            .ok_or_else(|| FrontError::Resolve(format!("'{name}' has no body")))?;
+        let mut arg_idx = 0;
+        for pd in &para.params {
+            for pn in &pd.names {
+                body = replace_var_expr(&body, pn, &args[arg_idx]);
+                arg_idx += 1;
+            }
+        }
+        let out = self.lower_expr(arena, &body, env)?;
+        self.depth.set(d);
+        Ok(out)
+    }
+
+    /// Bit-position singletons (`mbit[0]` = `{M$0}`): the flat
+    /// spelling for individual lane bits.
+    fn lower_expr_call_lane_bit(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        args: &[Expr],
+    ) -> LResult<(ExprId, u32)> {
+        if args.len() != 1 {
+            return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
+        }
+        let prefix = name.chars().next().unwrap().to_ascii_uppercase();
+        let width = match name {
+            "mbit" => self.res.mepk_widths.m_width,
+            "ebit" => self.res.mepk_widths.e_width,
+            "pbit" => self.res.mepk_widths.p_width,
+            _ => self.res.mepk_widths.k_width,
+        };
+        let idx_lit = match &args[0] {
+            Expr::Name(n, _) => n.parse::<i64>().ok(),
+            Expr::Bits(v, _) => Some(*v),
+            _ => None,
+        };
+        let i = idx_lit.ok_or_else(|| {
+            FrontError::Resolve(format!("'{name}' expects an integer literal"))
+        })?;
+        if i < 0 || i >= width as i64 {
+            return Err(FrontError::Resolve(format!(
+                "'{name}[{i}]' outside the lane range [0, {width})"
+            )));
+        }
+        let atom = format!("{prefix}${i}");
+        let idx = self
+            .res
+            .universe
+            .index(&atom)
+            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+        Ok((arena.expr_atoms(vec![idx]), 1))
+    }
+
+    /// Builtin `realUp`/`realDown`: decimal literals constant-fold
+    /// through the oracle, anything else desugars to a singleton
+    /// comprehension over `realSucc`/`realPred` (memoized per call site).
+    fn lower_expr_call_real_step(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        args: &[Expr],
+        pos: usize,
+        env: &mut Env,
+    ) -> LResult<(ExprId, u32)> {
+        if args.len() != 1 {
+            return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
+        }
+        if let Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) = &args[0] {
+            let approx = matches!(&args[0], Expr::ApproxRealLit(..));
+            let w = &self.res.mepk_widths;
+            let v = if approx {
+                decimal_to_real_rounded(s, Some(w.m_width), RealRound::Nearest).ok_or_else(|| {
+                    FrontError::Resolve(format!(
+                        "cannot convert ({s:?}) to Real (malformed or outside the m lane)"
+                    ))
+                })?
+            } else {
+                decimal_to_real(s, Some(w.m_width)).ok_or_else(|| {
+                    FrontError::Resolve(format!(
+                        "cannot convert {s:?} to Real exactly; round it with setRealNearest first"
+                    ))
+                })?
+            };
+            let nv = if name == "realUp" {
+                alloy_kodkod_rs::real::next_up(&v, w.m_width, w.e_width)
+            } else {
+                alloy_kodkod_rs::real::next_down(&v, w.m_width, w.e_width)
+            }
+            .ok_or_else(|| {
+                FrontError::Resolve(format!(
+                    "'{name}' of {s:?} leaves the lane range"
+                ))
+            })?;
+            let n = self.pin_seq.get();
+            self.pin_seq.set(n + 1);
+            let vnm = format!("$rup{n}");
+            let decl = Decl {
+                disj: false,
+                names: vec![vnm.clone()],
+                expr: Expr::Name("Real".into(), 0),
+                pos: 0,
+                is_var: false,
+            };
+            // Pin the witness lanes to the computed centre.
+            let pin = ereal_and_all(vec![
+                Formula::IntCmp(
+                    IntCmpOp::Eq,
+                    ereal_lane(&Expr::Name(vnm.clone(), 0), "m"),
+                    IntExpr::Lit(nv.m as i64, 0),
+                    0,
+                ),
+                Formula::IntCmp(
+                    IntCmpOp::Eq,
+                    ereal_lane(&Expr::Name(vnm.clone(), 0), "e"),
+                    IntExpr::Lit(nv.e as i64, 0),
+                    0,
+                ),
+            ]);
+            return self.lower_expr(
+                arena,
+                &Expr::Comprehension(vec![decl], Box::new(pin)),
+                env,
+            );
+        }
+        let pred = if name == "realUp" { "realSucc" } else { "realPred" };
+        let n = self.pin_seq.get();
+        self.pin_seq.set(n + 1);
+        let v = format!("$rup{n}");
+        let decl = Decl {
+            disj: false,
+            names: vec![v.clone()],
+            expr: Expr::Name("Real".into(), 0),
+            pos: 0,
+            is_var: false,
+        };
+        let body = Formula::Call(
+            pred.into(),
+            vec![Expr::Name(v, 0), args[0].clone()],
+            0,
+        );
+        // Memoize per call site: the same occurrence is
+        // lowered once per lane join (plus once per use);
+        // sharing one lowering lets the kodkod matrix memo
+        // hit instead of re-expanding the core per lane.
+        let key = (
+            name.to_string(),
+            pos,
+            env.iter().map(|(_, vid, _, _)| *vid).collect::<Vec<_>>(),
+            self.marker_time.get(),
+        );
+        if let Some(hit) = self.rup_memo.borrow().get(&key) {
+            return Ok(*hit);
+        }
+        let out = self.lower_expr(
+            arena,
+            &Expr::Comprehension(vec![decl], Box::new(body)),
+            env,
+        )?;
+        self.rup_memo.borrow_mut().insert(key, out);
+        Ok(out)
+    }
+
+    /// Resolves a name through let scopes, quantifier env, expression
+    /// bindings, relations (incl. ambiguous-field union), ordering
+    /// builtins, zero-arg functions, and atom fallbacks.
+    fn lower_expr_name(
+        &self,
+        arena: &mut kk::AstArena,
+        n: &str,
+        pos: usize,
+        env: &mut Env,
+    ) -> LResult<(ExprId, u32)> {
+        // Check let-binding scopes (innermost first)
+        {
+            let binds = self.let_binds.borrow();
+            for scope in binds.iter().rev() {
+                if let Some(&(eid, a, _)) = scope.get(n) {
+                    return Ok((eid, a));
+                }
+            }
+        }
+        if let Some((_, v, a, _fl)) = env.iter().rev().find(|(nm, ..)| nm.as_str() == n) {
+            let (v, a) = (*v, *a);
+            return Ok((arena.expr_variable(v), a));
+        }
+        // Check expression-level bindings (sig fact field qualification)
+        if let Some(&(eid, a, _)) = self.expr_binds.borrow().get(n) {
+            return Ok((eid, a));
+        }
+        if let Some(r) = self.lookup_rel(n) {
+            let ar = arena.relation_arity(r);
+            return Ok((arena.expr_relation(r), ar));
+        }
+        // Ambiguous field name: union of all matching relations
+        let all_hits = self.lookup_rel_all(n);
+        if all_hits.len() > 1 {
+            let mut cur = arena.expr_relation(all_hits[0]);
+            let mut car = arena.relation_arity(all_hits[0]);
+            for &r in &all_hits[1..] {
+                let ar = arena.relation_arity(r);
+                let other = arena.expr_relation(r);
+                if ar > car {
+                    cur = self.promote_arity(arena, cur, car, ar, false)?;
+                    car = ar;
+                        } else if ar < car {
+                            let promoted = self.promote_arity(arena, other, ar, car, false)?;
+                    cur = arena
+                        .binary_expr(kk::BinaryOp::Union, cur, promoted)
+                        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                    continue;
+                }
+                cur = arena
+                    .binary_expr(kk::BinaryOp::Union, cur, other)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            }
+            return Ok((cur, car));
+        }
+        // ordering builtins without args (e.g., ord/first, ord/last, ord/prev)
+        if let Some(result) = self.try_ordering_expr(arena, n, &[], env)? {
+            return Ok(result);
+        }
+        // zero-arg function reference: inline its body
+        if let Some(p) = self
+            .module
+            .paras
+            .iter()
+            .find(|p| p.is_fun && p.name.as_str() == n && p.params.is_empty())
+        {
+            let body = p
+                .body_expr
+                .clone()
+                .ok_or_else(|| FrontError::Resolve(format!("'{n}' has no body")))?;
+            let d = self.depth.get();
+            if d > 64 {
+                return Err(FrontError::Resolve("call recursion too deep".into()));
+            }
+            self.depth.set(d + 1);
+            let out = self.lower_expr(arena, &body, env)?;
+            self.depth.set(d);
+            return Ok(out);
+        }
+        // Bit-vector builtins (fallback: declared names win since
+        // sigs/fields/lets were checked above).
+        if n == "Signed" {
+            return Ok((arena.constant(kk::ConstantExpr::Ints), 1));
+        }
+        if n == "MSB" {
+            // Sign-bit alias: the top atom index `W - 1`.
+            let w = self.res.int_count;
+            let s = self.int_atom_singleton(arena, (w as i64) - 1)?;
+            return Ok((s, 1));
+        }
+        // Atom literal (`A$0` in `:query`): a universe atom name
+        // denotes its singleton set. Declared names win (checked
+        // above), so this is strictly a fallback. Positions are
+        // scope-local: re-lowering under another scope re-resolves
+        // by name. Model builds reject `$` names (Java parity).
+        if self.allow_atoms {
+            if let Ok(idx) = self.res.universe.index(n) {
+                return Ok((arena.expr_atoms(vec![idx]), 1));
+            }
+        } else if n.contains('$') {
+            return Err(FrontError::Parse {
+                pos,
+                msg: "The name cannot contain the '$' symbol.".to_string(),
+            });
+        } else if let Ok(idx) = self.res.universe.index(n) {
+            // Numeric int atoms (`5`, `-5`) stay resolvable in
+            // models: they carry no `$`.
+            return Ok((arena.expr_atoms(vec![idx]), 1));
+        }
+        // A-plan lazy allocation: integer literals in set position need
+        // materialized int atoms. On Int-free models the universe
+        // has none, so explain instead of a bare "unresolved".
+        if n.parse::<i64>().is_ok() {
+            return Err(FrontError::Parse {
+                pos,
+                msg: format!("integer '{n}' is not in scope (this model materializes no Int atoms; mention Int in the model or add `for N Int` to the scope)"),
+            });
+        }
+        Err(FrontError::Parse {
+            pos,
+            msg: format!(
+                "unresolved name '{}' (env has: {:?})",
+                n,
+                env.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>()
+            ),
+        })
+    }
+
+    /// Binary set operators: join, domain/range restriction, and the
+    /// univ-padded union/intersect/difference/override/product family.
+    fn lower_expr_bin(
+        &self,
+        arena: &mut kk::AstArena,
+        op: &BinOp,
+        a: &Expr,
+        b: &Expr,
+        env: &mut Env,
+    ) -> LResult<(ExprId, u32)> {
+        let (ea, aa) = self.lower_expr(arena, a, env)?;
+        let (eb, ab) = self.lower_expr(arena, b, env)?;
+        let id = (match op {
+            BinOp::Join => {
+                if aa + ab < 2 {
+                    return Err(FrontError::Resolve(format!(
+                        "join arity too small ({aa}.{ab})"
+                    )));
+                }
+                arena.binary_expr(kk::BinaryOp::Join, ea, eb)
+            }
+            BinOp::DomainRestrict => {
+                // A <: B = (A × univ^(b-1)) & B
+                // This restricts B to tuples whose first column is in A
+                let bx_ar = ab;
+                let mut ax = ea;
+                let univ = arena.constant(kk::ConstantExpr::Univ);
+                for _ in 1..bx_ar {
+                    ax = arena
+                        .binary_expr(kk::BinaryOp::Product, ax, univ)
+                        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                }
+                arena.binary_expr(kk::BinaryOp::Intersection, ax, eb)
+            }
+            BinOp::RangeRestrict => {
+                // A :> B = (univ^(a-1) × B) & A
+                // This restricts A to tuples whose last column is in B
+                let ax_ar = aa;
+                let mut bx = eb;
+                let univ = arena.constant(kk::ConstantExpr::Univ);
+                for _ in 1..ax_ar {
+                    bx = arena
+                        .binary_expr(kk::BinaryOp::Product, univ, bx)
+                        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+                }
+                arena.binary_expr(kk::BinaryOp::Intersection, bx, ea)
+            }
+            _ => {
+                // For Union, Intersect, Difference, Override, Product:
+                // Auto-promote lower-arity side with univ padding
+                let kk_op = match op {
+                    BinOp::Union => kk::BinaryOp::Union,
+                    BinOp::Intersect => kk::BinaryOp::Intersection,
+                    BinOp::Difference => kk::BinaryOp::Difference,
+                    BinOp::Override => kk::BinaryOp::Override,
+                    BinOp::Product => kk::BinaryOp::Product,
+                    _ => unreachable!(),
+                };
+                if aa == ab || matches!(op, BinOp::Product) {
+                    arena.binary_expr(kk_op, ea, eb)
+                } else if aa < ab {
+                    // Promote ea to match eb's arity
+                    let promoted = self.promote_arity(arena, ea, aa, ab, false)?;
+                    arena.binary_expr(kk_op, promoted, eb)
+                } else {
+                    // Promote eb to match ea's arity
+                    let promoted = self.promote_arity(arena, eb, ab, aa, true)?;
+                    arena.binary_expr(kk_op, ea, promoted)
+                }
+            }
+        })
+        .map_err(|e| FrontError::Resolve(e.to_string()))?;
+        let ar = arena.arity(id);
+        let _ = (aa, ab);
+        Ok((id, ar))
+    }
+
     /// Lowers decl list, pushing new env entries; returns count pushed.
     fn lower_decls(
         &self,
@@ -3990,7 +4188,25 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         let mut added_roots: Vec<String> = Vec::new();
         for d in decls {
             let domain_int = self.set_int_flavored(&d.expr, env);
-            let (dom, _da) = self.lower_expr(arena, &d.expr, env)?;
+            // Decimal literals in domain position denote their lane-bit
+            // set (the inverse of `display::decode_bitset`), so
+            // `{x: (1.3) | F}` ranges over the value's `M$`/`E$` atoms.
+            let (dom, _da) = match &d.expr {
+                lit @ (Expr::RealLit(..) | Expr::ApproxRealLit(..)) => {
+                    let mw = self.res.mepk_widths.m_width;
+                    let ew = self.res.mepk_widths.e_width;
+                    let centre = decimal_centre(lit, mw)?;
+                    let idxs = centre_lane_indices(&self.res.universe, mw, ew, &centre)
+                        .ok_or_else(|| {
+                            FrontError::Resolve(
+                                "decimal domain is outside the solved lane population (missing lane atoms)"
+                                    .to_string(),
+                            )
+                        })?;
+                    (arena.expr_atoms(idxs), 1)
+                }
+                _ => self.lower_expr(arena, &d.expr, env)?,
+            };
             // Only plain sig names resolve (joins/arrows keep legacy routing).
             let decl_root = match &d.expr {
                 Expr::Name(n, _) => self.sig_root(n),
@@ -4310,88 +4526,7 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 let neither = arena.and(&[na, nb]);
                 arena.or(&[both, neither])
             }
-            Formula::Call(name, args, pos) => {
-                // `totalOrder[S, S.next]`: order fixing is applied via
-                // exact bounds on the binary links (i.e. `S<:next`);
-                // the formula itself is true.
-                if name == "totalOrder" {
-                    if args.len() != 2 {
-                        return Err(FrontError::Resolve(format!(
-                            "'totalOrder' expects 2 args, got {}",
-                            args.len()
-                        )));
-                    }
-                    if total_order_target(&args[0], &args[1]).is_none() {
-                        return Err(FrontError::Resolve(
-                            "'totalOrder' expects (S, S<:f) or (S, S.f) or (S, f)".into(),
-                        ));
-                    }
-                    return Ok(arena.bool_formula(true));
-                }
-                // Check ordering builtins first
-                if let Some(f) = self.try_ordering_pred(arena, name, args, env)? {
-                    return Ok(f);
-                }
-                // Builtin `EReal` predicates (desugared to lane constraints).
-                if let Some(f) = self.try_ereal_pred(arena, name, args, env)? {
-                    return Ok(f);
-                }
-                // Builtin `Real` predicates (exact-centre lane constraints).
-                if let Some(f) = self.try_real_pred(arena, name, args, env)? {
-                    return Ok(f);
-                }
-                // Check stdlib builtins (graph, relation)
-                if let Some(f) = self.try_stdlib_pred(arena, name, args, env)? {
-                    return Ok(f);
-                }
-                // Field fallback: `a.f[b]` as a formula means `some a.f[b]`.
-                let is_pred = self
-                    .module
-                    .paras
-                    .iter()
-                    .any(|p| p.name == *name && !p.is_fun);
-                if !is_pred && self.lookup_rel(name).is_some() {
-                    let base = Expr::Call(name.clone(), Vec::new(), *pos);
-                    let e = Expr::Bracket(
-                        Box::new(base),
-                        args.iter().map(|a| Box::new(a.clone())).collect(),
-                    );
-                    let (ee, _) = self.lower_expr(arena, &e, env)?;
-                    let mf = arena.multiplicity_formula(Multiplicity::Some, ee).unwrap();
-                    return Ok(mf);
-                }
-                let para = self
-                    .module
-                    .paras
-                    .iter()
-                    .find(|p| p.name == *name && !p.is_fun)
-                    .ok_or_else(|| FrontError::Resolve(format!("unknown predicate '{name}'")))?;
-                // Flatten multi-name declarations: "t, t\": Type" counts as 2 params
-                let total_param_names: usize = para.params.iter().map(|d| d.names.len()).sum();
-                if total_param_names != args.len() {
-                    return Err(FrontError::Resolve(format!(
-                        "'{name}' expects {} args, got {}",
-                        total_param_names,
-                        args.len()
-                    )));
-                }
-                let d = self.depth.get();
-                if d > 64 {
-                    return Err(FrontError::Resolve("call recursion too deep".into()));
-                }
-                self.depth.set(d + 1);
-                let mut body = para.body.clone();
-                let mut arg_idx = 0;
-                for pd in &para.params {
-                    for pn in &pd.names {
-                        body = replace_var_formula(&body, pn, &args[arg_idx]);
-                        arg_idx += 1;
-                    }
-                }
-                let out = self.lower_formula(arena, &body, env)?;
-                self.depth.set(d);
-                out
-            }
+            Formula::Call(name, args, pos) => self.lower_formula_call(arena, name, args, *pos, env)?,
             Formula::LetBind(binds, body) => {
                 let mut scope = HashMap::new();
                 for (name, e) in binds {
@@ -4456,62 +4591,7 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 });
                 arena.bool_formula(true)
             }
-            Formula::Cmp(kind, l, r, _) => {
-                // Decimal-literal value equality (`R = 1.2`): the literal
-                // denotes an EReal *value* (lane equalities, i.e.
-                // `setEReal`), since `extends` siblings are disjoint as
-                // sets. Lane-vs-literal (`x.m = 3`) keeps the integer
-                // reading below; other shapes keep the legacy relational
-                // reading.
-                if matches!(kind, CmpKind::Eq | CmpKind::Neq) {
-                    if let Some(rw) = self.rewrite_ereal_lit_cmp(kind, l, r)? {
-                        return self.lower_formula(arena, &rw, env);
-                    }
-                    if let Some(rw) = self.rewrite_lane_lit_cmp(kind, l, r)? {
-                        return self.lower_formula(arena, &rw, env);
-                    }
-                }
-                let (el, al) = self.lower_expr(arena, l, env)?;
-                let (er, ar) = self.lower_expr(arena, r, env)?;
-                // Auto-promote lower arity side for comparisons
-                let (el, er) = if al < ar {
-                    let mut promoted = el;
-                    let univ = arena.constant(kk::ConstantExpr::Univ);
-                    for _ in al..ar {
-                        promoted = arena
-                            .binary_expr(kk::BinaryOp::Product, promoted, univ)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                    }
-                    (promoted, er)
-                } else if ar < al {
-                    let mut promoted = er;
-                    let univ = arena.constant(kk::ConstantExpr::Univ);
-                    for _ in ar..al {
-                        promoted = arena
-                            .binary_expr(kk::BinaryOp::Product, univ, promoted)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                    }
-                    (el, promoted)
-                } else {
-                    (el, er)
-                };
-                let final_ar = arena.arity(el);
-                let final_ar2 = arena.arity(er);
-                let base = match kind {
-                    CmpKind::Eq | CmpKind::Neq => {
-                        arena.comparison(ExprCompOp::Equals, el, er)
-                            .map_err(|e| FrontError::Resolve(format!("{e} (final arities: {final_ar} vs {final_ar2}, original: {al} vs {ar})")))?
-                    }
-                    CmpKind::In | CmpKind::NotIn => {
-                        arena.comparison(ExprCompOp::Subset, el, er)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?
-                    }
-                };
-                match kind {
-                    CmpKind::Neq | CmpKind::NotIn => arena.not(base),
-                    _ => base,
-                }
-            }
+            Formula::Cmp(kind, l, r, _) => self.lower_formula_cmp(arena, kind, l, r, env)?,
             Formula::IntCmp(op, l, r, _) => {
                 let il = self.lower_int(arena, l, env)?;
                 let ir = self.lower_int(arena, r, env)?;
@@ -4539,168 +4619,344 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 };
                 arena.multiplicity_formula(m, ee).unwrap()
             }
-            Formula::Quant(kind, decls, body) => {
-                match kind {
-                    QuantKind::All | QuantKind::Some => {
-                        let q = if *kind == QuantKind::All {
-                            Quantifier::All
-                        } else {
-                            Quantifier::Some
-                        };
-                        // `disj` groups contribute x != y conjuncts/guards
-                        let disj_pairs = collect_disj_pairs(decls, arena);
-                        let (ds, pushed) = self.lower_decls(arena, decls, env)?;
-                        let mut bf = self.lower_formula(arena, body, env)?;
-                        for _ in 0..pushed {
-                            env.pop();
-                        }
-                        for &(a, b) in &disj_pairs {
-                            let neq = var_neq(arena, a, b);
-                            if *kind == QuantKind::All {
-                                // all disj x,y | F  ==  all x,y | x!=y => F
-                                let nb = arena.not(neq);
-                                bf = arena.or(&[nb, bf]);
-                            } else {
-                                // some disj x,y | F  ==  some x,y | F && x!=y
-                                bf = arena.and(&[bf, neq]);
-                            }
-                        }
-                        arena.quantified(q, ds, bf)
-                    }
-                    QuantKind::No => {
-                        let inner = Formula::Quant(QuantKind::Some, decls.clone(), body.clone());
-                        let sf = self.lower_formula(arena, &inner, env)?;
-                        arena.not(sf)
-                    }
-                    QuantKind::Lone | QuantKind::One => {
-                        // lone x: D | F  ==  not some disj pairs both satisfying F
-                        // one x: D | F  ==  some x: D | F  and  lone x: D | F
-                        if decls.len() != 1 || decls[0].names.len() != 1 || decls[0].disj {
-                            return self.unsup("lone/one quantifier shape");
-                        }
-                        let name = decls[0].names[0].clone();
-                        let alt = format!("{}'", name);
-                        let second = subst_formula(body, &name, &alt);
-                        // decls for x' reuse same domain
-                        let mut ds2 = decls.clone();
-                        ds2[0].names = vec![alt.clone()];
-                        let neq = Formula::Cmp(
-                            CmpKind::Neq,
-                            Expr::Name(name.clone(), 0),
-                            Expr::Name(alt.clone(), 0),
-                            0,
-                        );
-                        let pair_body = Formula::And(
-                            Box::new((**body).clone()),
-                            Box::new(Formula::And(Box::new(second), Box::new(neq))),
-                        );
-                        let two = Formula::Quant(
-                            QuantKind::Some,
-                            vec![
-                                decls[0].clone(),
-                                Decl {
-                                    disj: false,
-                                    names: vec![alt],
-                                    expr: decls[0].expr.clone(),
-                                    pos: decls[0].pos,
-                                    is_var: false,
-                                },
-                            ],
-                            Box::new(pair_body),
-                        );
-                        let _ = ds2;
-                        let two_f = self.lower_formula(arena, &two, env)?;
-                        let not_two = arena.not(two_f);
-                        if *kind == QuantKind::Lone {
-                            return Ok(not_two);
-                        }
-                        let some1 = self.lower_formula(
-                            arena,
-                            &Formula::Quant(
-                                QuantKind::Some,
-                                decls.clone(),
-                                Box::new((**body).clone()),
-                            ),
-                            env,
-                        )?;
-                        arena.and(&[some1, not_two])
-                    }
-                }
-            }
+            Formula::Quant(kind, decls, body) => self.lower_formula_quant(arena, kind, decls, body, env)?,
             Formula::Always(inner) => {
-                let f = self.lower_formula(arena, inner, env)?;
-                arena.temporal_unary(kk::TemporalFormulaOp::Always, f)
+                self.lower_temporal_unary(arena, kk::TemporalFormulaOp::Always, inner, env)?
             }
             Formula::Eventually(inner) => {
-                let f = self.lower_formula(arena, inner, env)?;
-                arena.temporal_unary(kk::TemporalFormulaOp::Eventually, f)
+                self.lower_temporal_unary(arena, kk::TemporalFormulaOp::Eventually, inner, env)?
             }
             Formula::Until(left, right) => {
-                let fl = self.lower_formula(arena, left, env)?;
-                let fr = self.lower_formula(arena, right, env)?;
-                arena.temporal_binary(kk::TemporalBinaryOp::Until, fl, fr)
+                self.lower_temporal_binary(arena, kk::TemporalBinaryOp::Until, left, right, env)?
             }
             Formula::Releases(left, right) => {
-                let fl = self.lower_formula(arena, left, env)?;
-                let fr = self.lower_formula(arena, right, env)?;
-                arena.temporal_binary(kk::TemporalBinaryOp::Releases, fl, fr)
+                self.lower_temporal_binary(arena, kk::TemporalBinaryOp::Releases, left, right, env)?
             }
             Formula::Before(inner) => {
-                let f = self.lower_formula(arena, inner, env)?;
-                arena.temporal_unary(kk::TemporalFormulaOp::Before, f)
+                self.lower_temporal_unary(arena, kk::TemporalFormulaOp::Before, inner, env)?
             }
             Formula::Historically(inner) => {
-                let f = self.lower_formula(arena, inner, env)?;
-                arena.temporal_unary(kk::TemporalFormulaOp::Historically, f)
+                self.lower_temporal_unary(arena, kk::TemporalFormulaOp::Historically, inner, env)?
             }
             Formula::Once(inner) => {
-                let f = self.lower_formula(arena, inner, env)?;
-                arena.temporal_unary(kk::TemporalFormulaOp::Once, f)
+                self.lower_temporal_unary(arena, kk::TemporalFormulaOp::Once, inner, env)?
             }
             Formula::Since(left, right) => {
-                let fl = self.lower_formula(arena, left, env)?;
-                let fr = self.lower_formula(arena, right, env)?;
-                arena.temporal_binary(kk::TemporalBinaryOp::Since, fl, fr)
+                self.lower_temporal_binary(arena, kk::TemporalBinaryOp::Since, left, right, env)?
             }
             Formula::Triggered(left, right) => {
-                let fl = self.lower_formula(arena, left, env)?;
-                let fr = self.lower_formula(arena, right, env)?;
-                arena.temporal_binary(kk::TemporalBinaryOp::Triggered, fl, fr)
+                self.lower_temporal_binary(arena, kk::TemporalBinaryOp::Triggered, left, right, env)?
             }
             Formula::Keeping(inner) => {
-                let f = self.lower_formula(arena, inner, env)?;
-                arena.temporal_unary(kk::TemporalFormulaOp::Keeping, f)
+                self.lower_temporal_unary(arena, kk::TemporalFormulaOp::Keeping, inner, env)?
             }
             Formula::Goal(inner) => {
                 // Markers inside take the goal (last) state; restore the
                 // outer context afterwards (innermost operator wins).
-                let prev = self.marker_time.replace(Some(TimePoint::Last));
-                let f = self.lower_formula(arena, inner, env)?;
-                self.marker_time.set(prev);
-                arena.temporal_unary(kk::TemporalFormulaOp::Goal, f)
+                self.lower_temporal_pinned(arena, kk::TemporalFormulaOp::Goal, inner, env, TimePoint::Last)?
             }
             Formula::Restore(inner) => {
-                let prev = self.marker_time.replace(Some(TimePoint::Loop));
-                let f = self.lower_formula(arena, inner, env)?;
-                self.marker_time.set(prev);
-                arena.temporal_unary(kk::TemporalFormulaOp::Restore, f)
+                self.lower_temporal_pinned(arena, kk::TemporalFormulaOp::Restore, inner, env, TimePoint::Loop)?
             }
             Formula::Initially(inner) => {
-                let prev = self.marker_time.replace(Some(TimePoint::First));
-                let f = self.lower_formula(arena, inner, env)?;
-                self.marker_time.set(prev);
-                arena.temporal_unary(kk::TemporalFormulaOp::Initially, f)
+                self.lower_temporal_pinned(arena, kk::TemporalFormulaOp::Initially, inner, env, TimePoint::First)?
             }
             Formula::Regularly(inner) => {
-                let f = self.lower_formula(arena, inner, env)?;
-                arena.temporal_unary(kk::TemporalFormulaOp::Regularly, f)
+                self.lower_temporal_unary(arena, kk::TemporalFormulaOp::Regularly, inner, env)?
             }
             Formula::Consistently(inner) => {
-                let f = self.lower_formula(arena, inner, env)?;
-                arena.temporal_unary(kk::TemporalFormulaOp::Consistently, f)
+                self.lower_temporal_unary(arena, kk::TemporalFormulaOp::Consistently, inner, env)?
             }
         })
     }
+
+    /// Set comparisons (`=`, `!=`, `in`, `!in`) with decimal-literal
+    /// and lane-literal rewrites plus univ-padded arity promotion.
+    fn lower_formula_cmp(
+        &self,
+        arena: &mut kk::AstArena,
+        kind: &CmpKind,
+        l: &Expr,
+        r: &Expr,
+        env: &mut Env,
+    ) -> LResult<FormulaId> {
+        // Decimal-literal value equality (`R = 1.2`): the literal
+        // denotes an EReal *value* (lane equalities, i.e.
+        // `setEReal`), since `extends` siblings are disjoint as
+        // sets. Lane-vs-literal (`x.m = 3`) keeps the integer
+        // reading below; other shapes keep the legacy relational
+        // reading.
+        if matches!(kind, CmpKind::Eq | CmpKind::Neq) {
+            if let Some(rw) = self.rewrite_ereal_lit_cmp(kind, l, r)? {
+                return self.lower_formula(arena, &rw, env);
+            }
+            if let Some(rw) = self.rewrite_lane_lit_cmp(kind, l, r)? {
+                return self.lower_formula(arena, &rw, env);
+            }
+        }
+        let (el, al) = self.lower_expr(arena, l, env)?;
+        let (er, ar) = self.lower_expr(arena, r, env)?;
+        // Auto-promote lower arity side for comparisons
+        let (el, er) = if al < ar {
+            (self.promote_arity(arena, el, al, ar, false)?, er)
+        } else if ar < al {
+            (el, self.promote_arity(arena, er, ar, al, true)?)
+        } else {
+            (el, er)
+        };
+        let final_ar = arena.arity(el);
+        let final_ar2 = arena.arity(er);
+        let base = match kind {
+            CmpKind::Eq | CmpKind::Neq => {
+                arena.comparison(ExprCompOp::Equals, el, er)
+                    .map_err(|e| FrontError::Resolve(format!("{e} (final arities: {final_ar} vs {final_ar2}, original: {al} vs {ar})")))?
+            }
+            CmpKind::In | CmpKind::NotIn => {
+                arena.comparison(ExprCompOp::Subset, el, er)
+                    .map_err(|e| FrontError::Resolve(e.to_string()))?
+            }
+        };
+        let result = match kind {
+            CmpKind::Neq | CmpKind::NotIn => arena.not(base),
+            _ => base,
+        };
+        Ok(result)
+    }
+
+    /// Quantifiers: `all`/`some` (with `disj` guards), `no` (as
+    /// negated `some`), and `lone`/`one` (as pairwise uniqueness).
+    fn lower_formula_quant(
+        &self,
+        arena: &mut kk::AstArena,
+        kind: &QuantKind,
+        decls: &[Decl],
+        body: &Formula,
+        env: &mut Env,
+    ) -> LResult<FormulaId> {
+        Ok(match kind {
+            QuantKind::All | QuantKind::Some => {
+                let q = if *kind == QuantKind::All {
+                    Quantifier::All
+                } else {
+                    Quantifier::Some
+                };
+                // `disj` groups contribute x != y conjuncts/guards
+                let disj_pairs = collect_disj_pairs(decls, arena);
+                let (ds, pushed) = self.lower_decls(arena, decls, env)?;
+                let mut bf = self.lower_formula(arena, body, env)?;
+                for _ in 0..pushed {
+                    env.pop();
+                }
+                for &(a, b) in &disj_pairs {
+                    let neq = var_neq(arena, a, b);
+                    if *kind == QuantKind::All {
+                        // all disj x,y | F  ==  all x,y | x!=y => F
+                        let nb = arena.not(neq);
+                        bf = arena.or(&[nb, bf]);
+                    } else {
+                        // some disj x,y | F  ==  some x,y | F && x!=y
+                        bf = arena.and(&[bf, neq]);
+                    }
+                }
+                arena.quantified(q, ds, bf)
+            }
+            QuantKind::No => {
+                let inner = Formula::Quant(QuantKind::Some, decls.to_vec(), Box::new((*body).clone()));
+                let sf = self.lower_formula(arena, &inner, env)?;
+                arena.not(sf)
+            }
+            QuantKind::Lone | QuantKind::One => {
+                // lone x: D | F  ==  not some disj pairs both satisfying F
+                // one x: D | F  ==  some x: D | F  and  lone x: D | F
+                if decls.len() != 1 || decls[0].names.len() != 1 || decls[0].disj {
+                    return self.unsup("lone/one quantifier shape");
+                }
+                let name = decls[0].names[0].clone();
+                let alt = format!("{}'", name);
+                let second = subst_formula(body, &name, &alt);
+                // decls for x' reuse same domain
+                let mut ds2 = decls.to_vec();
+                ds2[0].names = vec![alt.clone()];
+                let neq = Formula::Cmp(
+                    CmpKind::Neq,
+                    Expr::Name(name.clone(), 0),
+                    Expr::Name(alt.clone(), 0),
+                    0,
+                );
+                let pair_body = Formula::And(
+                    Box::new((*body).clone()),
+                    Box::new(Formula::And(Box::new(second), Box::new(neq))),
+                );
+                let two = Formula::Quant(
+                    QuantKind::Some,
+                    vec![
+                        decls[0].clone(),
+                        Decl {
+                            disj: false,
+                            names: vec![alt],
+                            expr: decls[0].expr.clone(),
+                            pos: decls[0].pos,
+                            is_var: false,
+                        },
+                    ],
+                    Box::new(pair_body),
+                );
+                let _ = ds2;
+                let two_f = self.lower_formula(arena, &two, env)?;
+                let not_two = arena.not(two_f);
+                if *kind == QuantKind::Lone {
+                    return Ok(not_two);
+                }
+                let some1 = self.lower_formula(
+                    arena,
+                    &Formula::Quant(
+                        QuantKind::Some,
+                        decls.to_vec(),
+                        Box::new((*body).clone()),
+                    ),
+                    env,
+                )?;
+                arena.and(&[some1, not_two])
+            }
+        })
+    }
+
+    /// Temporal operators over one already-lowered operand.
+    fn lower_temporal_unary(
+        &self,
+        arena: &mut kk::AstArena,
+        op: kk::TemporalFormulaOp,
+        inner: &Formula,
+        env: &mut Env,
+    ) -> LResult<FormulaId> {
+        let f = self.lower_formula(arena, inner, env)?;
+        Ok(arena.temporal_unary(op, f))
+    }
+
+    /// Temporal operators over two already-lowered operands.
+    fn lower_temporal_binary(
+        &self,
+        arena: &mut kk::AstArena,
+        op: kk::TemporalBinaryOp,
+        left: &Formula,
+        right: &Formula,
+        env: &mut Env,
+    ) -> LResult<FormulaId> {
+        let fl = self.lower_formula(arena, left, env)?;
+        let fr = self.lower_formula(arena, right, env)?;
+        Ok(arena.temporal_binary(op, fl, fr))
+    }
+
+    /// Temporal operators that pin the in-body optimization clock
+    /// (`Goal`/`Restore`/`Initially`); the outer context is restored
+    /// afterwards (innermost operator wins).
+    fn lower_temporal_pinned(
+        &self,
+        arena: &mut kk::AstArena,
+        op: kk::TemporalFormulaOp,
+        inner: &Formula,
+        env: &mut Env,
+        time: TimePoint,
+    ) -> LResult<FormulaId> {
+        let prev = self.marker_time.replace(Some(time));
+        let f = self.lower_formula(arena, inner, env)?;
+        self.marker_time.set(prev);
+        Ok(arena.temporal_unary(op, f))
+    }
+
+    /// Predicate calls: `totalOrder` (bounds-only, formula is true),
+    /// ordering/EReal/Real/stdlib builtins, the `some a.f[b]` field
+    /// fallback, and user `pred` inlining (with recursion guard).
+    fn lower_formula_call(
+        &self,
+        arena: &mut kk::AstArena,
+        name: &str,
+        args: &[Expr],
+        pos: usize,
+        env: &mut Env,
+    ) -> LResult<FormulaId> {
+        // `totalOrder[S, S.next]`: order fixing is applied via
+        // exact bounds on the binary links (i.e. `S<:next`);
+        // the formula itself is true.
+        if name == "totalOrder" {
+            if args.len() != 2 {
+                return Err(FrontError::Resolve(format!(
+                    "'totalOrder' expects 2 args, got {}",
+                    args.len()
+                )));
+            }
+            if total_order_target(&args[0], &args[1]).is_none() {
+                return Err(FrontError::Resolve(
+                    "'totalOrder' expects (S, S<:f) or (S, S.f) or (S, f)".into(),
+                ));
+            }
+            return Ok(arena.bool_formula(true));
+        }
+        // Check ordering builtins first
+        if let Some(f) = self.try_ordering_pred(arena, name, args, env)? {
+            return Ok(f);
+        }
+        // Builtin `EReal` predicates (desugared to lane constraints).
+        if let Some(f) = self.try_ereal_pred(arena, name, args, env)? {
+            return Ok(f);
+        }
+        // Builtin `Real` predicates (exact-centre lane constraints).
+        if let Some(f) = self.try_real_pred(arena, name, args, env)? {
+            return Ok(f);
+        }
+        // Check stdlib builtins (graph, relation)
+        if let Some(f) = self.try_stdlib_pred(arena, name, args, env)? {
+            return Ok(f);
+        }
+        // Field fallback: `a.f[b]` as a formula means `some a.f[b]`.
+        let is_pred = self
+            .module
+            .paras
+            .iter()
+            .any(|p| p.name.as_str() == name && !p.is_fun);
+        if !is_pred && self.lookup_rel(name).is_some() {
+            let base = Expr::Call(name.to_string(), Vec::new(), pos);
+            let e = Expr::Bracket(
+                Box::new(base),
+                args.iter().map(|a| Box::new(a.clone())).collect(),
+            );
+            let (ee, _) = self.lower_expr(arena, &e, env)?;
+            let mf = arena.multiplicity_formula(Multiplicity::Some, ee).unwrap();
+            return Ok(mf);
+        }
+        let para = self
+            .module
+            .paras
+            .iter()
+            .find(|p| p.name.as_str() == name && !p.is_fun)
+            .ok_or_else(|| FrontError::Resolve(format!("unknown predicate '{name}'")))?;
+        // Flatten multi-name declarations: "t, t\": Type" counts as 2 params
+        let total_param_names: usize = para.params.iter().map(|d| d.names.len()).sum();
+        if total_param_names != args.len() {
+            return Err(FrontError::Resolve(format!(
+                "'{name}' expects {} args, got {}",
+                total_param_names,
+                args.len()
+            )));
+        }
+        let d = self.depth.get();
+        if d > 64 {
+            return Err(FrontError::Resolve("call recursion too deep".into()));
+        }
+        self.depth.set(d + 1);
+        let mut body = para.body.clone();
+        let mut arg_idx = 0;
+        for pd in &para.params {
+            for pn in &pd.names {
+                body = replace_var_formula(&body, pn, &args[arg_idx]);
+                arg_idx += 1;
+            }
+        }
+        let out = self.lower_formula(arena, &body, env)?;
+        self.depth.set(d);
+        Ok(out)
+    }
+
 }
 
 /// A normalized `partial` entry: comparison operands already in order.
@@ -4763,72 +5019,352 @@ fn collect_pin_labels(e: &Expr, out: &mut Vec<(String, String, String)>) -> LRes
 
 /// Textual variable renaming used by lone/one desugaring; stops at
 /// shadowing redeclarations of `from`.
-fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
+/// Leaf action for the shared variable-substitution traversal:
+/// either rename `from` to another name, or replace it with an expression.
+/// Also reused by the query-time value enumeration (`snippet.rs`).
+pub(crate) enum NameTarget<'a> {
+    Rename(&'a str),
+    Replace(&'a Expr),
+}
+
+impl<'a> NameTarget<'a> {
+    fn map_name(&self, name: &str, from: &str, pos: usize) -> Option<Expr> {
+        if name != from {
+            return None;
+        }
+        match self {
+            NameTarget::Rename(to) => Some(Expr::Name((*to).to_string(), pos)),
+            NameTarget::Replace(to) => Some((*to).clone()),
+        }
+    }
+}
+
+fn fold_decl(d: &Decl, from: &str, to: &NameTarget) -> Decl {
+    Decl {
+        disj: d.disj,
+        names: d.names.clone(),
+        expr: fold_expr(&d.expr, from, to),
+        pos: d.pos,
+        is_var: d.is_var,
+    }
+}
+
+fn fold_decls(ds: &[Decl], from: &str, to: &NameTarget) -> Vec<Decl> {
+    ds.iter().map(|d| fold_decl(d, from, to)).collect()
+}
+
+/// Faithful-literal pre-pass: rewrite user-syntax `IntExpr::Lit` nodes to
+/// faithful values (`8` under W=4 becomes `-8`) BEFORE lowering, so
+/// lowering-internal literals (lane indices, shifts, counts) are never
+/// touched. Runs at lowering drivers (command facts/bodies/objectives,
+/// query roots); idempotent.
+///
+/// `IntCmp` nodes comparing against genuine counts (`#X = 8`) keep raw
+/// literals in the whole comparison; every other position folds.
+/// Degenerate widths leave trees untouched.
+pub(crate) fn fold_user_lits_formula(f: &Formula, w: u32) -> Formula {
+    if w == 0 || w > 62 {
+        return f.clone();
+    }
+    go_lit_formula(f, w)
+}
+
+/// Faithful-literal pre-pass for bare integer-expression roots
+/// (`:query 8 + 8`, optimization targets): no comparison context, so all
+/// literals fold.
+pub(crate) fn fold_user_lits_int(ie: &IntExpr, w: u32) -> IntExpr {
+    if w == 0 || w > 62 {
+        return ie.clone();
+    }
+    go_lit_int(ie, w, true)
+}
+
+/// Faithful-literal pre-pass for bare expression roots (set expressions
+/// hold no integers except inside nested formulas).
+pub(crate) fn fold_user_lits_expr(e: &Expr, w: u32) -> Expr {
+    if w == 0 || w > 62 {
+        return e.clone();
+    }
+    go_lit_expr(e, w)
+}
+
+fn go_lit_formula(f: &Formula, w: u32) -> Formula {
+    match f {
+        Formula::Const(_) | Formula::Pin(..) => f.clone(),
+        Formula::IntCmp(op, a, b, p) => {
+            // Fold literals only against bare bitmask readings (`X = 8`:
+            // the literal denotes the same bit pattern). Pure arithmetic
+            // stays genuine (`7 < 8` is true), as do genuine counts
+            // (`#X = 8`) and lane values (`x.m = 8`). Judged per node:
+            // nested comparisons decide independently.
+            let clean =
+                !(a.has_count() || b.has_count() || a.has_lane() || b.has_lane());
+            let en_a = clean && is_bare_bitmask(b);
+            let en_b = clean && is_bare_bitmask(a);
+            Formula::IntCmp(
+                *op,
+                go_lit_int(a, w, en_a),
+                go_lit_int(b, w, en_b),
+                *p,
+            )
+        }
+        Formula::Maximize(ie) => Formula::Maximize(go_lit_int(ie, w, true)),
+        Formula::Minimize(ie) => Formula::Minimize(go_lit_int(ie, w, true)),
+        Formula::MaxSome(e) => Formula::MaxSome(Box::new(go_lit_expr(e, w))),
+        Formula::MinSome(e) => Formula::MinSome(Box::new(go_lit_expr(e, w))),
+        Formula::OverflowCond(m, body) => {
+            Formula::OverflowCond(*m, Box::new(go_lit_formula(body, w)))
+        }
+        Formula::MaxSomeDecl(ds, body) => Formula::MaxSomeDecl(
+            ds.iter()
+                .map(|d| Decl {
+                    expr: go_lit_expr(&d.expr, w),
+                    ..d.clone()
+                })
+                .collect(),
+            Box::new(go_lit_formula(body, w)),
+        ),
+        Formula::Not(x) => Formula::Not(Box::new(go_lit_formula(x, w))),
+        Formula::And(a, b) => Formula::And(
+            Box::new(go_lit_formula(a, w)),
+            Box::new(go_lit_formula(b, w)),
+        ),
+        Formula::Or(a, b) => Formula::Or(
+            Box::new(go_lit_formula(a, w)),
+            Box::new(go_lit_formula(b, w)),
+        ),
+        Formula::Implies(a, b) => Formula::Implies(
+            Box::new(go_lit_formula(a, w)),
+            Box::new(go_lit_formula(b, w)),
+        ),
+        Formula::Iff(a, b) => Formula::Iff(
+            Box::new(go_lit_formula(a, w)),
+            Box::new(go_lit_formula(b, w)),
+        ),
+        Formula::Cmp(k, a, b, p) => Formula::Cmp(
+            *k,
+            go_lit_expr(a, w),
+            go_lit_expr(b, w),
+            *p,
+        ),
+        Formula::BadIn(a, p) => Formula::BadIn(Box::new(go_lit_expr(a, w)), *p),
+        Formula::Multi(k, e, p) => Formula::Multi(*k, go_lit_expr(e, w), *p),
+        Formula::Quant(k, decls, body) => Formula::Quant(
+            *k,
+            decls
+                .iter()
+                .map(|d| Decl {
+                    expr: go_lit_expr(&d.expr, w),
+                    ..d.clone()
+                })
+                .collect(),
+            Box::new(go_lit_formula(body, w)),
+        ),
+        Formula::LetBind(binds, body) => Formula::LetBind(
+            binds
+                .iter()
+                .map(|(n, e)| (n.clone(), go_lit_expr(e, w)))
+                .collect(),
+            Box::new(go_lit_formula(body, w)),
+        ),
+        Formula::Call(name, args, p) => Formula::Call(
+            name.clone(),
+            args.iter().map(|a| go_lit_expr(a, w)).collect(),
+            *p,
+        ),
+        Formula::Always(inner) => Formula::Always(Box::new(go_lit_formula(inner, w))),
+        Formula::Eventually(inner) => {
+            Formula::Eventually(Box::new(go_lit_formula(inner, w)))
+        }
+        Formula::Until(a, b) => Formula::Until(
+            Box::new(go_lit_formula(a, w)),
+            Box::new(go_lit_formula(b, w)),
+        ),
+        Formula::Releases(a, b) => Formula::Releases(
+            Box::new(go_lit_formula(a, w)),
+            Box::new(go_lit_formula(b, w)),
+        ),
+        Formula::Before(inner) => Formula::Before(Box::new(go_lit_formula(inner, w))),
+        Formula::Historically(inner) => {
+            Formula::Historically(Box::new(go_lit_formula(inner, w)))
+        }
+        Formula::Once(inner) => Formula::Once(Box::new(go_lit_formula(inner, w))),
+        Formula::Since(a, b) => Formula::Since(
+            Box::new(go_lit_formula(a, w)),
+            Box::new(go_lit_formula(b, w)),
+        ),
+        Formula::Triggered(a, b) => Formula::Triggered(
+            Box::new(go_lit_formula(a, w)),
+            Box::new(go_lit_formula(b, w)),
+        ),
+        Formula::Keeping(inner) => Formula::Keeping(Box::new(go_lit_formula(inner, w))),
+        Formula::Goal(inner) => Formula::Goal(Box::new(go_lit_formula(inner, w))),
+        Formula::Restore(inner) => Formula::Restore(Box::new(go_lit_formula(inner, w))),
+        Formula::Initially(inner) => {
+            Formula::Initially(Box::new(go_lit_formula(inner, w)))
+        }
+        Formula::Regularly(inner) => {
+            Formula::Regularly(Box::new(go_lit_formula(inner, w)))
+        }
+        Formula::Consistently(inner) => {
+            Formula::Consistently(Box::new(go_lit_formula(inner, w)))
+        }
+    }
+}
+
+fn go_lit_expr(e: &Expr, w: u32) -> Expr {
+    match e {
+        Expr::Name(..)
+        | Expr::Univ
+        | Expr::None_
+        | Expr::Iden
+        | Expr::IntAtom
+        | Expr::StepAtom
+        | Expr::Bits(..)
+        | Expr::RealLit(..)
+        | Expr::ApproxRealLit(..) => e.clone(),
+        Expr::Bin(op, a, b) => Expr::Bin(
+            *op,
+            Box::new(go_lit_expr(a, w)),
+            Box::new(go_lit_expr(b, w)),
+        ),
+        Expr::Transpose(x) => Expr::Transpose(Box::new(go_lit_expr(x, w))),
+        Expr::TClosure(x) => Expr::TClosure(Box::new(go_lit_expr(x, w))),
+        Expr::RClosure(x) => Expr::RClosure(Box::new(go_lit_expr(x, w))),
+        Expr::Comprehension(ds, body) => Expr::Comprehension(
+            ds.iter()
+                .map(|d| Decl {
+                    expr: go_lit_expr(&d.expr, w),
+                    ..d.clone()
+                })
+                .collect(),
+            Box::new(go_lit_formula(body, w)),
+        ),
+        Expr::Find(sel, ds, body) => Expr::Find(
+            *sel,
+            ds.iter()
+                .map(|d| Decl {
+                    expr: go_lit_expr(&d.expr, w),
+                    ..d.clone()
+                })
+                .collect(),
+            Box::new(go_lit_formula(body, w)),
+        ),
+        Expr::If(c, t, el) => Expr::If(
+            Box::new(go_lit_formula(c, w)),
+            Box::new(go_lit_expr(t, w)),
+            Box::new(go_lit_expr(el, w)),
+        ),
+        Expr::Bracket(b, args) => Expr::Bracket(
+            Box::new(go_lit_expr(b, w)),
+            args.iter().map(|a| Box::new(go_lit_expr(a, w))).collect(),
+        ),
+        Expr::ArrowMult(m, x) => Expr::ArrowMult(*m, Box::new(go_lit_expr(x, w))),
+        Expr::LeadMult(m, x) => Expr::LeadMult(*m, Box::new(go_lit_expr(x, w))),
+        Expr::Call(n, args, p) => Expr::Call(
+            n.clone(),
+            args.iter().map(|a| go_lit_expr(a, w)).collect(),
+            *p,
+        ),
+        Expr::Prime(x) => Expr::Prime(Box::new(go_lit_expr(x, w))),
+        Expr::AtExpr(x) => Expr::AtExpr(Box::new(go_lit_expr(x, w))),
+        Expr::LetBind(binds, body) => Expr::LetBind(
+            binds
+                .iter()
+                .map(|(n, ex)| (n.clone(), go_lit_expr(ex, w)))
+                .collect(),
+            Box::new(go_lit_expr(body, w)),
+        ),
+    }
+}
+
+/// Bare bitmask readings: `Val`/`BitsVal` of a set (as opposed to genuine
+/// integer computations like `Bin`/`Sum`/`Card`). Literals facing one read
+/// as the same bit pattern (`X = 8` ⟺ `X = {3}` under W=4).
+fn is_bare_bitmask(ie: &IntExpr) -> bool {
+    matches!(ie, IntExpr::Val(..) | IntExpr::BitsVal(..))
+}
+
+fn go_lit_int(ie: &IntExpr, w: u32, on: bool) -> IntExpr {
+    match ie {
+        IntExpr::Lit(v, p) => {
+            if on {
+                IntExpr::Lit(crate::types::faithful_int(*v, w), *p)
+            } else {
+                ie.clone()
+            }
+        }
+        IntExpr::Card(e, p) => IntExpr::Card(Box::new(go_lit_expr(e, w)), *p),
+        IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(go_lit_expr(e, w)), *p),
+        IntExpr::BitsVal(e, p) => IntExpr::BitsVal(Box::new(go_lit_expr(e, w)), *p),
+        IntExpr::Val(e, p) => IntExpr::Val(Box::new(go_lit_expr(e, w)), *p),
+        IntExpr::Sum(ds, body, p) => IntExpr::Sum(
+            ds.iter()
+                .map(|d| Decl {
+                    expr: go_lit_expr(&d.expr, w),
+                    ..d.clone()
+                })
+                .collect(),
+            Box::new(go_lit_int(body, w, true)),
+            *p,
+        ),
+        IntExpr::Bin(op, a, b) => IntExpr::Bin(
+            *op,
+            Box::new(go_lit_int(a, w, true)),
+            Box::new(go_lit_int(b, w, true)),
+        ),
+        IntExpr::Widen(op, a, b) => IntExpr::Widen(
+            *op,
+            Box::new(go_lit_int(a, w, true)),
+            Box::new(go_lit_int(b, w, true)),
+        ),
+    }
+}
+
+pub(crate) fn fold_formula(f: &Formula, from: &str, to: &NameTarget) -> Formula {
     match f {
         Formula::Const(v) => Formula::Const(*v),
         // `pin` names a partial block, not a variable: untouched.
         Formula::Pin(name, pos) => Formula::Pin(name.clone(), *pos),
-        Formula::MaxSome(e) => Formula::MaxSome(Box::new(subst_expr(e, from, to))),
-        Formula::MinSome(e) => Formula::MinSome(Box::new(subst_expr(e, from, to))),
+        Formula::MaxSome(e) => Formula::MaxSome(Box::new(fold_expr(e, from, to))),
+        Formula::MinSome(e) => Formula::MinSome(Box::new(fold_expr(e, from, to))),
         Formula::OverflowCond(m, body) => {
-            Formula::OverflowCond(*m, Box::new(subst_formula(body, from, to)))
+            Formula::OverflowCond(*m, Box::new(fold_formula(body, from, to)))
         }
-        Formula::Maximize(ie) => Formula::Maximize(subst_int(ie, from, to)),
-        Formula::Minimize(ie) => Formula::Minimize(subst_int(ie, from, to)),
+        Formula::Maximize(ie) => Formula::Maximize(fold_int(ie, from, to)),
+        Formula::Minimize(ie) => Formula::Minimize(fold_int(ie, from, to)),
         Formula::MaxSomeDecl(ds, body) => {
-            let nd = ds
-                .iter()
-                .map(|d| crate::ast::Decl {
-                    disj: d.disj,
-                    names: d.names.clone(),
-                    expr: subst_expr(&d.expr, from, to),
-                    pos: d.pos,
-                    is_var: d.is_var,
-                })
-                .collect();
-            Formula::MaxSomeDecl(nd, Box::new(subst_formula(body, from, to)))
+            Formula::MaxSomeDecl(fold_decls(ds, from, to), Box::new(fold_formula(body, from, to)))
         }
-        Formula::Not(x) => Formula::Not(Box::new(subst_formula(x, from, to))),
+        Formula::Not(x) => Formula::Not(Box::new(fold_formula(x, from, to))),
         Formula::And(a, b) => Formula::And(
-            Box::new(subst_formula(a, from, to)),
-            Box::new(subst_formula(b, from, to)),
+            Box::new(fold_formula(a, from, to)),
+            Box::new(fold_formula(b, from, to)),
         ),
         Formula::Or(a, b) => Formula::Or(
-            Box::new(subst_formula(a, from, to)),
-            Box::new(subst_formula(b, from, to)),
+            Box::new(fold_formula(a, from, to)),
+            Box::new(fold_formula(b, from, to)),
         ),
         Formula::Implies(a, b) => Formula::Implies(
-            Box::new(subst_formula(a, from, to)),
-            Box::new(subst_formula(b, from, to)),
+            Box::new(fold_formula(a, from, to)),
+            Box::new(fold_formula(b, from, to)),
         ),
         Formula::Iff(a, b) => Formula::Iff(
-            Box::new(subst_formula(a, from, to)),
-            Box::new(subst_formula(b, from, to)),
+            Box::new(fold_formula(a, from, to)),
+            Box::new(fold_formula(b, from, to)),
         ),
-        Formula::Cmp(k, a, b, p) => {
-            Formula::Cmp(*k, subst_expr(a, from, to), subst_expr(b, from, to), *p)
-        }
-        Formula::BadIn(a, p) => Formula::BadIn(Box::new(subst_expr(a, from, to)), *p),
+        Formula::Cmp(k, a, b, p) => Formula::Cmp(*k, fold_expr(a, from, to), fold_expr(b, from, to), *p),
+        Formula::BadIn(a, p) => Formula::BadIn(Box::new(fold_expr(a, from, to)), *p),
         Formula::IntCmp(op, a, b, p) => {
-            Formula::IntCmp(*op, subst_int(a, from, to), subst_int(b, from, to), *p)
+            Formula::IntCmp(*op, fold_int(a, from, to), fold_int(b, from, to), *p)
         }
-        Formula::Multi(k, e, p) => Formula::Multi(*k, subst_expr(e, from, to), *p),
+        Formula::Multi(k, e, p) => Formula::Multi(*k, fold_expr(e, from, to), *p),
         Formula::Quant(k, decls, body) => {
             let shadows = decls.iter().any(|d| d.names.iter().any(|n| n == from));
             if shadows {
                 f.clone()
             } else {
-                let nd = decls
-                    .iter()
-                    .map(|d| Decl {
-                        disj: d.disj,
-                        names: d.names.clone(),
-                        expr: subst_expr(&d.expr, from, to),
-                        pos: d.pos,
-                        is_var: d.is_var,
-                    })
-                    .collect();
-                Formula::Quant(*k, nd, Box::new(subst_formula(body, from, to)))
+                Formula::Quant(*k, fold_decls(decls, from, to), Box::new(fold_formula(body, from, to)))
             }
         }
         Formula::LetBind(binds, body) => {
@@ -4838,147 +5374,150 @@ fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
                 Formula::LetBind(
                     binds
                         .iter()
-                        .map(|(n, e)| (n.clone(), subst_expr(e, from, to)))
+                        .map(|(n, e)| (n.clone(), fold_expr(e, from, to)))
                         .collect(),
-                    Box::new(subst_formula(body, from, to)),
+                    Box::new(fold_formula(body, from, to)),
                 )
             }
         }
         Formula::Call(name, args, p) => Formula::Call(
             name.clone(),
-            args.iter().map(|a| subst_expr(a, from, to)).collect(),
+            args.iter().map(|a| fold_expr(a, from, to)).collect(),
             *p,
         ),
-        Formula::Always(inner) => Formula::Always(Box::new(subst_formula(inner, from, to))),
-        Formula::Eventually(inner) => Formula::Eventually(Box::new(subst_formula(inner, from, to))),
+        Formula::Always(inner) => Formula::Always(Box::new(fold_formula(inner, from, to))),
+        Formula::Eventually(inner) => Formula::Eventually(Box::new(fold_formula(inner, from, to))),
         Formula::Until(a, b) => Formula::Until(
-            Box::new(subst_formula(a, from, to)),
-            Box::new(subst_formula(b, from, to)),
+            Box::new(fold_formula(a, from, to)),
+            Box::new(fold_formula(b, from, to)),
         ),
         Formula::Releases(a, b) => Formula::Releases(
-            Box::new(subst_formula(a, from, to)),
-            Box::new(subst_formula(b, from, to)),
+            Box::new(fold_formula(a, from, to)),
+            Box::new(fold_formula(b, from, to)),
         ),
-        Formula::Before(inner) => Formula::Before(Box::new(subst_formula(inner, from, to))),
+        Formula::Before(inner) => Formula::Before(Box::new(fold_formula(inner, from, to))),
         Formula::Historically(inner) => {
-            Formula::Historically(Box::new(subst_formula(inner, from, to)))
+            Formula::Historically(Box::new(fold_formula(inner, from, to)))
         }
-        Formula::Once(inner) => Formula::Once(Box::new(subst_formula(inner, from, to))),
+        Formula::Once(inner) => Formula::Once(Box::new(fold_formula(inner, from, to))),
         Formula::Since(a, b) => Formula::Since(
-            Box::new(subst_formula(a, from, to)),
-            Box::new(subst_formula(b, from, to)),
+            Box::new(fold_formula(a, from, to)),
+            Box::new(fold_formula(b, from, to)),
         ),
         Formula::Triggered(a, b) => Formula::Triggered(
-            Box::new(subst_formula(a, from, to)),
-            Box::new(subst_formula(b, from, to)),
+            Box::new(fold_formula(a, from, to)),
+            Box::new(fold_formula(b, from, to)),
         ),
-        Formula::Keeping(inner) => Formula::Keeping(Box::new(subst_formula(inner, from, to))),
-        Formula::Goal(inner) => Formula::Goal(Box::new(subst_formula(inner, from, to))),
-        Formula::Restore(inner) => Formula::Restore(Box::new(subst_formula(inner, from, to))),
-        Formula::Initially(inner) => Formula::Initially(Box::new(subst_formula(inner, from, to))),
-        Formula::Regularly(inner) => Formula::Regularly(Box::new(subst_formula(inner, from, to))),
+        Formula::Keeping(inner) => Formula::Keeping(Box::new(fold_formula(inner, from, to))),
+        Formula::Goal(inner) => Formula::Goal(Box::new(fold_formula(inner, from, to))),
+        Formula::Restore(inner) => Formula::Restore(Box::new(fold_formula(inner, from, to))),
+        Formula::Initially(inner) => Formula::Initially(Box::new(fold_formula(inner, from, to))),
+        Formula::Regularly(inner) => Formula::Regularly(Box::new(fold_formula(inner, from, to))),
         Formula::Consistently(inner) => {
-            Formula::Consistently(Box::new(subst_formula(inner, from, to)))
+            Formula::Consistently(Box::new(fold_formula(inner, from, to)))
         }
     }
 }
 
-fn subst_expr(e: &Expr, from: &str, to: &str) -> Expr {
+/// Shared variable-substitution traversal (see [`NameTarget`]); also reused
+/// by query-time find-form enumeration (`snippet.rs`).
+pub(crate) fn fold_expr(e: &Expr, from: &str, to: &NameTarget) -> Expr {
     match e {
-        Expr::Name(n, p) if n == from => Expr::Name(to.to_string(), *p),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => {
+        Expr::Name(n, p) => match to.map_name(n, from, *p) {
+            Some(rep) => rep,
+            None => e.clone(),
+        },
+        Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => {
             e.clone()
         }
         Expr::Bin(op, a, b) => Expr::Bin(
             *op,
-            Box::new(subst_expr(a, from, to)),
-            Box::new(subst_expr(b, from, to)),
+            Box::new(fold_expr(a, from, to)),
+            Box::new(fold_expr(b, from, to)),
         ),
-        Expr::Transpose(x) => Expr::Transpose(Box::new(subst_expr(x, from, to))),
-        Expr::TClosure(x) => Expr::TClosure(Box::new(subst_expr(x, from, to))),
-        Expr::RClosure(x) => Expr::RClosure(Box::new(subst_expr(x, from, to))),
+        Expr::Transpose(x) => Expr::Transpose(Box::new(fold_expr(x, from, to))),
+        Expr::TClosure(x) => Expr::TClosure(Box::new(fold_expr(x, from, to))),
+        Expr::RClosure(x) => Expr::RClosure(Box::new(fold_expr(x, from, to))),
         Expr::Comprehension(decls, body) => {
             let shadows = decls.iter().any(|d| d.names.iter().any(|n| n == from));
             if shadows {
                 e.clone()
             } else {
                 Expr::Comprehension(
-                    decls
-                        .iter()
-                        .map(|d| Decl {
-                            disj: d.disj,
-                            names: d.names.clone(),
-                            expr: subst_expr(&d.expr, from, to),
-                            pos: d.pos,
-                            is_var: d.is_var,
-                        })
-                        .collect(),
-                    Box::new(subst_formula(body, from, to)),
+                    fold_decls(decls, from, to),
+                    Box::new(fold_formula(body, from, to)),
+                )
+            }
+        }
+        Expr::Find(sel, decls, body) => {
+            let shadows = decls.iter().any(|d| d.names.iter().any(|n| n == from));
+            if shadows {
+                e.clone()
+            } else {
+                Expr::Find(
+                    *sel,
+                    fold_decls(decls, from, to),
+                    Box::new(fold_formula(body, from, to)),
                 )
             }
         }
         Expr::If(c, t, e2) => Expr::If(
-            Box::new(subst_formula(c, from, to)),
-            Box::new(subst_expr(t, from, to)),
-            Box::new(subst_expr(e2, from, to)),
+            Box::new(fold_formula(c, from, to)),
+            Box::new(fold_expr(t, from, to)),
+            Box::new(fold_expr(e2, from, to)),
         ),
         Expr::Bracket(b, args) => Expr::Bracket(
-            Box::new(subst_expr(b, from, to)),
-            args.iter()
-                .map(|a| Box::new(subst_expr(a, from, to)))
-                .collect(),
+            Box::new(fold_expr(b, from, to)),
+            args.iter().map(|a| Box::new(fold_expr(a, from, to))).collect(),
         ),
-        Expr::ArrowMult(m, x) => Expr::ArrowMult(*m, Box::new(subst_expr(x, from, to))),
-        Expr::LeadMult(m, x) => Expr::LeadMult(*m, Box::new(subst_expr(x, from, to))),
+        Expr::ArrowMult(m, x) => Expr::ArrowMult(*m, Box::new(fold_expr(x, from, to))),
+        Expr::LeadMult(m, x) => Expr::LeadMult(*m, Box::new(fold_expr(x, from, to))),
         Expr::Call(name, args, p) => Expr::Call(
             name.clone(),
-            args.iter().map(|a| subst_expr(a, from, to)).collect(),
+            args.iter().map(|a| fold_expr(a, from, to)).collect(),
             *p,
         ),
-        Expr::Prime(inner) => Expr::Prime(Box::new(subst_expr(inner, from, to))),
-        Expr::AtExpr(inner) => Expr::AtExpr(Box::new(subst_expr(inner, from, to))),
+        Expr::Prime(inner) => Expr::Prime(Box::new(fold_expr(inner, from, to))),
+        Expr::AtExpr(inner) => Expr::AtExpr(Box::new(fold_expr(inner, from, to))),
         Expr::LetBind(binds, body) => Expr::LetBind(
             binds
                 .iter()
-                .map(|(n, e)| (n.clone(), subst_expr(e, from, to)))
+                .map(|(n, e)| (n.clone(), fold_expr(e, from, to)))
                 .collect(),
-            Box::new(subst_expr(body, from, to)),
+            Box::new(fold_expr(body, from, to)),
         ),
     }
 }
 
-fn subst_int(i: &IntExpr, from: &str, to: &str) -> IntExpr {
+/// Shared integer-expression substitution traversal; also reused by
+/// query-time find-form enumeration (`snippet.rs`).
+pub(crate) fn fold_int(i: &IntExpr, from: &str, to: &NameTarget) -> IntExpr {
     match i {
         IntExpr::Lit(..) => i.clone(),
-        IntExpr::Card(e, p) => IntExpr::Card(Box::new(subst_expr(e, from, to)), *p),
+        IntExpr::Card(e, p) => IntExpr::Card(Box::new(fold_expr(e, from, to)), *p),
         IntExpr::Sum(decls, body, p) => IntExpr::Sum(
-            decls
-                .iter()
-                .map(|d| Decl {
-                    disj: d.disj,
-                    names: d.names.clone(),
-                    expr: subst_expr(&d.expr, from, to),
-                    pos: d.pos,
-                    is_var: d.is_var,
-                })
-                .collect(),
-            Box::new(subst_int(body, from, to)),
+            fold_decls(decls, from, to),
+            Box::new(fold_int(body, from, to)),
             *p,
         ),
         IntExpr::Bin(op, a, b) => IntExpr::Bin(
             *op,
-            Box::new(subst_int(a, from, to)),
-            Box::new(subst_int(b, from, to)),
+            Box::new(fold_int(a, from, to)),
+            Box::new(fold_int(b, from, to)),
         ),
         IntExpr::Widen(op, a, b) => IntExpr::Widen(
             *op,
-            Box::new(subst_int(a, from, to)),
-            Box::new(subst_int(b, from, to)),
+            Box::new(fold_int(a, from, to)),
+            Box::new(fold_int(b, from, to)),
         ),
-        IntExpr::Val(e, p) => IntExpr::Val(Box::new(subst_expr(e, from, to)), *p),
-        IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(subst_expr(e, from, to)), *p),
-        IntExpr::BitsVal(e, p) => IntExpr::BitsVal(Box::new(subst_expr(e, from, to)), *p),
+        IntExpr::Val(e, p) => IntExpr::Val(Box::new(fold_expr(e, from, to)), *p),
+        IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(fold_expr(e, from, to)), *p),
+        IntExpr::BitsVal(e, p) => IntExpr::BitsVal(Box::new(fold_expr(e, from, to)), *p),
     }
+}
+
+fn subst_formula(f: &Formula, from: &str, to: &str) -> Formula {
+    fold_formula(f, from, &NameTarget::Rename(to))
 }
 
 /// Generates the multiplicity constraint formula for one field declaration,
@@ -4995,6 +5534,7 @@ fn strip_mult(e: &Expr) -> Expr {
         Expr::TClosure(x) => Expr::TClosure(Box::new(strip_mult(x))),
         Expr::RClosure(x) => Expr::RClosure(Box::new(strip_mult(x))),
         Expr::Comprehension(ds, body) => Expr::Comprehension(ds.clone(), body.clone()),
+        Expr::Find(sel, ds, body) => Expr::Find(*sel, ds.clone(), body.clone()),
         Expr::If(c, t, el) => {
             Expr::If(c.clone(), Box::new(strip_mult(t)), Box::new(strip_mult(el)))
         }
@@ -5026,6 +5566,9 @@ fn mentions_int_expr(e: &Expr) -> bool {
         Expr::Bin(_, a, b) => mentions_int_expr(a) || mentions_int_expr(b),
         Expr::Transpose(x) | Expr::TClosure(x) | Expr::RClosure(x) => mentions_int_expr(x),
         Expr::Comprehension(ds, body) => {
+            ds.iter().any(|d| mentions_int_expr(&d.expr)) || mentions_int_formula(body)
+        }
+        Expr::Find(_, ds, body) => {
             ds.iter().any(|d| mentions_int_expr(&d.expr)) || mentions_int_formula(body)
         }
         Expr::If(c, t, el) => {
@@ -5212,6 +5755,12 @@ fn scan_total_order_expr(e: &Expr, out: &mut Vec<(String, String)>) {
             }
             scan_total_order_formula(body, out);
         }
+        Expr::Find(_, ds, body) => {
+            for d in ds {
+                scan_total_order_expr(&d.expr, out);
+            }
+            scan_total_order_formula(body, out);
+        }
         Expr::If(c, t, el) => {
             scan_total_order_formula(c, out);
             scan_total_order_expr(t, out);
@@ -5392,6 +5941,10 @@ fn ereal_wellformed(x: &ERealOp) -> Formula {
     ])
 }
 
+fn ereal_all_wellformed(ops: &[&ERealOp]) -> Vec<Formula> {
+    ops.iter().map(|o| ereal_wellformed(o)).collect()
+}
+
 fn ereal_div_guard(d: &ERealOp) -> Formula {
     ereal_icmp(IntCmpOp::Lt, ereal_lane_of(d, "k"), ereal_lane_of(d, "p"))
 }
@@ -5400,7 +5953,7 @@ fn ereal_div_guard(d: &ERealOp) -> Formula {
 /// arithmetic predicates). `extends` siblings are disjoint as *sets*,
 /// so this is the usable equality for EReal values.
 fn ereal_exact_eq(a: &ERealOp, b: &ERealOp) -> Formula {
-    let mut parts = vec![ereal_wellformed(a), ereal_wellformed(b)];
+    let mut parts = ereal_all_wellformed(&[a, b]);
     for lane in ["m", "e", "p", "k"] {
         parts.push(ereal_icmp(
             IntCmpOp::Eq,
@@ -5421,15 +5974,21 @@ fn ereal_exact_eq(a: &ERealOp, b: &ERealOp) -> Formula {
 // exactly. Fixed-width circuits could never hold this (a mantissa
 // already spans the problem bitwidth), hence the widening layer.
 
+/// `e - p` of an operand, exact widening arithmetic: shared base of
+/// `lsb` (`+1`) and the error-radius exponent (`+k`).
+fn ereal_e_minus_p(x: &ERealOp) -> IntExpr {
+    IntExpr::Widen(
+        WidenOp::Sub,
+        Box::new(ereal_lane_of(x, "e")),
+        Box::new(ereal_lane_of(x, "p")),
+    )
+}
+
 /// `lsb(x) = e - p + 1`, exact widening arithmetic.
 fn ereal_lsb_wide(x: &ERealOp) -> IntExpr {
     IntExpr::Widen(
         WidenOp::Add,
-        Box::new(IntExpr::Widen(
-            WidenOp::Sub,
-            Box::new(ereal_lane_of(x, "e")),
-            Box::new(ereal_lane_of(x, "p")),
-        )),
+        Box::new(ereal_e_minus_p(x)),
         Box::new(IntExpr::Lit(1, 0)),
     )
 }
@@ -5438,13 +5997,22 @@ fn ereal_lsb_wide(x: &ERealOp) -> IntExpr {
 fn ereal_r_exp(x: &ERealOp) -> IntExpr {
     IntExpr::Widen(
         WidenOp::Add,
-        Box::new(IntExpr::Widen(
-            WidenOp::Sub,
-            Box::new(ereal_lane_of(x, "e")),
-            Box::new(ereal_lane_of(x, "p")),
-        )),
+        Box::new(ereal_e_minus_p(x)),
         Box::new(ereal_lane_of(x, "k")),
     )
+}
+
+/// Symmetric window pin `|a - b| <= bound` (both directions).
+fn ereal_within(a: IntExpr, b: IntExpr) -> Formula {
+    ereal_and_all(vec![
+        ereal_icmp(IntCmpOp::Lte, a.clone(), b.clone()),
+        ereal_icmp(IntCmpOp::Lte, ereal_wneg(b), a),
+    ])
+}
+
+/// `B = e_r - p_r`: the result centre window exponent scale.
+fn ereal_b_exp(r: &ERealOp) -> IntExpr {
+    ereal_e_minus_p(r)
 }
 
 fn ereal_wadd(a: IntExpr, b: IntExpr) -> IntExpr {
@@ -5497,50 +6065,40 @@ fn ereal_scaled_cmp(a: &ERealOp, b: &ERealOp, s1: i64, s2: i64, op: IntCmpOp, wv
 /// Closed-interval overlap: `loA<=hiB and loB<=hiA` (endpoint contact
 /// counts).
 fn ereal_may_eq(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
-    ereal_and_all(vec![
-        ereal_wellformed(a),
-        ereal_wellformed(b),
-        ereal_scaled_cmp(a, b, -1, 1, IntCmpOp::Lte, wv),
-        ereal_scaled_cmp(b, a, -1, 1, IntCmpOp::Lte, wv),
-    ])
+    let mut parts = ereal_all_wellformed(&[a, b]);
+    parts.push(ereal_scaled_cmp(a, b, -1, 1, IntCmpOp::Lte, wv));
+    parts.push(ereal_scaled_cmp(b, a, -1, 1, IntCmpOp::Lte, wv));
+    ereal_and_all(parts)
 }
 
 /// Containment (A covers B, equal intervals count): `loA<=loB and hiB<=hiA`.
 fn ereal_covers(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
-    ereal_and_all(vec![
-        ereal_wellformed(a),
-        ereal_wellformed(b),
-        ereal_scaled_cmp(a, b, -1, -1, IntCmpOp::Lte, wv),
-        ereal_scaled_cmp(b, a, 1, 1, IntCmpOp::Lte, wv),
-    ])
+    let mut parts = ereal_all_wellformed(&[a, b]);
+    parts.push(ereal_scaled_cmp(a, b, -1, -1, IntCmpOp::Lte, wv));
+    parts.push(ereal_scaled_cmp(b, a, 1, 1, IntCmpOp::Lte, wv));
+    ereal_and_all(parts)
 }
 
 /// Strictly below: `hiA < loB`.
 fn ereal_lt(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
-    ereal_and_all(vec![
-        ereal_wellformed(a),
-        ereal_wellformed(b),
-        ereal_scaled_cmp(a, b, 1, -1, IntCmpOp::Lt, wv),
-    ])
+    let mut parts = ereal_all_wellformed(&[a, b]);
+    parts.push(ereal_scaled_cmp(a, b, 1, -1, IntCmpOp::Lt, wv));
+    ereal_and_all(parts)
 }
 
 /// Below or touching: `hiA <= loB`.
 fn ereal_lte(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
-    ereal_and_all(vec![
-        ereal_wellformed(a),
-        ereal_wellformed(b),
-        ereal_scaled_cmp(a, b, 1, -1, IntCmpOp::Lte, wv),
-    ])
+    let mut parts = ereal_all_wellformed(&[a, b]);
+    parts.push(ereal_scaled_cmp(a, b, 1, -1, IntCmpOp::Lte, wv));
+    ereal_and_all(parts)
 }
 
 /// A's upper end lies in B's range: `loB<=hiA<=hiB`.
 fn ereal_may_lte(a: &ERealOp, b: &ERealOp, wv: u32) -> Formula {
-    ereal_and_all(vec![
-        ereal_wellformed(a),
-        ereal_wellformed(b),
-        ereal_scaled_cmp(b, a, -1, 1, IntCmpOp::Lte, wv),
-        ereal_scaled_cmp(a, b, 1, 1, IntCmpOp::Lte, wv),
-    ])
+    let mut parts = ereal_all_wellformed(&[a, b]);
+    parts.push(ereal_scaled_cmp(b, a, -1, 1, IntCmpOp::Lte, wv));
+    parts.push(ereal_scaled_cmp(a, b, 1, 1, IntCmpOp::Lte, wv));
+    ereal_and_all(parts)
 }
 
 fn ereal_needs_refine(x: &ERealOp, g: &Expr) -> Formula {
@@ -5660,11 +6218,7 @@ fn ereal_add_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, sign: i8, wv: u32) ->
     let lsb_a = ereal_lsb_wide(a);
     let lsb_b = ereal_lsb_wide(b);
     let lsb_r = ereal_lsb_wide(r);
-    let b_exp = IntExpr::Widen(
-        WidenOp::Sub,
-        Box::new(ereal_lane_of(r, "e")),
-        Box::new(ereal_lane_of(r, "p")),
-    );
+    let b_exp = ereal_b_exp(r);
     let s0 = ereal_min(
         ereal_min(lsb_a.clone(), lsb_b.clone()),
         ereal_min(lsb_r.clone(), b_exp.clone()),
@@ -5677,12 +6231,8 @@ fn ereal_add_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, sign: i8, wv: u32) ->
         ereal_wsub(ca, cb)
     };
     let cr = ereal_wshl(ereal_lane_of(r, "m"), ereal_wsub(lsb_r, s0.clone()), wv);
-    let diff = ereal_wsub(cr, s);
     let bound = ereal_wshl(IntExpr::Lit(1, 0), ereal_wsub(b_exp, s0), wv);
-    ereal_and_all(vec![
-        ereal_icmp(IntCmpOp::Lte, diff.clone(), bound.clone()),
-        ereal_icmp(IntCmpOp::Lte, ereal_wneg(bound), diff),
-    ])
+    ereal_within(ereal_wsub(cr, s), bound)
 }
 
 /// `2^p` and `2^(p-1)` as widening shifts (exact while `p ≤ m_width`;
@@ -5903,11 +6453,7 @@ fn ereal_combine_eq_wide(k: &IntExpr, a: &IntExpr, b: &IntExpr) -> Formula {
 fn ereal_mul_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32) -> Formula {
     let lsb_ab = ereal_wadd(ereal_lsb_wide(a), ereal_lsb_wide(b));
     let lsb_r = ereal_lsb_wide(r);
-    let b_exp = IntExpr::Widen(
-        WidenOp::Sub,
-        Box::new(ereal_lane_of(r, "e")),
-        Box::new(ereal_lane_of(r, "p")),
-    );
+    let b_exp = ereal_b_exp(r);
     let s0 = ereal_min(
         ereal_min(lsb_r.clone(), lsb_ab.clone()),
         b_exp.clone(),
@@ -5915,12 +6461,8 @@ fn ereal_mul_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32) -> Formula {
     let prod = ereal_wmul(ereal_lane_of(a, "m"), ereal_lane_of(b, "m"));
     let cr = ereal_wshl(ereal_lane_of(r, "m"), ereal_wsub(lsb_r, s0.clone()), wv);
     let cp = ereal_wshl(prod, ereal_wsub(lsb_ab, s0.clone()), wv);
-    let diff = ereal_wsub(cr, cp);
     let bound = ereal_wshl(IntExpr::Lit(1, 0), ereal_wsub(b_exp, s0), wv);
-    ereal_and_all(vec![
-        ereal_icmp(IntCmpOp::Lte, diff.clone(), bound.clone()),
-        ereal_icmp(IntCmpOp::Lte, ereal_wneg(bound), diff),
-    ])
+    ereal_within(ereal_wsub(cr, cp), bound)
 }
 
 /// Division (§5 + rev2 §9.1(a) + P0-1 Q-fix + B3 tightening):
@@ -6039,11 +6581,7 @@ fn ereal_div_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32) -> Formula {
     let lsb_a = ereal_lsb_wide(a);
     let lsb_b = ereal_lsb_wide(b);
     let lsb_rb = ereal_wadd(ereal_lsb_wide(r), lsb_b.clone());
-    let b_exp = IntExpr::Widen(
-        WidenOp::Sub,
-        Box::new(ereal_lane_of(r, "e")),
-        Box::new(ereal_lane_of(r, "p")),
-    );
+    let b_exp = ereal_b_exp(r);
     let bl = ereal_wadd(b_exp.clone(), lsb_b.clone());
     let s0 = ereal_min(
         ereal_min(lsb_rb.clone(), lsb_a.clone()),
@@ -6061,10 +6599,7 @@ fn ereal_div_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32) -> Formula {
     // `rhs = |m_b|·2^(B+lsb_b)`; one case per denominator sign.
     let window = |am2: IntExpr| {
         let rhs = ereal_wshl(am2, ereal_wsub(bl.clone(), s0.clone()), wv);
-        ereal_and_all(vec![
-            ereal_icmp(IntCmpOp::Lte, lhs.clone(), rhs.clone()),
-            ereal_icmp(IntCmpOp::Lte, ereal_wneg(rhs), lhs.clone()),
-        ])
+        ereal_within(lhs.clone(), rhs)
     };
     let m2 = ereal_lane_of(b, "m");
     ereal_or_all(vec![
@@ -6080,19 +6615,82 @@ fn ereal_div_window(a: &ERealOp, b: &ERealOp, r: &ERealOp, wv: u32) -> Formula {
 }
 
 
+/// Decimal literal text for `setEReal`/`setReal*`: both spellings (`d`,
+/// `(d)`) denote the same text here; anything else is rejected loudly.
+fn decimal_lit_text(lit: &Expr, name: &str) -> LResult<String> {
+    match lit {
+        Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => Ok(s.clone()),
+        _ => Err(FrontError::Resolve(format!(
+            "{name} expects a decimal literal (e.g. 0.1) as its second argument"
+        ))),
+    }
+}
+
+/// Exact centre for a decimal literal in set/domain position (mirrors
+/// the solve path: exact dyadic for `d`, nearest for `(d)`). A plain
+/// non-dyadic literal errors loudly instead of rounding silently;
+/// malformed/range literals fail loudly, as in `setReal`.
+pub(crate) fn decimal_centre(lit: &Expr, mw: u32) -> LResult<RealCenter> {
+    match lit {
+        Expr::RealLit(s, _) => {
+            if let Some(v) = decimal_to_real(s, Some(mw)) {
+                return Ok(v);
+            }
+            if decimal_to_real_rounded(s, Some(mw), RealRound::Nearest).is_some() {
+                return Err(FrontError::Resolve(format!(
+                    "cannot convert {s:?} to Real exactly (non-dyadic); round it explicitly with the ({s}) spelling"
+                )));
+            }
+            Err(FrontError::Resolve(format!(
+                "cannot convert {s:?} to Real (malformed or outside the m lane)"
+            )))
+        }
+        Expr::ApproxRealLit(s, _) => decimal_to_real_rounded(s, Some(mw), RealRound::Nearest)
+            .ok_or_else(|| {
+                FrontError::Resolve(format!(
+                    "cannot convert ({s:?}) to Real (malformed or outside the m lane)"
+                ))
+            }),
+        _ => unreachable!("decimal_centre called on a non-literal"),
+    }
+}
+
+/// Lane-bit indices for a decoded centre (`M$i`/`E$j`, two's complement
+/// over the lane widths), the inverse of `display::decode_bitset`.
+/// `None` on unusable widths, out-of-range lanes, or missing lane atoms
+/// (the exact zero yields an empty vec, not `None`).
+pub(crate) fn centre_lane_indices(
+    universe: &Universe,
+    mw: u32,
+    ew: u32,
+    centre: &RealCenter,
+) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for (prefix, value, width) in [("M", centre.m, mw), ("E", centre.e as i128, ew)] {
+        if width == 0 || width >= 63 {
+            return None;
+        }
+        let lo = -(1i128 << (width - 1));
+        let hi = (1i128 << (width - 1)) - 1;
+        if value < lo || value > hi {
+            return None;
+        }
+        let u = (value as u64) & ((1u64 << width) - 1);
+        for i in 0..width {
+            if (u >> i) & 1 == 1 {
+                out.push(universe.index(&format!("{prefix}${i}")).ok()?);
+            }
+        }
+    }
+    Some(out)
+}
+
 /// `setEReal[x, lit]`: bind `x`'s lanes to the optimal conversion of
 /// the decimal literal (same conversion as `:mepk lit` at `max_p`).
 /// Desugars to four lane equalities; the literal text is never rounded
 /// through `f64`. Out-of-range literals fail loudly at lowering.
 fn ereal_set(x: &Expr, lit: &Expr, max_p: u32) -> LResult<Formula> {
-    let s = match lit {
-        Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => s.clone(),
-        _ => {
-            return Err(FrontError::Resolve(
-                "setEReal expects a decimal literal (e.g. 3.14) as its second argument".to_string(),
-            ))
-        }
-    };
+    let s = decimal_lit_text(lit, "setEReal")?;
     let conv = decimal_to_mepk(&s, max_p).ok_or_else(|| {
         FrontError::Resolve(format!(
             "setEReal: cannot convert {s:?} (malformed or outside the i128 oracle range)"
@@ -6173,14 +6771,9 @@ fn real_all_wellformed(ops: &[&RealOp]) -> Vec<Formula> {
     ops.iter().map(|o| real_wellformed(o)).collect()
 }
 
-/// Exact scaled equality of two centres at `s0 = min(e_a, e_b)`.
+/// Exact scaled equality of two centres: the `Eq` case of `real_scaled_cmp`.
 fn real_scaled_eq(a: &RealOp, b: &RealOp, wv: u32) -> Formula {
-    let ea = real_lane_of(a, "e");
-    let eb = real_lane_of(b, "e");
-    let s0 = ereal_min(ea.clone(), eb.clone());
-    let ca = ereal_wshl(real_lane_of(a, "m"), ereal_wsub(ea, s0.clone()), wv);
-    let cb = ereal_wshl(real_lane_of(b, "m"), ereal_wsub(eb, s0), wv);
-    ereal_icmp(IntCmpOp::Eq, ca, cb)
+    real_scaled_cmp(a, b, IntCmpOp::Eq, wv)
 }
 
 /// Exact scaled comparison `a OP b` at `s0 = min(e_a, e_b)`.
@@ -6301,16 +6894,10 @@ fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
                 "setReal: cannot convert ({s:?}) (malformed or outside the lane range)"
             ))
         })?;
-        return Ok(ereal_and_all(vec![
-            real_pin(x, "m", v.m as i64),
-            real_pin(x, "e", v.e as i64),
-        ]));
+        return Ok(real_pin_both(x, v.m as i64, v.e as i64));
     }
     if let Some(v) = decimal_to_real(&s, Some(m_width)) {
-        return Ok(ereal_and_all(vec![
-            real_pin(x, "m", v.m as i64),
-            real_pin(x, "e", v.e as i64),
-        ]));
+        return Ok(real_pin_both(x, v.m as i64, v.e as i64));
     }
     if decimal_to_real_rounded(&s, Some(m_width), RealRound::Nearest).is_some() {
         return Ok(Formula::Const(false));
@@ -6326,24 +6913,19 @@ fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
 /// (half-even), toward −inf, or toward +inf respectively. The rounding
 /// error itself is NOT tracked (unlike `EReal`'s `k`): bracket a value
 /// with Down+Up when the error matters.
+/// Pin both `(m, e)` lanes of a `Real` value.
+fn real_pin_both(x: &Expr, m: i64, e: i64) -> Formula {
+    ereal_and_all(vec![real_pin(x, "m", m), real_pin(x, "e", e)])
+}
+
 fn real_set_rounded(x: &Expr, lit: &Expr, m_width: u32, mode: RealRound, name: &str) -> LResult<Formula> {
-    let s = match lit {
-        Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => s.clone(),
-        _ => {
-            return Err(FrontError::Resolve(format!(
-                "{name} expects a decimal literal (e.g. 0.1) as its second argument"
-            )))
-        }
-    };
+    let s = decimal_lit_text(lit, name)?;
     let v = decimal_to_real_rounded(&s, Some(m_width), mode).ok_or_else(|| {
         FrontError::Resolve(format!(
             "{name}: cannot convert {s:?} (malformed or outside the lane range)"
         ))
     })?;
-    Ok(ereal_and_all(vec![
-        real_pin(x, "m", v.m as i64),
-        real_pin(x, "e", v.e as i64),
-    ]))
+    Ok(real_pin_both(x, v.m as i64, v.e as i64))
 }
 
 // ---- lane-successor constraints (`realSucc`/`realPred` core) --------------
@@ -7032,233 +7614,11 @@ fn field_mult_constraint(
 }
 
 fn replace_var_expr(e: &Expr, from: &str, to: &Expr) -> Expr {
-    match e {
-        Expr::Name(n, _) if n == from => to.clone(),
-        Expr::Name(..) | Expr::Univ | Expr::None_ | Expr::Iden | Expr::IntAtom | Expr::StepAtom | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => {
-            e.clone()
-        }
-        Expr::Bin(op, a, b) => Expr::Bin(
-            *op,
-            Box::new(replace_var_expr(a, from, to)),
-            Box::new(replace_var_expr(b, from, to)),
-        ),
-        Expr::Transpose(x) => Expr::Transpose(Box::new(replace_var_expr(x, from, to))),
-        Expr::TClosure(x) => Expr::TClosure(Box::new(replace_var_expr(x, from, to))),
-        Expr::RClosure(x) => Expr::RClosure(Box::new(replace_var_expr(x, from, to))),
-        Expr::Comprehension(decls, body) => {
-            let shadows = decls.iter().any(|d| d.names.iter().any(|n| n == from));
-            if shadows {
-                e.clone()
-            } else {
-                Expr::Comprehension(
-                    decls
-                        .iter()
-                        .map(|d| Decl {
-                            disj: d.disj,
-                            names: d.names.clone(),
-                            expr: replace_var_expr(&d.expr, from, to),
-                            pos: d.pos,
-                            is_var: d.is_var,
-                        })
-                        .collect(),
-                    Box::new(replace_var_formula(body, from, to)),
-                )
-            }
-        }
-        Expr::If(c, t, x) => Expr::If(
-            Box::new(replace_var_formula(c, from, to)),
-            Box::new(replace_var_expr(t, from, to)),
-            Box::new(replace_var_expr(x, from, to)),
-        ),
-        Expr::Bracket(b, args) => Expr::Bracket(
-            Box::new(replace_var_expr(b, from, to)),
-            args.iter()
-                .map(|a| Box::new(replace_var_expr(a, from, to)))
-                .collect(),
-        ),
-        Expr::ArrowMult(m, x) => Expr::ArrowMult(*m, Box::new(replace_var_expr(x, from, to))),
-        Expr::LeadMult(m, x) => Expr::LeadMult(*m, Box::new(replace_var_expr(x, from, to))),
-        Expr::Call(name, args, p) => Expr::Call(
-            name.clone(),
-            args.iter().map(|a| replace_var_expr(a, from, to)).collect(),
-            *p,
-        ),
-        Expr::Prime(inner) => Expr::Prime(Box::new(replace_var_expr(inner, from, to))),
-        Expr::AtExpr(inner) => Expr::AtExpr(Box::new(replace_var_expr(inner, from, to))),
-        Expr::LetBind(binds, body) => Expr::LetBind(
-            binds
-                .iter()
-                .map(|(n, e)| (n.clone(), replace_var_expr(e, from, to)))
-                .collect(),
-            Box::new(replace_var_expr(body, from, to)),
-        ),
-    }
+    fold_expr(e, from, &NameTarget::Replace(to))
 }
 
 fn replace_var_formula(f: &Formula, from: &str, to: &Expr) -> Formula {
-    match f {
-        Formula::Const(v) => Formula::Const(*v),
-        // `pin` names a partial block, not a variable: untouched.
-        Formula::Pin(name, pos) => Formula::Pin(name.clone(), *pos),
-        Formula::MaxSome(e) => Formula::MaxSome(Box::new(replace_var_expr(e, from, to))),
-        Formula::MinSome(e) => Formula::MinSome(Box::new(replace_var_expr(e, from, to))),
-        Formula::MaxSomeDecl(ds, body) => {
-            let nd = ds
-                .iter()
-                .map(|d| crate::ast::Decl {
-                    disj: d.disj,
-                    names: d.names.clone(),
-                    expr: replace_var_expr(&d.expr, from, to),
-                    pos: d.pos,
-                    is_var: d.is_var,
-                })
-                .collect();
-            Formula::MaxSomeDecl(nd, Box::new(replace_var_formula(body, from, to)))
-        }
-        Formula::Not(x) => Formula::Not(Box::new(replace_var_formula(x, from, to))),
-        Formula::OverflowCond(m, body) => {
-            Formula::OverflowCond(*m, Box::new(replace_var_formula(body, from, to)))
-        }
-        Formula::Maximize(ie) => Formula::Maximize(replace_var_int(ie, from, to)),
-        Formula::Minimize(ie) => Formula::Minimize(replace_var_int(ie, from, to)),
-        Formula::And(a, b) => Formula::And(
-            Box::new(replace_var_formula(a, from, to)),
-            Box::new(replace_var_formula(b, from, to)),
-        ),
-        Formula::Or(a, b) => Formula::Or(
-            Box::new(replace_var_formula(a, from, to)),
-            Box::new(replace_var_formula(b, from, to)),
-        ),
-        Formula::Implies(a, b) => Formula::Implies(
-            Box::new(replace_var_formula(a, from, to)),
-            Box::new(replace_var_formula(b, from, to)),
-        ),
-        Formula::Iff(a, b) => Formula::Iff(
-            Box::new(replace_var_formula(a, from, to)),
-            Box::new(replace_var_formula(b, from, to)),
-        ),
-        Formula::Cmp(k, a, b, p) => Formula::Cmp(
-            *k,
-            replace_var_expr(a, from, to),
-            replace_var_expr(b, from, to),
-            *p,
-        ),
-        Formula::BadIn(a, p) => Formula::BadIn(Box::new(replace_var_expr(a, from, to)), *p),
-        Formula::IntCmp(op, a, b, p) => Formula::IntCmp(
-            *op,
-            replace_var_int(a, from, to),
-            replace_var_int(b, from, to),
-            *p,
-        ),
-        Formula::Multi(k, e, p) => Formula::Multi(*k, replace_var_expr(e, from, to), *p),
-        Formula::Quant(k, decls, body) => {
-            let shadows = decls.iter().any(|d| d.names.iter().any(|n| n == from));
-            if shadows {
-                f.clone()
-            } else {
-                let nd = decls
-                    .iter()
-                    .map(|d| Decl {
-                        disj: d.disj,
-                        names: d.names.clone(),
-                        expr: replace_var_expr(&d.expr, from, to),
-                        pos: d.pos,
-                        is_var: d.is_var,
-                    })
-                    .collect();
-                Formula::Quant(*k, nd, Box::new(replace_var_formula(body, from, to)))
-            }
-        }
-        Formula::LetBind(binds, body) => {
-            if binds.iter().any(|(n, _)| n == from) {
-                f.clone()
-            } else {
-                Formula::LetBind(
-                    binds
-                        .iter()
-                        .map(|(n, e)| (n.clone(), replace_var_expr(e, from, to)))
-                        .collect(),
-                    Box::new(replace_var_formula(body, from, to)),
-                )
-            }
-        }
-        Formula::Call(name, args, p) => Formula::Call(
-            name.clone(),
-            args.iter().map(|a| replace_var_expr(a, from, to)).collect(),
-            *p,
-        ),
-        Formula::Always(inner) => Formula::Always(Box::new(replace_var_formula(inner, from, to))),
-        Formula::Eventually(inner) => {
-            Formula::Eventually(Box::new(replace_var_formula(inner, from, to)))
-        }
-        Formula::Until(a, b) => Formula::Until(
-            Box::new(replace_var_formula(a, from, to)),
-            Box::new(replace_var_formula(b, from, to)),
-        ),
-        Formula::Releases(a, b) => Formula::Releases(
-            Box::new(replace_var_formula(a, from, to)),
-            Box::new(replace_var_formula(b, from, to)),
-        ),
-        Formula::Before(inner) => Formula::Before(Box::new(replace_var_formula(inner, from, to))),
-        Formula::Historically(inner) => {
-            Formula::Historically(Box::new(replace_var_formula(inner, from, to)))
-        }
-        Formula::Once(inner) => Formula::Once(Box::new(replace_var_formula(inner, from, to))),
-        Formula::Since(a, b) => Formula::Since(
-            Box::new(replace_var_formula(a, from, to)),
-            Box::new(replace_var_formula(b, from, to)),
-        ),
-        Formula::Triggered(a, b) => Formula::Triggered(
-            Box::new(replace_var_formula(a, from, to)),
-            Box::new(replace_var_formula(b, from, to)),
-        ),
-        Formula::Keeping(inner) => Formula::Keeping(Box::new(replace_var_formula(inner, from, to))),
-        Formula::Goal(inner) => Formula::Goal(Box::new(replace_var_formula(inner, from, to))),
-        Formula::Restore(inner) => Formula::Restore(Box::new(replace_var_formula(inner, from, to))),
-        Formula::Initially(inner) => {
-            Formula::Initially(Box::new(replace_var_formula(inner, from, to)))
-        }
-        Formula::Regularly(inner) => {
-            Formula::Regularly(Box::new(replace_var_formula(inner, from, to)))
-        }
-        Formula::Consistently(inner) => {
-            Formula::Consistently(Box::new(replace_var_formula(inner, from, to)))
-        }
-    }
-}
-
-fn replace_var_int(i: &IntExpr, from: &str, to: &Expr) -> IntExpr {
-    match i {
-        IntExpr::Lit(..) => i.clone(),
-        IntExpr::Card(e, p) => IntExpr::Card(Box::new(replace_var_expr(e, from, to)), *p),
-        IntExpr::Sum(decls, body, p) => IntExpr::Sum(
-            decls
-                .iter()
-                .map(|d| Decl {
-                    disj: d.disj,
-                    names: d.names.clone(),
-                    expr: replace_var_expr(&d.expr, from, to),
-                    pos: d.pos,
-                    is_var: d.is_var,
-                })
-                .collect(),
-            Box::new(replace_var_int(body, from, to)),
-            *p,
-        ),
-        IntExpr::Bin(op, a, b) => IntExpr::Bin(
-            *op,
-            Box::new(replace_var_int(a, from, to)),
-            Box::new(replace_var_int(b, from, to)),
-        ),
-        IntExpr::Widen(op, a, b) => IntExpr::Widen(
-            *op,
-            Box::new(replace_var_int(a, from, to)),
-            Box::new(replace_var_int(b, from, to)),
-        ),
-        IntExpr::Val(e, p) => IntExpr::Val(Box::new(replace_var_expr(e, from, to)), *p),
-        IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(replace_var_expr(e, from, to)), *p),
-        IntExpr::BitsVal(e, p) => IntExpr::BitsVal(Box::new(replace_var_expr(e, from, to)), *p),
-    }
+    fold_formula(f, from, &NameTarget::Replace(to))
 }
 
 /// Pairs of same-group variables declared `disj`.

@@ -124,9 +124,10 @@ fn int_field_solves_unsigned() {
         QueryValue::Bool(..) => panic!("expected Int"),
         QueryValue::Real(..) => panic!("expected Int"),
     }
-    // literals wrap as E-bit two's complement (E = W + 1 = 9): 300 -> -212
+    // literals denote bit patterns read with signed weights (faithful
+    // range; W = 8 here): 300 is `{2,3,5}` = 44 (E-bit wrap `-212` is gone).
     match query_value(&m, scope, &cnf, "300", &inst).expect("query 300") {
-        QueryValue::Int(v) => assert_eq!(v, -212),
+        QueryValue::Int(v) => assert_eq!(v, 44),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
         QueryValue::Real(..) => panic!("expected Int"),

@@ -350,6 +350,12 @@ fn module_mentions_ereal(module: &Module, scope: &Scope) -> bool {
                 }
                 formula_mentions(body, hit);
             }
+            Expr::Find(_, ds, body) => {
+                for d in ds {
+                    expr_mentions(&d.expr, hit);
+                }
+                formula_mentions(body, hit);
+            }
             Expr::If(c, t, el) => {
                 formula_mentions(c, hit);
                 expr_mentions(t, hit);
@@ -543,6 +549,12 @@ fn module_mentions_real(module: &Module, scope: &Scope) -> bool {
                 }
                 formula_mentions(body, hit);
             }
+            Expr::Find(_, ds, body) => {
+                for d in ds {
+                    expr_mentions(&d.expr, hit);
+                }
+                formula_mentions(body, hit);
+            }
             Expr::If(c, t, el) => {
                 formula_mentions(c, hit);
                 expr_mentions(t, hit);
@@ -719,6 +731,12 @@ fn real_direct_mention(module: &Module) -> bool {
                 expr_hit(x, hit)
             }
             Expr::Comprehension(ds, body) => {
+                for d in ds {
+                    expr_hit(&d.expr, hit);
+                }
+                formula_hit(body, hit);
+            }
+            Expr::Find(_, ds, body) => {
                 for d in ds {
                     expr_hit(&d.expr, hit);
                 }
@@ -1442,8 +1460,14 @@ pub fn resolve(module: &Module, scope: &Scope) -> Result<Resolved, String> {
     uni_atoms.extend(step_atoms.iter().cloned());
     uni_atoms.extend(real_atoms.iter().cloned());
     uni_atoms.extend(ereal_atoms.iter().cloned());
-    for atoms in lane_atoms.values() {
-        uni_atoms.extend(atoms.iter().cloned());
+    // Lane groups in numeric group-id order (M, E, P, K): HashMap
+    // iteration order is nondeterministic across resolves, and universe
+    // atom indices must agree between the solve-time universe (the
+    // instance) and query-time re-resolves (atom-name lookups).
+    let mut lane_groups: Vec<u32> = lane_atoms.keys().copied().collect();
+    lane_groups.sort_unstable();
+    for g in lane_groups {
+        uni_atoms.extend(lane_atoms[&g].iter().cloned());
     }
     let refs: Vec<&str> = uni_atoms.iter().map(|s| s.as_str()).collect();
     let universe = Universe::new(refs).map_err(|e| format!("universe: {e}"))?;

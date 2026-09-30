@@ -18,11 +18,12 @@ use alloy_kodkod_rs::ast::AstArena;
 use alloy_kodkod_rs::instance::Instance;
 use alloy_kodkod_rs::intset::IntSet;
 use alloy_kodkod_rs::real::{
-    decimal_to_real, decimal_to_real_rounded, next_down, next_up, RealCenter, RealRound,
+    decimal_to_real, decimal_to_real_rounded, next_down, next_up, real_add, real_div,
+    real_mul, RealCenter, RealRound,
 };
 use alloy_kodkod_rs::tupleset::TupleSet;
 
-use crate::ast::{Expr, Formula, IntExpr, Module, Scope};
+use crate::ast::{BinOp, Decl, Expr, FindSel, Formula, IntExpr, Module, Scope};
 use crate::cnf::Cnf;
 use crate::lower::Lowerer;
 use crate::types::is_int_query;
@@ -158,13 +159,16 @@ pub enum QueryValue {
     Set(u32, TupleSet),
     Int(i64),
     Bool(bool),
-    /// Computed `Real` centre from a `realUp`/`realDown` query or a
-    /// `{ v: Real | v.realSucc[e] }`-shaped comprehension. Unlike
-    /// `Set` this is not an instance atom: the lane successor of a value
-    /// generally lies outside the solved atom population (e.g. with
-    /// `one sig X extends Real`, `Real = {X$0}`), so evaluating the
-    /// desugared comprehension by instance enumeration would yield `{}`.
-    /// The lane oracle (`next_up`/`next_down`) answers it instead.
+    /// Computed `Real` centre from a `realUp`/`realDown` function query,
+    /// or from an oracle-answered comprehension whose centre has no
+    /// lane-bit set in this instance (the bit-free exact zero, or a
+    /// model whose universe carries no `M$`/`E$` lane atoms, e.g.
+    /// `one sig X extends Real`). Unlike `Set` this is not an instance
+    /// tuple set: the computed value generally lies outside the solved
+    /// atom population, so evaluating the desugared comprehension by
+    /// instance enumeration would yield `{}`. Whenever the centre does
+    /// expand to a non-empty lane-bit set, the oracle paths below return
+    /// `Set` instead, so comprehensions always denote sets.
     Real(RealCenter),
 }
 
@@ -193,6 +197,12 @@ pub fn query_value(
     }
     match parse_expr(expr_src) {
         Ok(e) => {
+            // Bare decimal literals decode to their centre (mirrors the
+            // solve path: exact dyadic for `d`, nearest for `(d)`), then
+            // expand to the lane-bit atom set when possible.
+            if matches!(e, Expr::RealLit(..) | Expr::ApproxRealLit(..)) {
+                return query_real_lit(module, scope, &e, instance);
+            }
             if matches!(e, Expr::IntAtom) {
                 // `Int` (or `int`): every in-scope integer, i.e. the union
                 // of the Cnf's exact int bounds. Handled here because the
@@ -207,15 +217,20 @@ pub fn query_value(
                     .map_err(|_| FrontError::Resolve("cannot build Int tuple set".to_string()))?;
                 return Ok(QueryValue::Set(1, ts));
             }
+            // Value-finding `{[any|min|max] x in D | F}`: explicit opt-in
+            // to value computation (oracle fast path + bounded value-space
+            // enumeration in `query_find`). Plain `{x: D | F}`
+            // comprehensions stay purely enumerative and are evaluated
+            // below via `query_set_parsed`.
+            if let Expr::Find(sel, decls, body) = &e {
+                return query_find(module, scope, cnf, *sel, decls, body, instance);
+            }
             // `realUp`/`realDown` are computed functions, not relations:
             // answer via the lane oracle (see `QueryValue::Real`).
             if let Expr::Call(name, args, _) = &e {
                 if (name == "realUp" || name == "realDown") && args.len() == 1 {
                     return query_real_fun(module, scope, &e, name == "realUp", &args[0], instance);
                 }
-            }
-            if let Some(qv) = query_succ_set(module, scope, &e, instance)? {
-                return Ok(qv);
             }
             let (arity, ts) = query_set_parsed(module, scope, &e, instance)?;
             Ok(QueryValue::Set(arity, ts))
@@ -250,6 +265,51 @@ fn query_set_parsed(
     Ok((arity, ts))
 }
 
+/// Resolve a bare decimal literal query to its exact centre.
+///
+/// `d` needs an exact dyadic conversion (a plain non-dyadic literal
+/// errors loudly instead of rounding silently — use the `(d)`
+/// spelling for the nearest centre); `(d)` rounds to nearest.
+/// Malformed/range literals fail loudly, as in `setReal`.
+///
+/// The centre then expands to its lane-bit atom set (`M$i`/`E$j`,
+/// two's complement — the inverse of `display::decode_bitset`), so the
+/// query prints `{M$0, ...} = 1.25 [m=.. e=..]`. Expansion failures
+/// (missing lane atoms, out-of-range lanes, the bit-free exact zero)
+/// keep the computed `Real` reading.
+fn query_real_lit(
+    module: &Module,
+    scope: &Scope,
+    e: &Expr,
+    instance: &Instance,
+) -> Result<QueryValue, FrontError> {
+    let (mw, ew) = real_lane_widths(module, scope)?;
+    let centre = crate::lower::decimal_centre(e, mw)?;
+    if let Some(ts) = centre_atom_set(instance, mw, ew, &centre) {
+        return Ok(QueryValue::Set(1, ts));
+    }
+    Ok(QueryValue::Real(centre))
+}
+
+/// Lane-bit atom set for a decoded centre via the shared
+/// `centre_lane_indices`; `None` keeps the `Real` reading.
+fn centre_atom_set(
+    instance: &Instance,
+    mw: u32,
+    ew: u32,
+    centre: &RealCenter,
+) -> Option<TupleSet> {
+    let idxs = crate::lower::centre_lane_indices(instance.universe(), mw, ew, centre)?;
+    if idxs.is_empty() {
+        return None;
+    }
+    let mut set = IntSet::new();
+    for i in idxs {
+        set.insert(i as i64);
+    }
+    TupleSet::from_indices(instance.universe(), 1, set).ok()
+}
+
 /// Lane widths for oracle queries (`realUp`/`realDown`, successor
 /// comprehensions) from the query command's scope.
 fn real_lane_widths(module: &Module, scope: &Scope) -> Result<(u32, u32), FrontError> {
@@ -262,11 +322,13 @@ fn real_lane_widths(module: &Module, scope: &Scope) -> Result<(u32, u32), FrontE
 /// Resolve a Real-valued query argument to its exact centre.
 ///
 /// Decimal literals fold like the solve path (`RealLit` exact dyadic
-/// only; `(d)` nearest). Anything else must evaluate to a singleton
-/// atom set whose `(m, e)` lanes are read from the instance.
+/// only; `(d)` nearest). Anything else must evaluate to a set whose
+/// `(m, e)` centre can be read from the instance: either a singleton
+/// `extends Real` member atom (via [`crate::display::decode_ereal`]) or
+/// a flat lane bit set (`sig R in Real`, via [`bitset_centre`]).
 /// Returns `None` when no centre applies (non-dyadic plain literal,
-/// empty/multi-element set, undecodable lanes): the caller falls back
-/// to instance enumeration, which stays sound there.
+/// empty/undecodable set): the caller falls back to instance
+/// enumeration, which stays sound there.
 fn real_arg_centre(
     module: &Module,
     scope: &Scope,
@@ -293,13 +355,117 @@ fn real_arg_centre(
                 return None;
             }
             let idxs: Vec<_> = ts.index_view().iter().collect();
-            if idxs.len() != 1 {
-                return None;
+            if idxs.len() == 1 {
+                if let Some(decoded) = crate::display::decode_ereal(instance) {
+                    if let Some(d) = decoded.get(&(idxs[0] as u32)) {
+                        if let Some(v) = RealCenter::new(d.lanes.0 as i128, d.lanes.1 as i32) {
+                            return Some(v);
+                        }
+                    }
+                }
             }
-            let decoded = crate::display::decode_ereal(instance)?;
-            let d = decoded.get(&(idxs[0] as u32))?;
-            RealCenter::new(d.lanes.0 as i128, d.lanes.1 as i32)
+            // Flat bit-set value (`sig R in Real`): decode the whole set.
+            let all: Vec<u32> = idxs.iter().map(|i| *i as u32).collect();
+            bitset_centre(instance.universe(), &all, mw, real_lane_ew(module, scope)?)
         }
+    }
+}
+
+/// Lane `E` width companion for [`bitset_centre`] (scope-derived).
+fn real_lane_ew(module: &Module, scope: &Scope) -> Option<u32> {
+    real_lane_widths(module, scope).ok().map(|(_, ew)| ew)
+}
+
+/// Exact centre of a flat lane bit set (`{M$.., E$..}`).
+/// `P`/`K` bits, non-lane atoms, and out-of-range positions yield `None`.
+fn bitset_centre(
+    universe: &alloy_kodkod_rs::universe::Universe,
+    idxs: &[u32],
+    mw: u32,
+    ew: u32,
+) -> Option<RealCenter> {
+    if idxs.is_empty() {
+        return None;
+    }
+    let mut mbits = Vec::new();
+    let mut ebits = Vec::new();
+    for &i in idxs {
+        let atom = universe.atom(i as usize).ok()?;
+        let (pre, suf) = atom.split_once('$')?;
+        let pos: i64 = suf.parse().ok()?;
+        match pre {
+            "M" => mbits.push(pos),
+            "E" => ebits.push(pos),
+            _ => return None,
+        }
+    }
+    let m = lane_twos_comp(&mbits, mw as i64)?;
+    let e = lane_twos_comp(&ebits, ew as i64)?;
+    RealCenter::new(m as i128, e as i32)
+}
+
+/// Two's-complement value of lane-bit positions (MSB weighs `-2^(W-1)`);
+/// empty reads as 0.
+fn lane_twos_comp(bits: &[i64], width: i64) -> Option<i64> {
+    if width <= 0 || width >= 63 {
+        return None;
+    }
+    let mut total: i64 = 0;
+    for &v in bits {
+        if v < 0 || v >= width {
+            return None;
+        }
+        let w = if v == width - 1 {
+            -(1i64.checked_shl((width - 1) as u32)?)
+        } else {
+            1i64.checked_shl(v as u32)?
+        };
+        total = total.checked_add(w)?;
+    }
+    Some(total)
+}
+
+/// Present a computed centre the way comprehensions must: as the
+/// lane-bit set it denotes whenever that set is non-empty and
+/// representable in this instance's universe, otherwise as the bare
+/// computed-`Real` reading (exact zero, missing lane atoms). This keeps
+/// `{x: Real | ...}` oracle answers composable with the relational
+/// language (`#`, `in`, `=` against other bit sets) exactly like
+/// enumerated comprehensions such as `{x: Real | one x}`.
+fn centre_as_set_or_real(
+    instance: &Instance,
+    mw: u32,
+    ew: u32,
+    centre: RealCenter,
+) -> QueryValue {
+    if let Some(ts) = centre_atom_set(instance, mw, ew, &centre) {
+        return QueryValue::Set(1, ts);
+    }
+    QueryValue::Real(centre)
+}
+
+/// Step a centre through the lane oracle, reporting a range exit loudly
+/// (mirrors the solve path, where a missing successor is UNSAT).
+fn real_oracle_centre(
+    name: &str,
+    up: bool,
+    centre: &RealCenter,
+    mw: u32,
+    ew: u32,
+) -> Result<RealCenter, FrontError> {
+    let next = if up {
+        next_up(centre, mw, ew)
+    } else {
+        next_down(centre, mw, ew)
+    };
+    match next {
+        Some(v) => Ok(v),
+        None => Err(FrontError::Resolve(format!(
+            "`{name}` of {} [m={} e={}] leaves the lane range",
+            centre.centre_short(),
+            centre.m,
+            centre.e,
+        ))),
     }
 }
 
@@ -312,20 +478,7 @@ fn real_oracle_step(
     mw: u32,
     ew: u32,
 ) -> Result<QueryValue, FrontError> {
-    let next = if up {
-        next_up(centre, mw, ew)
-    } else {
-        next_down(centre, mw, ew)
-    };
-    match next {
-        Some(v) => Ok(QueryValue::Real(v)),
-        None => Err(FrontError::Resolve(format!(
-            "`{name}` of {} [m={} e={}] leaves the lane range",
-            centre.centre_short(),
-            centre.m,
-            centre.e,
-        ))),
-    }
+    real_oracle_centre(name, up, centre, mw, ew).map(QueryValue::Real)
 }
 
 /// Evaluate a `realUp[x]` / `realDown[x]` query via the lane oracle.
@@ -356,27 +509,24 @@ fn query_real_fun(
     }
 }
 
-/// Evaluate a `{ v: Real | v.realSucc[e] }` / `{ v: Real | v.realPred[e] }`
-/// query (either orientation) via the lane oracle.
+/// Evaluate a `{ v in Real | v.realSucc[e] }` / `{ v in Real | v.realPred[e] }`
+/// find-form query (either orientation) via the lane oracle.
 ///
 /// Same atom-population limitation as [`query_real_fun`]: the successor
-/// is computed from `e`'s centre instead of enumerated. Only the exact
+/// is computed from `e`'s centre instead of enumerated, then presented
+/// as a lane-bit set via [`centre_as_set_or_real`]. Only the exact
 /// shape qualifies — a single `Real`-typed binding whose body is one
 /// `realSucc`/`realPred` call with the bound variable bare on one side
 /// and a variable-free closed argument (literal or plain name) on the
-/// other. Anything else (domain-restricted bindings, compound bodies,
-/// nested bound variables) falls through to instance enumeration, which
-/// stays sound there.
+/// other. Anything else returns `None` so the caller can fall back to
+/// value-space enumeration.
 fn query_succ_set(
     module: &Module,
     scope: &Scope,
-    e: &Expr,
+    decls: &[Decl],
+    body: &Formula,
     instance: &Instance,
 ) -> Result<Option<QueryValue>, FrontError> {
-    let (decls, body) = match e {
-        Expr::Comprehension(decls, body) => (decls, body),
-        _ => return Ok(None),
-    };
     if decls.len() != 1 || decls[0].names.len() != 1 {
         return Ok(None);
     }
@@ -384,7 +534,7 @@ fn query_succ_set(
         return Ok(None);
     }
     let var = &decls[0].names[0];
-    let (name, args) = match body.as_ref() {
+    let (name, args) = match body {
         Formula::Call(n, a, _) => (n.as_str(), a),
         _ => return Ok(None),
     };
@@ -423,8 +573,689 @@ fn query_succ_set(
     };
     // Forward (solving for the result side) steps with the predicate's
     // own direction; backward (solving for the input side) inverts it.
+    // The answer is presented as a lane-bit set (see
+    // `centre_as_set_or_real`), so the comprehension denotes a set just
+    // like `{x: Real | one x}` does.
     let fwd = succ == (var_side == 0);
-    Ok(Some(real_oracle_step(name, fwd, &centre, mw, ew)?))
+    let next = real_oracle_centre(name, fwd, &centre, mw, ew)?;
+    Ok(Some(centre_as_set_or_real(instance, mw, ew, next)))
+}
+
+/// Evaluate a `{ r in Real | r.realAdd[a, b] }`-shaped arithmetic
+/// find-form (`realAdd`/`realSub`/`realMul`/`realDiv`) via the
+/// exact-centre oracle, presented as a lane-bit set via
+/// [`centre_as_set_or_real`].
+///
+/// Same atom-population limitation as [`query_succ_set`]: the result is
+/// computed from the closed arguments' centres instead of enumerated.
+/// Only the exact shape qualifies — a single `Real`-typed binding whose
+/// body is one arithmetic call with the bound variable bare in exactly
+/// one of the three positions and closed arguments (literal or plain
+/// name) elsewhere. Anything else returns `None` so the caller can fall
+/// back to value-space enumeration.
+///
+/// Inexact results (e.g. inexact `realDiv`), overflows, or lane-width
+/// violations also return `None` (enumeration then correctly yields no
+/// solutions, mirroring the solve path's UNSAT).
+fn query_arith_set(
+    module: &Module,
+    scope: &Scope,
+    decls: &[Decl],
+    body: &Formula,
+    instance: &Instance,
+) -> Result<Option<QueryValue>, FrontError> {
+    if decls.len() != 1 || decls[0].names.len() != 1 {
+        return Ok(None);
+    }
+    if !matches!(&decls[0].expr, Expr::Name(n, _) if n == "Real") {
+        return Ok(None);
+    }
+    let var = &decls[0].names[0];
+    let (name, args) = match body {
+        Formula::Call(n, a, _) => (n.as_str(), a),
+        _ => return Ok(None),
+    };
+    if args.len() != 3 {
+        return Ok(None);
+    }
+    // Arg order is `[R, A, B]` (`R = A op B`).
+    let kind = match name {
+        "realAdd" | "realSub" | "realMul" | "realDiv" => name,
+        _ => return Ok(None),
+    };
+    let var_side = args
+        .iter()
+        .position(|a| matches!(a, Expr::Name(n, _) if n == var));
+    let var_side = match var_side {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    // Bound variable must occur exactly once.
+    if args
+        .iter()
+        .filter(|a| matches!(a, Expr::Name(n, _) if n == var))
+        .count()
+        != 1
+    {
+        return Ok(None);
+    }
+    // Other sides must be closed over a literal or a plain,
+    // non-shadowed name.
+    for (i, other) in args.iter().enumerate() {
+        if i == var_side {
+            continue;
+        }
+        let closed = match other {
+            Expr::RealLit(..) | Expr::ApproxRealLit(..) => true,
+            Expr::Name(n, _) => n != var,
+            _ => return Ok(None),
+        };
+        if !closed {
+            return Ok(None);
+        }
+    }
+    let (mw, ew) = real_lane_widths(module, scope)?;
+    let centre_of = |expr: &Expr| real_arg_centre(module, scope, mw, expr, instance);
+    // Resolve the two known sides to centres.
+    let known: Vec<Option<RealCenter>> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if i == var_side {
+                None
+            } else {
+                centre_of(a)
+            }
+        })
+        .collect();
+    // `known[i]` is None exactly at `var_side`; the other two must resolve.
+    let mut vals: [Option<RealCenter>; 3] = [None, None, None];
+    for (i, v) in known.into_iter().enumerate() {
+        vals[i] = v;
+    }
+    if vals.iter().enumerate().any(|(i, v)| i != var_side && v.is_none()) {
+        return Ok(None);
+    }
+    // Compute the unknown side. Conventions: R=A+B, R=A-B, R=A*B, R=A/B.
+    let result = match (kind, var_side) {
+        ("realAdd", 0) => real_add(&vals[1].unwrap(), &vals[2].unwrap(), 1),
+        ("realAdd", 1) => real_add(&vals[0].unwrap(), &vals[2].unwrap(), -1),
+        ("realAdd", 2) => real_add(&vals[0].unwrap(), &vals[1].unwrap(), -1),
+        ("realSub", 0) => real_add(&vals[1].unwrap(), &vals[2].unwrap(), -1),
+        ("realSub", 1) => real_add(&vals[0].unwrap(), &vals[2].unwrap(), 1),
+        // B = A - R.
+        ("realSub", 2) => real_add(&vals[1].unwrap(), &vals[0].unwrap(), -1),
+        ("realMul", 0) => real_mul(&vals[1].unwrap(), &vals[2].unwrap()),
+        ("realMul", 1) => real_div(&vals[0].unwrap(), &vals[2].unwrap()),
+        ("realMul", 2) => real_div(&vals[0].unwrap(), &vals[1].unwrap()),
+        ("realDiv", 0) => real_div(&vals[1].unwrap(), &vals[2].unwrap()),
+        ("realDiv", 1) => real_mul(&vals[0].unwrap(), &vals[2].unwrap()),
+        // B = A / R.
+        ("realDiv", 2) => real_div(&vals[1].unwrap(), &vals[0].unwrap()),
+        _ => return Ok(None),
+    };
+    let result = match result {
+        Some(v) => v,
+        // Inexact (e.g. inexact `realDiv`): no value satisfies.
+        None => return Ok(None),
+    };
+    // Fire only if the centre is exactly lane-representable: the lane
+    // circuits compute modulo 2^width, so an out-of-range exact result
+    // would diverge from the solver. Deferring to enumeration keeps the
+    // answer solver-faithful (wrapping) in that case. Exact zero keeps
+    // the shared presentation (its value is unambiguous either way).
+    if result.m != 0 && !centre_in_lane_range(&result, mw, ew) {
+        return Ok(None);
+    }
+    Ok(Some(centre_as_set_or_real(instance, mw, ew, result)))
+}
+
+/// Lane-range validity of a computed centre: mantissa fits `mw` plus the
+/// exponent fits the signed `ew` lanes.
+fn centre_in_lane_range(c: &RealCenter, mw: u32, ew: u32) -> bool {
+    if !c.is_valid(Some(mw)) || ew == 0 || ew > 30 {
+        return false;
+    }
+    let lo = -(1i64 << (ew - 1));
+    let hi = (1i64 << (ew - 1)) - 1;
+    lo <= c.e as i64 && (c.e as i64) <= hi
+}
+
+/// Cap on find-form value-space enumeration: candidate counts above this
+/// fail loudly with a scope-narrowing hint instead of hanging.
+const FIND_ENUM_CAP: u64 = 65536;
+
+/// A candidate value of a find-form binder in ascending numeric order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindVal {
+    Int(i64),
+    Real(RealCenter),
+}
+
+/// Exact numeric order on centres (`m*2^e`, no floats). Zeros compare
+/// equal regardless of scale. Nonzero values align mantissas with checked
+/// shifts; on shift overflow the shifted side provably exceeds the other
+/// in magnitude (overflow needs magnitude ≥ 2^127 while mantissas fit in
+/// `mw ≤ 127` bits), so its sign decides.
+fn real_center_cmp(a: &RealCenter, b: &RealCenter) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.m == 0, b.m == 0) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return if b.m > 0 { Ordering::Less } else { Ordering::Greater },
+        (false, true) => return if a.m > 0 { Ordering::Greater } else { Ordering::Less },
+        (false, false) => {}
+    }
+    if a.m.signum() != b.m.signum() {
+        return a.m.cmp(&b.m);
+    }
+    let ell = a.e.min(b.e);
+    match (
+        a.m.checked_shl((a.e - ell) as u32),
+        b.m.checked_shl((b.e - ell) as u32),
+    ) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (None, Some(_)) => a.m.signum().cmp(&0),
+        (Some(_), None) => 0.cmp(&b.m.signum()),
+        // Unreachable: one shift is always 0 (`ell` is the minimum).
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Ascending candidate values of a find-form domain. `Int`: the faithful
+/// range `[-2^(W-1), 2^W - 1]` (signed integer values, not just atoms —
+/// `{n in Int | n < 0}` must see negatives). `Real`: normalized centres
+/// within the lane widths (odd mantissas plus zero at every scale;
+/// value-equal centres dedupe to the finest scale). Counts above
+/// [`FIND_ENUM_CAP`] error out.
+fn find_candidates(
+    _cnf: &Cnf,
+    _instance: &Instance,
+    is_int: bool,
+    w: u32,
+    mw: u32,
+    ew: u32,
+) -> Result<Vec<FindVal>, FrontError> {
+    if is_int {
+        if w == 0 || w > 62 {
+            return Ok(Vec::new());
+        }
+        let total = 2u64.checked_pow(w).unwrap_or(u64::MAX);
+        if total > FIND_ENUM_CAP {
+            return Err(FrontError::Resolve(format!(
+                "`in`-form enumeration over {total} integers exceeds the cap ({FIND_ENUM_CAP}); narrow the `Int` scope"
+            )));
+        }
+        let lo = -(1i64.checked_shl(w - 1).unwrap_or(i64::MAX));
+        let hi = (1i64.checked_shl(w - 1).unwrap_or(i64::MAX)) - 1;
+        return Ok((lo..=hi).map(FindVal::Int).collect());
+    }
+    // Real: 2^(mw-1) odd mantissas x 2^ew exponents, plus zero scales.
+    let e_count = 2u64.checked_pow(ew).unwrap_or(u64::MAX);
+    let m_odd = if mw == 0 {
+        0
+    } else {
+        2u64.checked_pow(mw - 1).unwrap_or(u64::MAX)
+    };
+    let total = m_odd.saturating_mul(e_count).saturating_add(e_count);
+    if total > FIND_ENUM_CAP {
+        return Err(FrontError::Resolve(format!(
+            "`in`-form enumeration over ~{total} centres exceeds the cap ({FIND_ENUM_CAP}); narrow the lane widths (`for N Int`)"
+        )));
+    }
+    let (m_lo, m_hi) = (-(1i128 << (mw.saturating_sub(1))), (1i128 << (mw.saturating_sub(1))) - 1);
+    let (e_lo, e_hi) = (
+        -(1i64.checked_shl(ew.saturating_sub(1)).unwrap_or(i64::MAX)),
+        (1i64.checked_shl(ew.saturating_sub(1)).unwrap_or(i64::MAX)) - 1,
+    );
+    let mut out: Vec<(RealCenter, i32)> = Vec::new();
+    let mut m = m_lo;
+    while m <= m_hi {
+        if m == 0 || m % 2 != 0 {
+            let mut e = e_lo;
+            while e <= e_hi {
+                if let Some(c) = RealCenter::new(m, e as i32) {
+                    out.push((c, e as i32));
+                }
+                if e == e_hi {
+                    break;
+                }
+                e += 1;
+            }
+        }
+        if m == m_hi {
+            break;
+        }
+        m += 1;
+    }
+    out.sort_by(|(a, ea), (b, eb)| real_center_cmp(a, b).then(ea.cmp(eb)));
+    let mut deduped: Vec<FindVal> = Vec::new();
+    for (c, _) in out {
+        let same = deduped.last().is_some_and(|last| match last {
+            FindVal::Real(d) => real_center_cmp(d, &c) == std::cmp::Ordering::Equal,
+            FindVal::Int(_) => false,
+        });
+        if !same {
+            deduped.push(FindVal::Real(c));
+        }
+    }
+    Ok(deduped)
+}
+
+/// Test one candidate: substitute the binder and evaluate the closed body
+/// against `instance`.
+///
+/// The binder reads as a *value*: in set positions it becomes the exact
+/// bit union (`Int` and `Real` alike, see [`find_lit`] — never decimal
+/// text, whose re-parse can leave the lane); in integer `Val` positions
+/// an `Int` binder becomes the integer literal itself (naive integer
+/// arithmetic, not the bitmask cast). Nested redeclarations of the binder
+/// stop the substitution.
+///
+/// Lowering/evaluation failures for a candidate mean the candidate does
+/// not satisfy the body (its denotation may reference unmaterialized
+/// atoms, or an operation may be undefined on it, e.g. division by zero).
+/// Genuine body errors are surfaced once by the caller-side pilot instead.
+#[allow(clippy::too_many_arguments)]
+fn find_holds(
+    module: &Module,
+    scope: &Scope,
+    cnf: &Cnf,
+    var: &str,
+    cand: &FindVal,
+    body: &Formula,
+    instance: &Instance,
+    w: u32,
+    mw: u32,
+    ew: u32,
+) -> Result<bool, FrontError> {
+    let lit = find_lit(w, mw, ew, cand);
+    let int_val = match cand {
+        FindVal::Int(v) => Some(*v),
+        FindVal::Real(_) => None,
+    };
+    let closed = subst_find_formula(body, var, &lit, int_val);
+    let mut arena = AstArena::with_pool(Arc::clone(instance.pool()));
+    let mut lower = Lowerer::new(module);
+    let fid = match lower.lower_formula_in_scope(scope, &mut arena, &closed) {
+        Ok(fid) => fid,
+        Err(_) => return Ok(false),
+    };
+    let empty_env = Vec::new();
+    match alloy_kodkod_rs::eval::Evaluator::new(instance)
+        .with_bitwidth(cnf.bitwidth)
+        .formula_bool(&arena, fid, &empty_env)
+    {
+        Ok(v) => Ok(v),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Present one found value: integer (`Int`) or lane-bit set (`Real`,
+/// sharing [`centre_as_set_or_real`]'s bit-free-zero fallback).
+fn present_find_val(
+    instance: &Instance,
+    mw: u32,
+    ew: u32,
+    cand: &FindVal,
+) -> Result<QueryValue, FrontError> {
+    match cand {
+        FindVal::Int(v) => Ok(QueryValue::Int(*v)),
+        FindVal::Real(c) => Ok(centre_as_set_or_real(instance, mw, ew, *c)),
+    }
+}
+
+/// Evaluate `{[any|min|max] x in D | F}`: the value-finding form.
+///
+/// The oracle fast path answers `Real` functional shapes directly (a
+/// closed functional body determines at most one value, so every
+/// selector agrees with it). Otherwise the domain's value space is
+/// enumerated in ascending order ([`find_candidates`]) and each
+/// candidate is tested ([`find_holds`]):
+/// - `any`: first hit (short-circuits), `{}` when nothing satisfies;
+/// - bare: the single hit, `{}` when nothing satisfies, an explicit
+///   ambiguity error past one hit (use a selector instead);
+/// - `min`/`max`: extremal hit by the sort's numeric order, `{}` when
+///   nothing satisfies.
+fn query_find(
+    module: &Module,
+    scope: &Scope,
+    cnf: &Cnf,
+    sel: FindSel,
+    decls: &[Decl],
+    body: &Formula,
+    instance: &Instance,
+) -> Result<QueryValue, FrontError> {
+    if decls.len() != 1 || decls[0].names.len() != 1 {
+        return Err(FrontError::Resolve("`in`-form takes a single binder".to_string()));
+    }
+    let var = decls[0].names[0].clone();
+    let is_int = matches!(&decls[0].expr, Expr::IntAtom);
+    let is_real = matches!(&decls[0].expr, Expr::Name(n, _) if n == "Real");
+    if !is_int && !is_real {
+        // Defensive: the parser restricts `in`-form domains to value sorts.
+        return Err(FrontError::Resolve(
+            "`{x in D | F}` needs a value sort (`Int` or `Real`)".to_string(),
+        ));
+    }
+    if is_real {
+        if let Some(qv) = query_succ_set(module, scope, decls, body, instance)? {
+            return Ok(qv);
+        }
+        if let Some(qv) = query_arith_set(module, scope, decls, body, instance)? {
+            return Ok(qv);
+        }
+    }
+    // `Int` needs materialized bit atoms for value denotations (mirrors
+    // the integer-scope guard on the int path).
+    if is_int && cnf.bounds.int_bounds().count() == 0 {
+        return Err(FrontError::Resolve(
+            "integer set is not in scope (this model materializes no Int atoms; mention Int in the model or add `for N Int` to the scope)".to_string(),
+        ));
+    }
+    let w = crate::ast::effective_int_count(scope);
+    let (mw, ew) = real_lane_widths(module, scope)?;
+    let cands = find_candidates(cnf, instance, is_int, w, mw, ew)?;
+    // Pilot: lower the body once with the first candidate's denotation so
+    // genuine body errors surface loudly instead of collapsing every
+    // candidate to non-hits. Later per-candidate lowering failures mean
+    // that candidate is unevaluable (unmaterialized atoms, undefined
+    // operations like division by zero) and count as non-hits.
+    if !cands.is_empty() {
+        let rep = find_lit(w, mw, ew, &cands[0]);
+        let probe = subst_find_formula(body, &var, &rep, None);
+        let mut arena = AstArena::with_pool(Arc::clone(instance.pool()));
+        let mut lower = Lowerer::new(module);
+        lower.lower_formula_in_scope(scope, &mut arena, &probe)?;
+    }
+    let mut hits: Vec<FindVal> = Vec::new();
+    for cand in &cands {
+        if find_holds(module, scope, cnf, &var, cand, body, instance, w, mw, ew)? {
+            match sel {
+                // Ascending scan: the first hit is both `any` and `min`.
+                FindSel::Any | FindSel::Min => {
+                    return present_find_val(instance, mw, ew, cand)
+                }
+                FindSel::All if !hits.is_empty() => {
+                    return Err(FrontError::Resolve(
+                        "multiple values satisfy the `in`-form; refine with `any`, `min` or `max`"
+                            .to_string(),
+                    ));
+                }
+                _ => hits.push(*cand),
+            }
+        }
+    }
+    let empty = || {
+        TupleSet::from_indices(instance.universe(), 1, IntSet::new())
+            .map_err(|_| FrontError::Resolve("cannot build empty set".to_string()))
+            .map(|ts| QueryValue::Set(1, ts))
+    };
+    match sel {
+        FindSel::Any => empty(),
+        FindSel::All => match hits.len() {
+            0 => empty(),
+            _ => present_find_val(instance, mw, ew, &hits[0]),
+        },
+        FindSel::Min => match hits.first() {
+            Some(c) => present_find_val(instance, mw, ew, c),
+            None => empty(),
+        },
+        FindSel::Max => match hits.last() {
+            Some(c) => present_find_val(instance, mw, ew, c),
+            None => empty(),
+        },
+    }
+}
+
+/// Value-reading substitution for find-form enumeration (see
+/// [`find_holds`]).
+/// Value-reading substitution for find-form enumeration (see
+/// [`find_holds`]): a complete mirror of `fold_formula` threading
+/// integer-mode substitution ([`subst_find_int`]) through every position
+/// that can hold an `IntExpr` (`IntCmp`, `Maximize`/`Minimize`). All other
+/// shapes recurse structurally; nested redeclarations of the binder stop
+/// the substitution exactly like `fold_formula`.
+fn subst_find_formula(f: &Formula, var: &str, lit: &Expr, int_val: Option<i64>) -> Formula {
+    match f {
+        Formula::Const(_) | Formula::Pin(..) => f.clone(),
+        Formula::IntCmp(op, a, b, p) => Formula::IntCmp(
+            *op,
+            subst_find_int(a, var, lit, int_val),
+            subst_find_int(b, var, lit, int_val),
+            *p,
+        ),
+        Formula::Maximize(ie) => Formula::Maximize(subst_find_int(ie, var, lit, int_val)),
+        Formula::Minimize(ie) => Formula::Minimize(subst_find_int(ie, var, lit, int_val)),
+        Formula::MaxSome(e) => Formula::MaxSome(Box::new(subst_find_set(e, var, lit))),
+        Formula::MinSome(e) => Formula::MinSome(Box::new(subst_find_set(e, var, lit))),
+        Formula::OverflowCond(m, body) => {
+            Formula::OverflowCond(*m, Box::new(subst_find_formula(body, var, lit, int_val)))
+        }
+        Formula::MaxSomeDecl(ds, body) => Formula::MaxSomeDecl(
+            subst_find_decls(ds, var, lit),
+            Box::new(subst_find_formula(body, var, lit, int_val)),
+        ),
+        Formula::Not(x) => Formula::Not(Box::new(subst_find_formula(x, var, lit, int_val))),
+        Formula::And(a, b) => Formula::And(
+            Box::new(subst_find_formula(a, var, lit, int_val)),
+            Box::new(subst_find_formula(b, var, lit, int_val)),
+        ),
+        Formula::Or(a, b) => Formula::Or(
+            Box::new(subst_find_formula(a, var, lit, int_val)),
+            Box::new(subst_find_formula(b, var, lit, int_val)),
+        ),
+        Formula::Implies(a, b) => Formula::Implies(
+            Box::new(subst_find_formula(a, var, lit, int_val)),
+            Box::new(subst_find_formula(b, var, lit, int_val)),
+        ),
+        Formula::Iff(a, b) => Formula::Iff(
+            Box::new(subst_find_formula(a, var, lit, int_val)),
+            Box::new(subst_find_formula(b, var, lit, int_val)),
+        ),
+        Formula::Cmp(k, a, b, p) => Formula::Cmp(
+            *k,
+            subst_find_set(a, var, lit),
+            subst_find_set(b, var, lit),
+            *p,
+        ),
+        Formula::BadIn(a, p) => Formula::BadIn(Box::new(subst_find_set(a, var, lit)), *p),
+        Formula::Multi(k, e, p) => {
+            Formula::Multi(*k, subst_find_set(e, var, lit), *p)
+        }
+        Formula::Quant(k, decls, body) => {
+            if decls.iter().any(|d| d.names.iter().any(|n| n == var)) {
+                f.clone()
+            } else {
+                Formula::Quant(
+                    *k,
+                    subst_find_decls(decls, var, lit),
+                    Box::new(subst_find_formula(body, var, lit, int_val)),
+                )
+            }
+        }
+        Formula::LetBind(binds, body) => {
+            if binds.iter().any(|(n, _)| n == var) {
+                f.clone()
+            } else {
+                Formula::LetBind(
+                    binds.clone(),
+                    Box::new(subst_find_formula(body, var, lit, int_val)),
+                )
+            }
+        }
+        Formula::Call(name, args, p) => Formula::Call(
+            name.clone(),
+            args.iter().map(|a| subst_find_set(a, var, lit)).collect(),
+            *p,
+        ),
+        Formula::Always(inner) => Formula::Always(Box::new(subst_find_formula(inner, var, lit, int_val))),
+        Formula::Eventually(inner) => {
+            Formula::Eventually(Box::new(subst_find_formula(inner, var, lit, int_val)))
+        }
+        Formula::Until(a, b) => Formula::Until(
+            Box::new(subst_find_formula(a, var, lit, int_val)),
+            Box::new(subst_find_formula(b, var, lit, int_val)),
+        ),
+        Formula::Releases(a, b) => Formula::Releases(
+            Box::new(subst_find_formula(a, var, lit, int_val)),
+            Box::new(subst_find_formula(b, var, lit, int_val)),
+        ),
+        Formula::Before(inner) => Formula::Before(Box::new(subst_find_formula(inner, var, lit, int_val))),
+        Formula::Historically(inner) => {
+            Formula::Historically(Box::new(subst_find_formula(inner, var, lit, int_val)))
+        }
+        Formula::Once(inner) => Formula::Once(Box::new(subst_find_formula(inner, var, lit, int_val))),
+        Formula::Since(a, b) => Formula::Since(
+            Box::new(subst_find_formula(a, var, lit, int_val)),
+            Box::new(subst_find_formula(b, var, lit, int_val)),
+        ),
+        Formula::Triggered(a, b) => Formula::Triggered(
+            Box::new(subst_find_formula(a, var, lit, int_val)),
+            Box::new(subst_find_formula(b, var, lit, int_val)),
+        ),
+        Formula::Keeping(inner) => {
+            Formula::Keeping(Box::new(subst_find_formula(inner, var, lit, int_val)))
+        }
+        Formula::Goal(inner) => Formula::Goal(Box::new(subst_find_formula(inner, var, lit, int_val))),
+        Formula::Restore(inner) => {
+            Formula::Restore(Box::new(subst_find_formula(inner, var, lit, int_val)))
+        }
+        Formula::Initially(inner) => {
+            Formula::Initially(Box::new(subst_find_formula(inner, var, lit, int_val)))
+        }
+        Formula::Regularly(inner) => {
+            Formula::Regularly(Box::new(subst_find_formula(inner, var, lit, int_val)))
+        }
+        Formula::Consistently(inner) => {
+            Formula::Consistently(Box::new(subst_find_formula(inner, var, lit, int_val)))
+        }
+    }
+}
+
+/// Declaration substitution for [`subst_find_formula`].
+fn subst_find_decls(ds: &[Decl], var: &str, lit: &Expr) -> Vec<Decl> {
+    ds.iter()
+        .map(|d| crate::ast::Decl {
+            disj: d.disj,
+            names: d.names.clone(),
+            expr: subst_find_set(&d.expr, var, lit),
+            pos: d.pos,
+            is_var: d.is_var,
+        })
+        .collect()
+}
+
+/// Set-position substitution: the binder becomes its denotation
+/// (singleton atom / exact decimal); nested redeclarations stop it via
+/// the shared traversal.
+fn subst_find_set(e: &Expr, var: &str, lit: &Expr) -> Expr {
+    crate::lower::fold_expr(e, var, &crate::lower::NameTarget::Replace(lit))
+}
+
+/// Integer-position substitution: an `Int` binder reads as the integer
+/// itself; anything else substitutes in set positions underneath.
+fn subst_find_int(i: &IntExpr, var: &str, lit: &Expr, int_val: Option<i64>) -> IntExpr {
+    use crate::ast::IntExpr as IE;
+    match i {
+        IE::Val(e, p) => match e.as_ref() {
+            Expr::Name(n, _) if n == var => match int_val {
+                Some(v) => IE::Lit(v, *p),
+                // A `Real` binder under an integer operator is nonsense;
+                // leave it for lowering to reject loudly.
+                None => IE::Val(Box::new(subst_find_set(e, var, lit)), *p),
+            },
+            _ => IE::Val(Box::new(subst_find_set(e, var, lit)), *p),
+        },
+        IE::Card(e, p) => IE::Card(Box::new(subst_find_set(e, var, lit)), *p),
+        IE::SumOf(e, p) => IE::SumOf(Box::new(subst_find_set(e, var, lit)), *p),
+        IE::BitsVal(e, p) => IE::BitsVal(Box::new(subst_find_set(e, var, lit)), *p),
+        IE::Sum(decls, body, p) => {
+            if decls.iter().any(|d| d.names.iter().any(|n| n == var)) {
+                i.clone()
+            } else {
+                IE::Sum(decls.clone(), Box::new(subst_find_int(body, var, lit, int_val)), *p)
+            }
+        }
+        IE::Bin(op, a, b) => IE::Bin(
+            *op,
+            Box::new(subst_find_int(a, var, lit, int_val)),
+            Box::new(subst_find_int(b, var, lit, int_val)),
+        ),
+        IE::Widen(op, a, b) => IE::Widen(
+            *op,
+            Box::new(subst_find_int(a, var, lit, int_val)),
+            Box::new(subst_find_int(b, var, lit, int_val)),
+        ),
+        IE::Lit(..) => i.clone(),
+    }
+}
+
+/// The binder's denotation for substitution: exact bit unions for both
+/// sorts (`Int` bit positions / `Real` lanes).
+///
+/// Values never go through decimal text: an `e > 0` centre expands to a
+/// full integer on re-parse and can leave the mantissa lane even though
+/// the `(m, e)` pair itself is lane-valid. Bit unions are exact by
+/// construction (same two's-complement rule as `centre_lane_indices` and
+/// `lower_expr_bits`); the bit-free exact zero becomes the empty set.
+fn find_lit(w: u32, mw: u32, ew: u32, cand: &FindVal) -> Expr {
+    match cand {
+        FindVal::Int(v) => {
+            let names = int_bit_names(*v, w).unwrap_or_default();
+            let mut it = names.into_iter().map(|n| Expr::Name(n, 0));
+            match it.next() {
+                Some(first) => it.fold(first, |acc, e| {
+                    Expr::Bin(BinOp::Union, Box::new(acc), Box::new(e))
+                }),
+                None => Expr::None_,
+            }
+        }
+        FindVal::Real(c) => {
+            let mut names: Vec<String> = Vec::new();
+            for (prefix, value, width) in [("M", c.m as i64, mw), ("E", c.e as i64, ew)] {
+                names.extend(lane_bit_names(prefix, value, width).unwrap_or_default());
+            }
+            let mut it = names.into_iter().map(|n| Expr::Name(n, 0));
+            match it.next() {
+                Some(first) => it.fold(first, |acc, e| {
+                    Expr::Bin(BinOp::Union, Box::new(acc), Box::new(e))
+                }),
+                None => Expr::None_,
+            }
+        }
+    }
+}
+
+/// Int bit-position names holding `value` (`{i < W : bit i}`, mirroring
+/// `lower_expr_bits`; `None` on degenerate widths).
+fn int_bit_names(value: i64, w: u32) -> Option<Vec<String>> {
+    if w == 0 || w > 62 {
+        return None;
+    }
+    let u = (value as u64) & ((1u64 << w) - 1);
+    let mut out = Vec::new();
+    for i in 0..w {
+        if (u >> i) & 1 == 1 {
+            out.push(i.to_string());
+        }
+    }
+    Some(out)
+}
+
+/// Lane-bit atom names holding `value` under two's-complement `width`
+/// (mirrors `centre_lane_indices`; `None` on degenerate widths).
+fn lane_bit_names(prefix: &str, value: i64, width: u32) -> Option<Vec<String>> {
+    if width == 0 || width > 30 {
+        return None;
+    }
+    let u = (value as u64) & ((1u64 << width) - 1);
+    let mut out = Vec::new();
+    for i in 0..width {
+        if (u >> i) & 1 == 1 {
+            out.push(format!("{prefix}${i}"));
+        }
+    }
+    Some(out)
 }
 
 /// Evaluate a bare formula against a solved instance (REPL `:query` of
@@ -495,5 +1326,14 @@ fn query_int_parsed(
         .with_bitwidth(cnf.bitwidth)
         .int_value(&arena, iid, &empty_env)
         .map_err(|e| FrontError::Resolve(e.to_string()))?;
+    // Pure literal arithmetic displays faithful values (`7 + 7` reads
+    // like the bare `14`, i.e. `-2` under W=4). Trees holding `#`/`sum`
+    // report genuine counts and stay raw. (Literals themselves were
+    // already folded at lowering; this maps computed results.)
+    let v = if ie.has_count() {
+        v
+    } else {
+        crate::types::faithful_int(v, crate::ast::effective_int_count(scope))
+    };
     Ok(QueryValue::Int(v))
 }

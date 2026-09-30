@@ -353,3 +353,122 @@ fn query_real_up_down_uses_oracle() {
         }
     }
 }
+
+#[test]
+fn query_find_real_arith_oracle() {
+    // `{r in Real | r.realAdd[a, b]}` answers via the exact-centre
+    // oracle and presents a lane-bit *set* — find-forms denote sets.
+    // The `:`-form stays purely enumerative (atom population): the same
+    // body yields `{}` there. No shape-dependent magic.
+    use alloy_front_rs::{display::decode_bitset, effective_int_count, query_value, QueryValue};
+    use alloy_kodkod_rs::mepk::MepkWidths;
+    use alloy_kodkod_rs::real::{
+        decimal_to_real_rounded, real_add, real_div, real_mul, RealCenter, RealRound,
+    };
+    // Assert a find-form query yields the lane-bit set of `expect`.
+    fn assert_bitset(
+        m: &alloy_front_rs::Module,
+        scope: &alloy_front_rs::Scope,
+        cnf: &alloy_front_rs::Cnf,
+        inst: &alloy_front_rs::Instance,
+        src: &str,
+        expect: RealCenter,
+    ) {
+        match query_value(m, scope, cnf, src, inst).expect("query arith find-form") {
+            QueryValue::Set(arity, ts) => {
+                assert_eq!(arity, 1, "{src}");
+                let idxs: Vec<u32> = ts.index_view().iter().map(|i| i as u32).collect();
+                let text = decode_bitset(inst.universe(), &idxs).expect("decodes as Real");
+                assert_eq!(
+                    text,
+                    format!("{} [m={} e={}]", expect.centre_short(), expect.m, expect.e),
+                    "{src}"
+                );
+            }
+            QueryValue::Real(..) => panic!("expected lane-bit set for {src}"),
+            QueryValue::Int(..) | QueryValue::Bool(..) => panic!("expected set for {src}"),
+        }
+    }
+    let src = "sig A, B in Real {}\nfact { A = (1.2) and B = (-3.6) }\nrun {} for 10 Int";
+    let m = parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("run");
+    let inst = solve(&cnf).expect("solve").expect("SAT");
+    let scope = &m.commands[0].scope;
+    let w = MepkWidths::from_env(effective_int_count(scope)).expect("widths");
+    let a = decimal_to_real_rounded("1.2", Some(w.m_width), RealRound::Nearest).expect("a");
+    let b = decimal_to_real_rounded("-3.6", Some(w.m_width), RealRound::Nearest).expect("b");
+    let sum = real_add(&a, &b, 1).expect("sum");
+    assert!(sum.is_valid(Some(w.m_width)));
+    // User case, incl. `set`-stripped domain and selectors (all agree on
+    // the unique value).
+    for src in [
+        "{x in Real | x.realAdd[A, B]}",
+        "{x in set Real | x.realAdd[A, B]}",
+        "{min x in Real | x.realAdd[A, B]}",
+        "{max x in Real | x.realAdd[A, B]}",
+        "{any x in Real | x.realAdd[A, B]}",
+    ] {
+        assert_bitset(&m, scope, &cnf, &inst, src, sum);
+    }
+    // `:`-form purity: the same body enumerates lane atoms, none of which
+    // satisfies the whole-value constraint.
+    match query_value(&m, scope, &cnf, "{x: Real | x.realAdd[A, B]}", &inst)
+        .expect("query colon form")
+    {
+        QueryValue::Set(arity, ts) => {
+            assert_eq!(arity, 1);
+            assert_eq!(ts.len(), 0);
+        }
+        QueryValue::Real(..) | QueryValue::Int(..) | QueryValue::Bool(..) => {
+            panic!("expected (empty) set for colon form")
+        }
+    }
+    // Overflowing `A - B`: lane circuits wrap (solver parity, 1229 mod
+    // 2^11 = -819); enumeration finds the wrapped value.
+    let wrapped = RealCenter::new(-819, -8).expect("wrapped");
+    assert_bitset(&m, scope, &cnf, &inst, "{x in Real | x.realSub[A, B]}", wrapped);
+    // Sub/mul/div on exactly representable small values (wide enough
+    // lanes that results stay in range).
+    let src2 = "sig A, B in Real {}\nfact { A = 1.5 and B = 0.5 }\nrun {} for 8 Int";
+    let m2 = parse_module(src2).expect("parse");
+    let cnf2 = run(&m2, 0).expect("run");
+    let inst2 = solve(&cnf2).expect("solve").expect("SAT");
+    let scope2 = &m2.commands[0].scope;
+    let w2 = MepkWidths::from_env(effective_int_count(scope2)).expect("widths");
+    let a2 = decimal_to_real_rounded("1.5", Some(w2.m_width), RealRound::Nearest).unwrap();
+    let b2 = decimal_to_real_rounded("0.5", Some(w2.m_width), RealRound::Nearest).unwrap();
+    for (src, expect) in [
+        ("{x in Real | x.realSub[A, B]}", real_add(&a2, &b2, -1).unwrap()),
+        ("{x in Real | x.realMul[A, B]}", real_mul(&a2, &b2).unwrap()),
+        ("{x in Real | x.realDiv[A, B]}", real_div(&a2, &b2).unwrap()),
+        // Backward: solve for an input side (`A = x + B`).
+        ("{x in Real | A.realAdd[x, B]}", real_add(&a2, &b2, -1).unwrap()),
+    ] {
+        assert_bitset(&m2, scope2, &cnf2, &inst2, src, expect);
+    }
+    // Scaled exact zero carries `E` bits: presented as a set.
+    let src4 = "sig A, B in Real {}\nfact { A = (0.5) and B = (0.5) }\nrun {} for 8 Int";
+    let m4 = parse_module(src4).expect("parse");
+    let cnf4 = run(&m4, 0).expect("run");
+    let inst4 = solve(&cnf4).expect("solve").expect("SAT");
+    let scope4 = &m4.commands[0].scope;
+    let w4 = MepkWidths::from_env(effective_int_count(scope4)).expect("widths");
+    let a4 = decimal_to_real_rounded("0.5", Some(w4.m_width), RealRound::Nearest).unwrap();
+    let zero_scaled = real_add(&a4, &a4, -1).unwrap();
+    assert_eq!(zero_scaled.m, 0);
+    assert_bitset(&m4, scope4, &cnf4, &inst4, "{x in Real | x.realSub[A, B]}", zero_scaled);
+    // Bit-free exact zero has no lane bits: the `Real` reading is kept so
+    // the value stays displayable instead of collapsing to `{}`.
+    let src3 = "sig A, B in Real {}\nfact { A = 1.0 and B = 1.0 }\nrun {} for 8 Int";
+    let m3 = parse_module(src3).expect("parse");
+    let cnf3 = run(&m3, 0).expect("run");
+    let inst3 = solve(&cnf3).expect("solve").expect("SAT");
+    let scope3 = &m3.commands[0].scope;
+    match query_value(&m3, scope3, &cnf3, "{x in Real | x.realSub[A, B]}", &inst3)
+        .expect("query zero diff")
+    {
+        QueryValue::Real(v) => assert_eq!(v.m, 0),
+        QueryValue::Set(..) => panic!("expected Real reading for bit-free exact zero"),
+        QueryValue::Int(..) | QueryValue::Bool(..) => panic!("expected Real for zero"),
+    }
+}

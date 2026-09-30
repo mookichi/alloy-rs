@@ -1,6 +1,6 @@
 //! End-to-end tests: parse -> resolve/lower -> solve entirely in Rust.
 
-use alloy_front_rs::{parse_module, run_command};
+use alloy_front_rs::{parse_module, run, run_command, solve};
 
 fn outcome(src: &str, cmd: usize) -> String {
     let m = match parse_module(src) {
@@ -703,4 +703,124 @@ fn set_eq_sum_mask() {
     "#;
     // sum(Y) = 1, bitmask(X) = 1: equal and not 2
     assert_eq!(outcome(mirror, 0), "SAT");
+}
+
+/// Reported REPL session: an abstract parent must be covered by its
+/// extenders (`D = A + B`), not solve to `{}`.
+fn sig_tuples(src: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let m = parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("run");
+    let inst = solve(&cnf).expect("solve").expect("SAT");
+    let mut get = |want: &str| {
+        let mut out = Vec::new();
+        for (r, ts) in inst.relation_tuples() {
+            if inst.pool().name(r).as_ref() == want {
+                for idx in ts.index_view().iter() {
+                    out.push(
+                        inst.universe()
+                            .atom(idx as usize)
+                            .expect("atom")
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+    (get("D"), get("A"), get("B"))
+}
+
+#[test]
+fn abstract_parent_covered_by_extenders() {
+    // `run for 0`: D has no own atoms; A, B are pinned singletons.
+    let src = r#"
+        module t
+        abstract sig D {}
+        one sig A, B extends D {}
+        run {} for 0
+    "#;
+    let (d, a, b) = sig_tuples(src);
+    assert_eq!(a, vec!["A$0"]);
+    assert_eq!(b, vec!["B$0"]);
+    assert_eq!(d, vec!["A$0", "B$0"]);
+}
+
+#[test]
+fn extends_partition_facts() {
+    // subset: A - D is always empty.
+    let sub = r#"
+        module t
+        abstract sig D {}
+        one sig A, B extends D {}
+        pred p { some (A - D) }
+        run p for 0
+    "#;
+    assert_eq!(outcome(sub, 0), "UNSAT");
+    // disjoint siblings.
+    let disj = r#"
+        module t
+        abstract sig D {}
+        one sig A, B extends D {}
+        pred p { some (A & B) }
+        run p for 0
+    "#;
+    assert_eq!(outcome(disj, 0), "UNSAT");
+    // cover: D has exactly the two extender atoms.
+    let cover = r#"
+        module t
+        abstract sig D {}
+        one sig A, B extends D {}
+        pred p { #D = 2 }
+        run p for 0
+    "#;
+    assert_eq!(outcome(cover, 0), "SAT");
+    // non-abstract parents stay flexible: P can exceed its extender.
+    let flex = r#"
+        module t
+        sig P {}
+        sig Q extends P {}
+        pred p { some (P - Q) }
+        run p for 2
+    "#;
+    assert_eq!(outcome(flex, 0), "SAT");
+    // ...but the subset direction still holds.
+    let sub2 = r#"
+        module t
+        sig P {}
+        sig Q extends P {}
+        pred p { some (Q - P) }
+        run p for 2
+    "#;
+    assert_eq!(outcome(sub2, 0), "UNSAT");
+}
+
+/// Bare `{x in D | F}` lowers like a comprehension in the solver (set
+/// semantics); selector forms are query-only and fail loudly at build.
+#[test]
+fn find_form_solver_path() {
+    // Bare in-form over Int atoms behaves like the `:`-form.
+    let sat = r#"
+        module t
+        sig X in Int {}
+        fact pin { X = {0} + {1} + {2} }
+        pred p { {n in Int | n in X} = X }
+        run p for 3, 8 Int
+    "#;
+    assert_eq!(outcome(sat, 0), "SAT");
+    // Selector in `run`: explicit build error, never silent.
+    let m = parse_module(
+        r#"
+        module t
+        sig X in Int {}
+        pred p { some {min n in Int | n in X} }
+        run p for 3, 8 Int
+    "#,
+    )
+    .expect("parse");
+    let err = run(&m, 0).expect_err("selector in solver");
+    assert!(
+        format!("{err:?}").contains("query-only"),
+        "unexpected error: {err:?}"
+    );
 }

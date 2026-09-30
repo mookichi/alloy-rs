@@ -163,8 +163,10 @@ fn mask_equality_named_sets() {
     unsat("sig X in Int {}\nfact pin { X = {0, 1} }\nrun { 5 = X } for 4 Int");
     // Signed mirrors Int over the same atoms.
     sat("sig X in Signed {}\nfact pin { X = {0, 2} }\nrun { X = 5 } for 4 Int");
-    // W-dependent atom weight: at W = 3 atom 2 is the MSB (-4).
-    unsat("pred p { {2} = 4 }\nrun p for 3 Int");
+    // W-dependent atom weight: at W = 3 atom 2 is the MSB (-4), and the
+    // literal `4` denotes the same bit pattern (faithful reading), so
+    // both sides are -4.
+    sat("pred p { {2} = 4 }\nrun p for 3 Int");
     sat("pred p { {2} = 4 }\nrun p for 4 Int");
 }
 
@@ -198,4 +200,42 @@ fn scalar_mask_reading() {
     sat("sig X in Signed {}\nrun { some x: X | x = 4 } for 4 Int");
     // ... hence `some x: X | x = 4 and x = {2}` agree on the witness.
     sat("sig X in Signed {}\nrun { some x: X | x = 4 and x = {2} } for 4 Int");
+}
+
+#[test]
+fn faithful_literal_reading() {
+    // Integer literals denote bit patterns read with signed weights
+    // (`for 4 Int`: `8` is `{3}` = -8, `16` is `{}` = 0,
+    // `15` is `{0,1,2,3}` = -1).
+    sat("sig X in Int {}\nrun { X = 8 } for 4 Int");
+    sat("sig X in Int {}\nrun { X = 15 } for 4 Int");
+    // ...but genuine counts keep raw literals (`#X = 8` expects eight).
+    sat("sig X in Int {}\nfact { #X = 2 }\nrun { #X = 2 } for 4 Int");
+    unsat("sig X in Int {}\nfact { #X = 2 }\nrun { #X = 8 } for 4 Int");
+}
+
+#[test]
+fn faithful_literal_query() {
+    // Reported REPL session (`run for 4 Int`): bare queries read
+    // faithful values, while counts stay genuine.
+    let src = "run for 4 Int";
+    let m = parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("run");
+    let inst = solve(&cnf).expect("solve").expect("SAT");
+    let scope = &m.commands[0].scope;
+    let intval = |q: &str| match query_value(&m, scope, &cnf, q, &inst).expect("query") {
+        QueryValue::Int(v) => v,
+        v => panic!("expected Int for {q}, got {v:?}"),
+    };
+    assert_eq!(intval("8"), -8);
+    assert_eq!(intval("16"), 0);
+    assert_eq!(intval("15"), -1);
+    assert_eq!(intval("7"), 7);
+    // Pure literal arithmetic agrees with the bare spelling
+    // (`7 + 7` reads like `14`, i.e. -2).
+    assert_eq!(intval("8 + 1"), -7);
+    assert_eq!(intval("15 + 1"), 0);
+    assert_eq!(intval("7 + 7"), -2);
+    // Counts stay genuine: all four Int atoms materialize.
+    assert_eq!(intval("#Int"), 4);
 }

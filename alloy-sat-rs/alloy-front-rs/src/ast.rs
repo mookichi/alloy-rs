@@ -82,6 +82,12 @@ pub enum Expr {
     TClosure(Box<Expr>),
     RClosure(Box<Expr>),
     Comprehension(Vec<Decl>, Box<Formula>),
+    /// Value-finding form `{x in D | F}` (`{any/min/max x in D | F}` with
+    /// a selector): `x` denotes a *value* of the value sort `D`
+    /// (`Int`/`Real` only), not a domain atom. Single binder (enforced at
+    /// parse); the solver lowers bare `Find` like a comprehension while
+    /// selector forms are query-only.
+    Find(FindSel, Vec<Decl>, Box<Formula>),
     If(Box<Formula>, Box<Expr>, Box<Expr>),
     Bracket(Box<Expr>, Vec<Box<Expr>>), // e[a, b] == join chain
     /// Predicate/function call parsed positionally; resolved at lowering.
@@ -114,6 +120,17 @@ pub enum QuantKind {
     No,
     Lone,
     One,
+}
+
+/// Value-selection mode of a `{x in D | F}` find-form: all solutions
+/// (bare), an arbitrary one, or the extremal one by the sort's value
+/// order (`Int`/`Real` numeric; other sorts reject `min`/`max`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FindSel {
+    All,
+    Any,
+    Min,
+    Max,
 }
 
 /// Search-mode marker for `some Overflow { F }` / `no Overflow { F }`.
@@ -470,6 +487,125 @@ impl Formula {
             Formula::OverflowCond(_, body) => body.has_soft(),
         }
     }
+
+    /// Returns true if this formula or any subformula contains a
+    /// cardinality/sum operator (`#`, `sum`). Used to exempt genuine
+    /// count comparisons from faithful-literal folding (`#X = 8` keeps
+    /// the raw `8`: a count expectation, not a bit-pattern spelling).
+    pub fn has_count(&self) -> bool {
+        match self {
+            Formula::Not(f) => f.has_count(),
+            Formula::And(a, b)
+            | Formula::Or(a, b)
+            | Formula::Implies(a, b)
+            | Formula::Iff(a, b)
+            | Formula::Until(a, b)
+            | Formula::Releases(a, b)
+            | Formula::Since(a, b)
+            | Formula::Triggered(a, b) => a.has_count() || b.has_count(),
+            Formula::Quant(_, decls, body) => {
+                body.has_count() || decls.iter().any(|d| d.expr.has_count())
+            }
+            Formula::LetBind(binds, body) => {
+                body.has_count() || binds.iter().any(|(_, e)| e.has_count())
+            }
+            Formula::Cmp(_, a, b, _) => a.has_count() || b.has_count(),
+            Formula::BadIn(a, _) => a.has_count(),
+            Formula::IntCmp(_, a, b, _) => a.has_count() || b.has_count(),
+            Formula::Multi(_, e, _) => e.has_count(),
+            Formula::Call(_, args, _) => args.iter().any(|a| a.has_count()),
+            Formula::MaxSomeDecl(ds, body) => {
+                body.has_count() || ds.iter().any(|d| d.expr.has_count())
+            }
+            Formula::MaxSome(e) | Formula::MinSome(e) => e.has_count(),
+            Formula::Always(f)
+            | Formula::Eventually(f)
+            | Formula::Before(f)
+            | Formula::Historically(f)
+            | Formula::Once(f)
+            | Formula::Keeping(f)
+            | Formula::Goal(f)
+            | Formula::Restore(f)
+            | Formula::Initially(f)
+            | Formula::Regularly(f)
+            | Formula::Consistently(f) => f.has_count(),
+            Formula::Maximize(ie) | Formula::Minimize(ie) => ie.has_count(),
+            Formula::Pin(..) | Formula::Const(_) => false,
+            Formula::OverflowCond(_, body) => body.has_count(),
+        }
+    }
+
+    /// Returns true if this formula or any subformula mentions `Real`/`EReal`
+    /// lanes (`.m`/`.e`/`.p`/`.k` joins, `mbit`/`ebit`/`pbit`/`kbit` calls,
+    /// `$`-lane atoms). Lane values are genuine integers, so comparisons
+    /// against them keep raw literals. NOTE: coarse by design — a user
+    /// `Int` field literally named `m`/`e`/`p`/`k` also matches (rename to
+    /// avoid the exemption).
+    pub fn has_lane(&self) -> bool {
+        match self {
+            Formula::Not(f) => f.has_lane(),
+            Formula::And(a, b)
+            | Formula::Or(a, b)
+            | Formula::Implies(a, b)
+            | Formula::Iff(a, b)
+            | Formula::Until(a, b)
+            | Formula::Releases(a, b)
+            | Formula::Since(a, b)
+            | Formula::Triggered(a, b) => a.has_lane() || b.has_lane(),
+            Formula::Quant(_, decls, body) => {
+                body.has_lane() || decls.iter().any(|d| d.expr.has_lane())
+            }
+            Formula::LetBind(binds, body) => {
+                body.has_lane() || binds.iter().any(|(_, e)| e.has_lane())
+            }
+            Formula::Cmp(_, a, b, _) => a.has_lane() || b.has_lane(),
+            Formula::BadIn(a, _) => a.has_lane(),
+            Formula::IntCmp(_, a, b, _) => a.has_lane() || b.has_lane(),
+            Formula::Multi(_, e, _) => e.has_lane(),
+            Formula::Call(name, args, _) => {
+                is_lane_call(name) || args.iter().any(|a| a.has_lane())
+            }
+            Formula::MaxSomeDecl(ds, body) => {
+                body.has_lane() || ds.iter().any(|d| d.expr.has_lane())
+            }
+            Formula::MaxSome(e) | Formula::MinSome(e) => e.has_lane(),
+            Formula::Always(f)
+            | Formula::Eventually(f)
+            | Formula::Before(f)
+            | Formula::Historically(f)
+            | Formula::Once(f)
+            | Formula::Keeping(f)
+            | Formula::Goal(f)
+            | Formula::Restore(f)
+            | Formula::Initially(f)
+            | Formula::Regularly(f)
+            | Formula::Consistently(f) => f.has_lane(),
+            Formula::Maximize(ie) | Formula::Minimize(ie) => ie.has_lane(),
+            Formula::Pin(..) | Formula::Const(_) => false,
+            Formula::OverflowCond(_, body) => body.has_lane(),
+        }
+    }
+}
+
+/// Lane-builtin call names (`mbit[i]` etc. read lane bits as integers).
+fn is_lane_call(name: &str) -> bool {
+    matches!(
+        name,
+        "mbit" | "ebit" | "pbit" | "kbit" | "realUp" | "realDown" | "composeReal" | "composeEReal"
+    )
+}
+
+/// Lane field labels (`.m` on a `Real`-rooted value reads a lane).
+fn is_lane_field(name: &str) -> bool {
+    matches!(name, "m" | "e" | "p" | "k")
+}
+
+/// Lane-bit atom names (`M$0`, `E$1`, …): substituted value denotations
+/// and query-level atom references read lanes.
+fn is_lane_atom(name: &str) -> bool {
+    name.len() > 2
+        && matches!(&name[..2], "M$" | "E$" | "P$" | "K$")
+        && name[2..].bytes().all(|b| b.is_ascii_digit())
 }
 
 impl Expr {
@@ -480,6 +616,9 @@ impl Expr {
             Expr::Bin(_, a, b) => a.has_temporal() || b.has_temporal(),
             Expr::Transpose(x) | Expr::TClosure(x) | Expr::RClosure(x) => x.has_temporal(),
             Expr::Comprehension(decls, body) => {
+                body.has_temporal() || decls.iter().any(|d| d.expr.has_temporal())
+            }
+            Expr::Find(_, decls, body) => {
                 body.has_temporal() || decls.iter().any(|d| d.expr.has_temporal())
             }
             Expr::If(c, t, e) => c.has_temporal() || t.has_temporal() || e.has_temporal(),
@@ -504,6 +643,9 @@ impl Expr {
     pub fn has_soft(&self) -> bool {
         match self {
             Expr::Comprehension(decls, body) => {
+                body.has_soft() || decls.iter().any(|d| d.expr.has_soft())
+            }
+            Expr::Find(_, decls, body) => {
                 body.has_soft() || decls.iter().any(|d| d.expr.has_soft())
             }
             Expr::If(c, t, e) => c.has_soft() || t.has_soft() || e.has_soft(),
@@ -537,6 +679,9 @@ impl Expr {
             Expr::Comprehension(decls, body) => {
                 body.has_opt_marker() || decls.iter().any(|d| d.expr.has_opt_marker())
             }
+            Expr::Find(_, decls, body) => {
+                body.has_opt_marker() || decls.iter().any(|d| d.expr.has_opt_marker())
+            }
             Expr::If(c, t, e) => c.has_opt_marker() || t.has_opt_marker() || e.has_opt_marker(),
             Expr::Bin(_, a, b) => a.has_opt_marker() || b.has_opt_marker(),
             Expr::Transpose(x)
@@ -560,6 +705,83 @@ impl Expr {
             | Expr::IntAtom
             | Expr::StepAtom
             | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => false,
+        }
+    }
+
+    /// Expression-level cardinality/sum scan (`#`, `sum` make an integer
+    /// genuine: comparisons against them keep raw literals).
+    pub fn has_count(&self) -> bool {
+        match self {
+            Expr::Comprehension(decls, body) => {
+                body.has_count() || decls.iter().any(|d| d.expr.has_count())
+            }
+            Expr::Find(_, decls, body) => {
+                body.has_count() || decls.iter().any(|d| d.expr.has_count())
+            }
+            Expr::If(c, t, e) => c.has_count() || t.has_count() || e.has_count(),
+            Expr::Bin(_, a, b) => a.has_count() || b.has_count(),
+            Expr::Transpose(x)
+            | Expr::TClosure(x)
+            | Expr::RClosure(x)
+            | Expr::ArrowMult(_, x)
+            | Expr::LeadMult(_, x)
+            | Expr::AtExpr(x)
+            | Expr::Prime(x) => x.has_count(),
+            Expr::Bracket(b, args) => b.has_count() || args.iter().any(|a| a.has_count()),
+            Expr::Call(_, args, _) => args.iter().any(|a| a.has_count()),
+            Expr::LetBind(binds, body) => {
+                body.has_count() || binds.iter().any(|(_, e)| e.has_count())
+            }
+            Expr::Name(..)
+            | Expr::Univ
+            | Expr::None_
+            | Expr::Iden
+            | Expr::IntAtom
+            | Expr::StepAtom
+            | Expr::Bits(..) | Expr::RealLit(..) | Expr::ApproxRealLit(..) => false,
+        }
+    }
+
+    /// Lane scan: true if a `.m`/`.e`/`.p`/`.k` join, a lane-builtin call,
+    /// or a `$`-lane atom occurs below (see [`Formula::has_lane`]).
+    pub fn has_lane(&self) -> bool {
+        match self {
+            // Lane-field access reads a lane as an integer.
+            Expr::Bin(BinOp::Join, _, dot) => {
+                matches!(dot.as_ref(), Expr::Name(n, _) if is_lane_field(n))
+                    || dot.has_lane()
+            }
+            Expr::Bin(_, a, b) => a.has_lane() || b.has_lane(),
+            Expr::Name(n, _) => is_lane_atom(n),
+            Expr::Call(name, args, _) => {
+                is_lane_call(name) || args.iter().any(|a| a.has_lane())
+            }
+            Expr::Comprehension(decls, body) => {
+                body.has_lane() || decls.iter().any(|d| d.expr.has_lane())
+            }
+            Expr::Find(_, decls, body) => {
+                body.has_lane() || decls.iter().any(|d| d.expr.has_lane())
+            }
+            Expr::If(c, t, e) => c.has_lane() || t.has_lane() || e.has_lane(),
+            Expr::Transpose(x)
+            | Expr::TClosure(x)
+            | Expr::RClosure(x)
+            | Expr::ArrowMult(_, x)
+            | Expr::LeadMult(_, x)
+            | Expr::AtExpr(x)
+            | Expr::Prime(x) => x.has_lane(),
+            Expr::Bracket(b, args) => b.has_lane() || args.iter().any(|a| a.has_lane()),
+            Expr::LetBind(binds, body) => {
+                body.has_lane() || binds.iter().any(|(_, e)| e.has_lane())
+            }
+            Expr::Univ
+            | Expr::None_
+            | Expr::Iden
+            | Expr::IntAtom
+            | Expr::StepAtom
+            | Expr::Bits(..)
+            | Expr::RealLit(..)
+            | Expr::ApproxRealLit(..) => false,
         }
     }
 }
@@ -605,6 +827,37 @@ impl IntExpr {
             IntExpr::Widen(_, a, b) => a.has_opt_marker() || b.has_opt_marker(),
             IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => {
                 e.has_opt_marker()
+            }
+            IntExpr::Lit(..) => false,
+        }
+    }
+
+    /// Cardinality/sum scan: true if `#` or `sum` occurs anywhere below
+    /// (comparisons against such trees keep raw literals).
+    pub fn has_count(&self) -> bool {
+        match self {
+            IntExpr::Card(..) | IntExpr::SumOf(..) => true,
+            IntExpr::Sum(decls, body, _) => {
+                body.has_count() || decls.iter().any(|d| d.expr.has_count())
+            }
+            IntExpr::Bin(_, a, b) => a.has_count() || b.has_count(),
+            IntExpr::Widen(_, a, b) => a.has_count() || b.has_count(),
+            IntExpr::Val(e, _) | IntExpr::BitsVal(e, _) => e.has_count(),
+            IntExpr::Lit(..) => false,
+        }
+    }
+
+    /// Lane scan over integer expressions (see [`Formula::has_lane`]).
+    pub fn has_lane(&self) -> bool {
+        match self {
+            IntExpr::Card(e, _) => e.has_lane(),
+            IntExpr::Sum(decls, body, _) => {
+                body.has_lane() || decls.iter().any(|d| d.expr.has_lane())
+            }
+            IntExpr::Bin(_, a, b) => a.has_lane() || b.has_lane(),
+            IntExpr::Widen(_, a, b) => a.has_lane() || b.has_lane(),
+            IntExpr::Val(e, _) | IntExpr::SumOf(e, _) | IntExpr::BitsVal(e, _) => {
+                e.has_lane()
             }
             IntExpr::Lit(..) => false,
         }
@@ -901,6 +1154,12 @@ pub(crate) fn scan_expr_int_set(e: &Expr, needs: &mut bool) {
             scan_expr_int_set(x, needs);
         }
         Expr::Comprehension(ds, body) => {
+            for d in ds {
+                scan_expr_int_set(&d.expr, needs);
+            }
+            scan_formula_int_set(body, needs);
+        }
+        Expr::Find(_, ds, body) => {
             for d in ds {
                 scan_expr_int_set(&d.expr, needs);
             }

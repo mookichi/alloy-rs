@@ -246,7 +246,7 @@ fn query_int_universe_lazy_when_unused() {
 }
 
 #[test]
-fn query_int_literal_wraps_like_java() {
+fn query_int_literal_reads_faithful() {
     let (m, cnf, inst) = solved_demo();
     let scope = &m.commands[0].scope;
     // in-range literals (unary minus folds at parse time)
@@ -262,9 +262,8 @@ fn query_int_literal_wraps_like_java() {
         QueryValue::Bool(..) => panic!("expected Int"),
         QueryValue::Real(..) => panic!("expected Int"),
     }
-    // out-of-range literals wrap (two's complement truncation at the
-    // query Cnf's bitwidth 4), matching Java's evaluator: 100 -> 4,
-    // -9 -> 7.
+    // out-of-range literals denote bit patterns read with signed weights
+    // (faithful range; W = 4 here): 100 is `{2}` = 4, -9 is `{0,1,2}` = 7.
     match query_value(&m, scope, &cnf, "100", &inst).expect("query 100") {
         QueryValue::Int(v) => assert_eq!(v, 4),
         QueryValue::Set(..) => panic!("expected Int"),
@@ -272,7 +271,7 @@ fn query_int_literal_wraps_like_java() {
         QueryValue::Real(..) => panic!("expected Int"),
     }
     match query_value(&m, scope, &cnf, "-9", &inst).expect("query -9") {
-        QueryValue::Int(v) => assert_eq!(v, -9),
+        QueryValue::Int(v) => assert_eq!(v, 7),
         QueryValue::Set(..) => panic!("expected Int"),
         QueryValue::Bool(..) => panic!("expected Int"),
         QueryValue::Real(..) => panic!("expected Int"),
@@ -368,6 +367,37 @@ fn query_bare_comprehension() {
     let scope = &m.commands[0].scope;
     let (_, ts) = query(&m, scope, &cnf, "{x: X}", &inst).expect("query {x: X}");
     assert_eq!(ts.len(), 3);
+}
+
+/// A leading `set` on a comprehension domain reads as element iteration
+/// (`{x: set X}` ≡ `{x: X}`): traditional comprehensions keep working,
+/// and the multiplicity never means a set-of-sets.
+#[test]
+fn query_set_domain_comprehension() {
+    let src = r#"
+        module demo
+        sig X in Int {}
+        fact pin { X = {0} + {1} + {2} }
+        run {} for 3, 8 Int
+    "#;
+    let m = alloy_front_rs::parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("build cnf");
+    let inst = solve(&cnf).expect("solve").expect("SAT instance");
+    let scope = &m.commands[0].scope;
+    let (_, plain) = query(&m, scope, &cnf, "{x: X}", &inst).expect("query {x: X}");
+    let (_, with_set) = query(&m, scope, &cnf, "{x: set X}", &inst).expect("query {x: set X}");
+    assert_eq!(with_set.len(), plain.len());
+    assert_eq!(with_set.len(), 3);
+    // filtered form agrees too
+    match query_value(&m, scope, &cnf, "{x: set X | x < 2}", &inst).expect("query") {
+        QueryValue::Set(arity, ts) => {
+            assert_eq!(arity, 1);
+            assert_eq!(ts.len(), 1);
+        }
+        QueryValue::Int(..) => panic!("expected Set"),
+        QueryValue::Bool(..) => panic!("expected Set"),
+        QueryValue::Real(..) => panic!("expected Set"),
+    }
 }
 
 /// `{A, B, ...}` set literal (extension: Java rejects it) equals `A + B`.
@@ -596,4 +626,175 @@ fn query_comprehension_over_int() {
     // `Int` inside larger set expressions routes through the evaluator too
     let (_, union) = query(&m, scope, &cnf, "none + Int", &inst).expect("query none + Int");
     assert_eq!(union.len(), 4);
+}
+
+#[test]
+fn query_decimal_literal_decodes() {
+    let src = "sig R in Real {}\nrun {}";
+    let m = alloy_front_rs::parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("run");
+    let inst = solve(&cnf).expect("solve").expect("SAT");
+    let scope = &m.commands[0].scope;
+    // Exact dyadic literal, both spellings: expands to the lane-bit
+    // atom set with the decoded reading alongside.
+    for lit in ["0.5", "(0.5)"] {
+        match query_value(&m, scope, &cnf, lit, &inst).expect("query dyadic") {
+            QueryValue::Set(arity, ts) => {
+                assert_eq!(arity, 1);
+                let text = alloy_front_rs::display::format_query_value(
+                    &inst,
+                    &QueryValue::Set(arity, ts),
+                );
+                assert!(
+                    text.starts_with('{') && text.contains("} = 0.5 [m=1 e=-1]"),
+                    "unexpected rendering: {text}"
+                );
+            }
+            _ => panic!("expected Set for {lit}"),
+        }
+    }
+    // The bit-free exact zero keeps the computed `Real` reading.
+    match query_value(&m, scope, &cnf, "(0.0)", &inst).expect("query (0.0)") {
+        QueryValue::Real(c) => {
+            assert_eq!((c.m, c.e), (0, 0));
+        }
+        _ => panic!("expected Real"),
+    }
+    // Approximable spelling rounds to the nearest centre (wellformed and
+    // close to the literal whatever the scope widths are), expanded to
+    // its lane-bit set.
+    match query_value(&m, scope, &cnf, "(1.3)", &inst).expect("query (1.3)") {
+        QueryValue::Set(arity, ts) => {
+            assert_eq!(arity, 1);
+            assert!(!ts.is_empty());
+            let text = alloy_front_rs::display::format_query_value(
+                &inst,
+                &QueryValue::Set(arity, ts),
+            );
+            assert!(
+                text.starts_with('{') && text.contains("} = ") && text.contains("[m="),
+                "{text}"
+            );
+        }
+        _ => panic!("expected Set"),
+    }
+    // A decimal literal in comprehension-domain position ranges over
+    // its lane-bit atoms (same expansion as the bare literal).
+    match query_value(&m, scope, &cnf, "{x : (1.3)}", &inst).expect("query {x : (1.3)}") {
+        QueryValue::Set(arity, ts) => {
+            assert_eq!(arity, 1);
+            assert!(!ts.is_empty());
+            let text = alloy_front_rs::display::format_query_value(
+                &inst,
+                &QueryValue::Set(arity, ts),
+            );
+            assert!(
+                text.starts_with('{') && text.contains("} = ") && text.contains("[m="),
+                "{text}"
+            );
+        }
+        _ => panic!("expected Set"),
+    }
+    // Plain non-dyadic literals error loudly instead of rounding
+    // silently (mirrors the solve path).
+    let err = format!(
+        "{}",
+        query_value(&m, scope, &cnf, "1.3", &inst).expect_err("plain 1.3 must fail")
+    );
+    assert!(err.contains("(1.3)"), "should suggest the (d) spelling: {err}");
+}
+
+/// `in`-form parsing: selector shapes become `Find`, general domains and
+/// bar-less forms report specific errors, and lookalikes keep their old
+/// readings (`{min, X}` is a literal; `sig min {}` still parses).
+#[test]
+fn find_form_shapes() {
+    use alloy_front_rs::{Expr, FindSel};
+    let find = |src: &str| match parse_expr(src).expect("parse") {
+        Expr::Find(sel, decls, _) => {
+            assert_eq!(decls.len(), 1);
+            (sel, decls[0].names.clone())
+        }
+        e => panic!("expected Find for {src}, got {e:?}"),
+    };
+    assert_eq!(
+        find("{x in Int | 0 < x}"),
+        (FindSel::All, vec!["x".to_string()])
+    );
+    assert_eq!(
+        find("{min n in Int | 0 < n}"),
+        (FindSel::Min, vec!["n".to_string()])
+    );
+    assert_eq!(
+        find("{max n in Int | 0 < n}"),
+        (FindSel::Max, vec!["n".to_string()])
+    );
+    assert_eq!(
+        find("{any v in Real | v.realAdd[A, A]}"),
+        (FindSel::Any, vec!["v".to_string()])
+    );
+    // General domains duplicate the `:`-form: rejected with a pointer.
+    let err = parse_expr("{x in D | some univ}").expect_err("general-D in-form");
+    assert!(format!("{err:?}").contains("`{x: D | F}`"), "{err:?}");
+    // Bar-less `{x in D}` is the subset predicate, not a set.
+    let err = parse_expr("{x in Int}").expect_err("bar-less in-form");
+    assert!(format!("{err:?}").contains("subset predicate"), "{err:?}");
+    // Lookalikes keep their readings.
+    match parse_expr("{min, X}").expect("literal") {
+        Expr::Bin(..) => {}
+        e => panic!("expected literal union, got {e:?}"),
+    }
+    assert!(parse_expr("sig min {}").is_ok() || parse_module_min_ok());
+}
+
+/// `sig min {}` must keep parsing (contextual keywords only).
+fn parse_module_min_ok() -> bool {
+    alloy_front_rs::parse_module("module m\nsig min {}\nrun {}").is_ok()
+}
+
+/// End-to-end selectors over `Int`: values read as signed integers over
+/// the faithful range (`for 8 Int` → `[-128, 255]`), presented as
+/// integers — never bitmask confusion.
+#[test]
+fn find_int_selectors() {
+    let src = r#"
+        module demo
+        sig X in Int {}
+        fact pin { X = {1} }
+        run {} for 3, 8 Int
+    "#;
+    let m = alloy_front_rs::parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("build cnf");
+    let inst = solve(&cnf).expect("solve").expect("SAT instance");
+    let scope = &m.commands[0].scope;
+    let intval = |q: &str| match query_value(&m, scope, &cnf, q, &inst).expect("query") {
+        QueryValue::Int(v) => v,
+        v => panic!("expected Int for {q}, got {v:?}"),
+    };
+    assert_eq!(intval("{min n in Int | 0 < n and n <= 3}"), 1);
+    assert_eq!(intval("{max n in Int | 0 < n and n <= 3}"), 3);
+    assert_eq!(intval("{any n in Int | 0 < n and n <= 3}"), 1);
+    // Negatives live in the faithful range too.
+    assert_eq!(intval("{min n in Int | n < 0}"), -128);
+    assert_eq!(intval("{max n in Int | n < 0}"), -1);
+    // Bare with several hits: explicit ambiguity error.
+    let err = query_value(&m, scope, &cnf, "{n in Int | 0 < n and n <= 3}", &inst)
+        .expect_err("ambiguous bare");
+    assert!(format!("{err:?}").contains("any"), "{err:?}");
+    // Bare with a unique hit presents the integer.
+    assert_eq!(intval("{n in Int | n = 42}"), 42);
+    // Literals denote bit patterns too: `1000` under W=8 is `{3,5,6,7}`
+    // = -24, so the minimum above it is -23.
+    assert_eq!(intval("{min n in Int | 1000 < n}"), -23);
+    // No hit: empty set (not an error).
+    match query_value(&m, scope, &cnf, "{min n in Int | n < -128}", &inst).expect("query") {
+        QueryValue::Set(_, ts) => assert_eq!(ts.len(), 0),
+        v => panic!("expected empty set, got {v:?}"),
+    }
+    // Set positions read the value's bit pattern (`n in X` with X = {1}
+    // is satisfied by value 2 = `{1}`, matching literal `2 in X`
+    // bitmask routing; value 0 denotes `{}` and is a subset of every X,
+    // so it is the minimum here).
+    assert_eq!(intval("{min n in Int | n in X}"), 0);
+    assert_eq!(intval("{max n in Int | n in X}"), 2);
 }
