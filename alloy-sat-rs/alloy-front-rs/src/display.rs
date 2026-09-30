@@ -1,16 +1,16 @@
 //! Real/EReal-aware solution display for the `als` CLI.
 //!
-//! Port of the REPL decoder (`alloy-repl/src/fmt.rs`): raw
-//! `Real.m`/`Real.e`/`EReal.p`/`EReal.k` lane tuples are unreadable bit
-//! sets (and carry ghost tuples for atoms outside the solved extent,
-//! which the solver leaves unconstrained), so they are hidden whenever
-//! decoding succeeds and member atoms print as `Real$i = c` /
-//! `EReal$i = c ± R [m=.. e=.. p=.. k=..]`.
+//! A value *is* the set of its lane bits, so there is nothing to
+//! reify: a unary set of `M$`/`E$` atoms reads as an exact centre
+//! (`0.5 [m=1 e=-1]`) and one carrying `P$`/`K$` atoms as an error
+//! interval (`2.5 ± 0.125 [m=10 e=1 p=4 k=0]`). The type domains
+//! (`Real`, `EReal`) and the lane sigs themselves stay raw.
 //! The surrounding shape intentionally matches the kodkod `Instance`
 //! `Display` (`relations:` / `ints:` with `[[...]]` tuple sets) so
 //! non-Real output is byte-identical.
 
-use std::collections::{BTreeMap, HashSet};
+
+use std::collections::BTreeMap;
 
 use alloy_kodkod_rs::instance::Instance;
 use alloy_kodkod_rs::mepk::Mepk;
@@ -18,27 +18,11 @@ use alloy_kodkod_rs::real::RealCenter;
 use alloy_kodkod_rs::tupleset::TupleSet;
 use alloy_kodkod_rs::universe::Universe;
 
-/// One decoded member atom: raw lanes plus the one-line guarantee reading.
-#[derive(Clone, Debug)]
-pub struct DecodedEreal {
-    /// `(m, e, p, k)` lane values (`p`/`k` are 0 for pure-`Real` atoms).
-    pub lanes: (i64, i64, i64, i64),
-    /// `c ± R [m=.. e=.. p=.. k=..]` for `EReal` members, `c [m=.. e=..]`
-    /// for pure-`Real` members (or an ill-formed-lanes note).
-    pub text: String,
-}
-
 fn atom_name(universe: &Universe, idx: u32) -> String {
     universe
         .atom(idx as usize)
         .map(|s| s.to_string())
         .unwrap_or_else(|_| "?".to_string())
-}
-
-/// True for the builtin lane relations (`Real.m`/`Real.e` shared centre
-/// lanes plus the `EReal`-only `EReal.p`/`EReal.k`).
-fn is_ereal_lane(name: &str) -> bool {
-    matches!(name, "Real.m" | "Real.e" | "EReal.p" | "EReal.k")
 }
 
 /// Bit position of a lane atom (`M$3` -> 3) with the expected prefix.
@@ -227,156 +211,14 @@ fn digits(size: i64, arity: u32, mut flat: i64) -> Vec<u32> {
     out
 }
 
-/// Decode every member `Real$i`/`EReal$i` atom to its lanes plus a
-/// one-line display (`None` when the instance carries no `Real` lanes).
-/// `EReal` members with full lanes show `c ± R`; pure-`Real` members
-/// show the exact centre `c`. Tuples owned by atoms outside the solved
-/// extents (solver leftovers on unused scope atoms) are skipped, never shown.
-pub fn decode_ereal(inst: &Instance) -> Option<BTreeMap<u32, DecodedEreal>> {
-    let universe = inst.universe();
-    let size = universe.size() as i64;
-    let mut lanes: BTreeMap<&str, &TupleSet> = BTreeMap::new();
-    for (r, ts) in inst.relation_tuples() {
-        let name = inst.pool().name(r);
-        match name.as_ref() {
-            "Real.m" => {
-                lanes.insert("m", ts);
-            }
-            "Real.e" => {
-                lanes.insert("e", ts);
-            }
-            "EReal.p" => {
-                lanes.insert("p", ts);
-            }
-            "EReal.k" => {
-                lanes.insert("k", ts);
-            }
-            _ => {}
-        }
-    }
-    if lanes.get("m").is_none() || lanes.get("e").is_none() {
-        return None;
-    }
-    let me_prefixes = [("m", "M"), ("e", "E")];
-    let me_widths: Vec<i64> = me_prefixes
-        .iter()
-        .map(|(_, pre)| lane_width(universe, pre))
-        .collect::<Option<_>>()?;
-    let pk_prefixes = [("p", "P"), ("k", "K")];
-    let pk_widths: Option<Vec<i64>> = pk_prefixes
-        .iter()
-        .map(|(_, pre)| lane_width(universe, pre))
-        .collect();
-    let mut rows: BTreeMap<u32, ([Vec<i64>; 2], [Vec<i64>; 2])> = BTreeMap::new();
-    for (li, (lane, _)) in me_prefixes.iter().enumerate() {
-        let ts = lanes[lane];
-        if ts.arity() != 2 {
-            return None;
-        }
-        for flat in ts.index_view().iter() {
-            let d = digits(size, 2, flat);
-            if d.len() < 2 {
-                return None;
-            }
-            let bit = lane_pos(universe, d[1], me_prefixes[li].1)?;
-            rows.entry(d[0]).or_default().0[li].push(bit);
-        }
-    }
-    if lanes.contains_key("p") && lanes.contains_key("k") && pk_widths.is_some() {
-        for (li, (lane, _)) in pk_prefixes.iter().enumerate() {
-            let ts = lanes[lane];
-            if ts.arity() != 2 {
-                return None;
-            }
-            for flat in ts.index_view().iter() {
-                let d = digits(size, 2, flat);
-                if d.len() < 2 {
-                    return None;
-                }
-                let bit = lane_pos(universe, d[1], pk_prefixes[li].1)?;
-                rows.entry(d[0]).or_default().1[li].push(bit);
-            }
-        }
-    }
-    let mut members: HashSet<u32> = HashSet::new();
-    let mut ereal_members: HashSet<u32> = HashSet::new();
-    for (r, ts) in inst.relation_tuples() {
-        let name = inst.pool().name(r);
-        if ts.arity() != 1 {
-            continue;
-        }
-        if name.as_ref() == "Real" || name.as_ref() == "EReal" {
-            members.extend(ts.index_view().iter().map(|i| i as u32));
-        }
-        if name.as_ref() == "EReal" {
-            ereal_members.extend(ts.index_view().iter().map(|i| i as u32));
-        }
-    }
-    let mut out: BTreeMap<u32, DecodedEreal> = BTreeMap::new();
-    for (owner, (me_bits, pk_bits)) in rows {
-        if !members.contains(&owner) {
-            continue;
-        }
-        // `EReal`-population atoms (`EReal$i`) outside the solved `EReal`
-        // extent are scope leftovers with unconstrained lanes (legacy
-        // ghost-lane rule); genuine `Real` members always decode.
-        let atom = atom_name(universe, owner);
-        if atom.starts_with("EReal$") && !ereal_members.contains(&owner) {
-            continue;
-        }
-        let me_vals: Vec<i64> = me_bits
-            .iter()
-            .zip(me_widths.iter())
-            .map(|(b, w)| lane_value(*w, b.iter().copied()))
-            .collect::<Option<_>>()?;
-        let (m, e) = (me_vals[0], me_vals[1]);
-        // `EReal` members with decodable `p`/`k` lanes keep the legacy
-        // `c ± R` reading; everything else reads the exact centre.
-        let pk_vals: Option<(i64, i64)> = match (&pk_widths, ereal_members.contains(&owner)) {
-            (Some(ws), true) => {
-                let vs: Option<Vec<i64>> = pk_bits
-                    .iter()
-                    .zip(ws.iter())
-                    .map(|(b, w)| lane_value(*w, b.iter().copied()))
-                    .collect();
-                vs.map(|v| (v[0], v[1]))
-            }
-            _ => None,
-        };
-        let (text, lanes) = match pk_vals {
-            Some((p, k)) => match Mepk::new(m as i128, e as i32, p as u32, k as i32) {
-                Some(v) => (
-                    format!("{} [m={m} e={e} p={p} k={k}]", v.interval_string(0)),
-                    (m, e, p, k),
-                ),
-                None => (
-                    format!("(ill-formed lanes m={m} e={e} p={p} k={k})"),
-                    (m, e, p, k),
-                ),
-            },
-            None => match RealCenter::new(m as i128, e as i32) {
-                Some(v) => (format!("{} [m={m} e={e}]", v.centre_short()), (m, e, 0, 0)),
-                None => (format!("(ill-formed lanes m={m} e={e})"), (m, e, 0, 0)),
-            },
-        };
-        out.insert(owner, DecodedEreal { lanes, text });
-    }
-    Some(out)
-}
-
-/// Instance display with Real/EReal decoding: same `relations:`/`ints:`
-/// shape as the kodkod `Display`, except raw lane relations are hidden
-/// when decoding succeeds and member atoms gain `Real$i = ...` /
-/// `EReal$i = ...` lines after the `Real = ...` / `EReal = ...` lines.
+/// Instance display: same `relations:`/`ints:` shape as the kodkod
+/// `Display`, except a value (a set of lane bits) gains its real-number
+/// or interval reading alongside the raw set.
 pub fn format_instance(inst: &Instance) -> String {
-    let ereal = decode_ereal(inst);
     let mut out = String::from("relations:");
     for (r, ts) in inst.relation_tuples() {
         let name = inst.pool().name(r);
         let name_s: &str = &name;
-        if ereal.is_some() && is_ereal_lane(name_s) {
-            continue;
-        }
         // Flat bit-set rows decode alongside the raw tuples (fields);
         // untouched relations keep the legacy shape (byte-identical).
         if ts.arity() == 2 {
@@ -398,20 +240,6 @@ pub fn format_instance(inst: &Instance) -> String {
             }
         }
         out.push_str(&format!("\n {name}->{ts}\n"));
-        if name_s == "Real" || name_s == "EReal" {
-            if let Some(ref ev) = ereal {
-                for (idx, dec) in ev.iter() {
-                    let atom = atom_name(inst.universe(), *idx);
-                    // Decoded lines belong to their own sig block only
-                    // (`Real` members under `Real`, `EReal` under `EReal`).
-                    let is_ereal_atom = atom.starts_with("EReal$");
-                    if (name_s == "EReal") != is_ereal_atom {
-                        continue;
-                    }
-                    out.push_str(&format!(" {atom} = {}\n", dec.text));
-                }
-            }
-        }
     }
     out.push_str("\nints:");
     for (i, ts) in inst.int_tuples() {
@@ -421,9 +249,9 @@ pub fn format_instance(inst: &Instance) -> String {
 }
 
 /// Render a `:query` value against `inst`: integers and booleans print
-/// plainly; unary sets decode `EReal` members (`{EReal$0 = c ± R ...}`);
-/// n-ary sets print raw `A->B` tuples (column types are unavailable here);
-/// empty sets print `{}`.
+/// plainly; unary sets of lane bits gain their real-number / interval
+/// reading (`{M$0, E$0} = 2 [m=1 e=1]`); n-ary sets print raw `A->B`
+/// tuples (column types are unavailable here); empty sets print `{}`.
 pub fn format_query_value(inst: &Instance, v: &crate::snippet::QueryValue) -> String {
     use crate::snippet::QueryValue;
     match v {
@@ -431,10 +259,10 @@ pub fn format_query_value(inst: &Instance, v: &crate::snippet::QueryValue) -> St
         QueryValue::Bool(b) => format!("{b}"),
         QueryValue::Real(c) => format!("{} [m={} e={}]", c.centre_short(), c.m, c.e),
         QueryValue::Set(1, ts) => {
-            let decoded = decode_ereal(inst).unwrap_or_default();
-            let inner = format_atom_set(inst, &decoded, ts.index_view().iter().map(|i| i as u32));
-            // Flat bit sets gain their real-number reading alongside.
+            // A value is a set of lane bits, so it gains its real-number
+            // or interval reading alongside the raw atom list.
             let idxs: Vec<u32> = ts.index_view().iter().map(|i| i as u32).collect();
+            let inner = format_atom_set(inst, idxs.iter().copied());
             match decode_bitset(inst.universe(), &idxs) {
                 Some(t) => format!("{inner} = {t}"),
                 None => inner,
@@ -465,18 +293,8 @@ pub fn query_exit_ok(v: &crate::snippet::QueryValue) -> bool {
     !matches!(v, crate::snippet::QueryValue::Bool(false))
 }
 
-/// Render the atoms of a unary instance relation, decoding `EReal` members
-/// via `decoded` (missing entry = plain atom name).
-pub fn format_atom_set(
-    inst: &Instance,
-    decoded: &BTreeMap<u32, DecodedEreal>,
-    idxs: impl Iterator<Item = u32>,
-) -> String {
-    let parts: Vec<String> = idxs
-        .map(|i| match decoded.get(&i) {
-            Some(d) => format!("{} = {}", atom_name(inst.universe(), i), d.text),
-            None => atom_name(inst.universe(), i),
-        })
-        .collect();
+/// Render the atoms of a unary instance relation as a set.
+pub fn format_atom_set(inst: &Instance, idxs: impl Iterator<Item = u32>) -> String {
+    let parts: Vec<String> = idxs.map(|i| atom_name(inst.universe(), i)).collect();
     format!("{{{}}}", parts.join(", "))
 }

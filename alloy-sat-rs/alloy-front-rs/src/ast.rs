@@ -591,7 +591,7 @@ impl Formula {
 fn is_lane_call(name: &str) -> bool {
     matches!(
         name,
-        "mbit" | "ebit" | "pbit" | "kbit" | "realUp" | "realDown" | "composeReal" | "composeEReal"
+        "mbit" | "ebit" | "pbit" | "kbit" | "composeReal" | "composeEReal"
     )
 }
 
@@ -602,10 +602,42 @@ fn is_lane_field(name: &str) -> bool {
 
 /// Lane-bit atom names (`M$0`, `E$1`, …): substituted value denotations
 /// and query-level atom references read lanes.
-fn is_lane_atom(name: &str) -> bool {
+pub(crate) fn is_lane_atom(name: &str) -> bool {
     name.len() > 2
         && matches!(&name[..2], "M$" | "E$" | "P$" | "K$")
         && name[2..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Step-position atom names (`Step$0`, …). Like the lane bits, a step
+/// atom is a named element of an exact builtin domain (`for N steps`
+/// fixes the population), not a solver output.
+pub(crate) fn is_step_atom(name: &str) -> bool {
+    name.len() > 5
+        && name.starts_with("Step$")
+        && name[5..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Members of the exact builtin domains that are named constants and so
+/// are language terms even in model text: the bit lanes (`M$0`, `E$1`,
+/// `P$2`, `K$0`) and the temporal step positions (`Step$0`).
+///
+/// Their positions are fixed by the scope (`for N $M` / `for W Int` /
+/// `for N steps`), so they are compile-time constants, not solver
+/// outputs — the same exemption `Int` atoms get (they carry no `$`).
+/// Value atoms (`A$0`) stay query-only (Java parity: atoms are solver
+/// outputs, not language terms).
+pub(crate) fn is_exact_builtin_atom(name: &str) -> bool {
+    is_lane_atom(name) || is_step_atom(name)
+}
+
+/// The lane group prefix of a lane-bit atom name (`M$3` -> `M`), or
+/// `None` for any other name.
+pub(crate) fn lane_atom_prefix(name: &str) -> Option<char> {
+    if is_lane_atom(name) {
+        name.chars().next()
+    } else {
+        None
+    }
 }
 
 impl Expr {

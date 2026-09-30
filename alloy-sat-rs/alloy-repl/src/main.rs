@@ -624,11 +624,11 @@ impl Session {
                             hints.signed_sigs.insert(n.clone());
                             break;
                         }
-                        Some("Real") => {
-                            // Flat bit-set sigs (`in Real` and friends):
-                            // empty sets read as the Real zero.
-                            // (`extends Real` is rejected; `EReal`
-                            // stays reified and excluded here.)
+                        Some("Real") | Some("EReal") => {
+                            // Value-holding sigs (`in Real` / `in EReal`
+                            // and friends): a value is a set of lane bits,
+                            // so an empty one reads as the zero value.
+                            // (`extends` is rejected for both.)
                             if sd.rel != SigRel::Extends {
                                 hints.real_sigs.insert(n.clone());
                             }
@@ -641,19 +641,17 @@ impl Session {
             }
             for owner in &sd.names {
                 for d in &sd.fields {
-                    if expr_is_signed(&d.expr) {
-                        for fname in &d.names {
-                            hints.signed_fields.insert(format!("{owner}.{fname}"));
+                    for (sigs, into) in [
+                        (&["Signed"][..], &mut hints.signed_fields),
+                        // A `Real`/`EReal` value reads as a real number or
+                        // an interval, depending on its error bits.
+                        (&["Real", "EReal"][..], &mut hints.real_fields),
+                    ] {
+                        if !expr_mentions(&d.expr, sigs) {
+                            continue;
                         }
-                    }
-                    if expr_is_ereal(&d.expr) {
                         for fname in &d.names {
-                            hints.ereal_fields.insert(format!("{owner}.{fname}"));
-                        }
-                    }
-                    if expr_is_real(&d.expr) {
-                        for fname in &d.names {
-                            hints.real_fields.insert(format!("{owner}.{fname}"));
+                            into.insert(format!("{owner}.{fname}"));
                         }
                     }
                 }
@@ -2130,6 +2128,12 @@ fn print_help() {
     println!("  run ... / check ...      as a fragment when it names no command");
     println!("  multi-line continues on `... ` until braces balance;");
     println!("  blank line or a `:command` line submits pending input first");
+    println!("command syntax:");
+    println!("  every command below may omit the leading `:` (`solve` == `:solve`);");
+    println!("  short aliases: h/? help, l load, ls list, m mode, s solve, n next, v validate, q quit.");
+    println!("  Bare `run`/`check`/`minimize`/`maximize` work too, but name a stored");
+    println!("  command only when they do; otherwise the line is read as model text.");
+    println!("  These need the colon: :optimize :max :min :maxw :minw :mepk :sens :cegar");
     println!("named stores (Cnf and solution namespaces are separate):");
     println!("  :run <i|name> [as <cnf>]    build Cnf, save it (auto: command name, else run0..)");
     println!("  :check <i|name> [as <cnf>]  build negated Cnf, save it");
@@ -2151,17 +2155,17 @@ fn print_help() {
     println!("    Use `@ <sol>` as an unambiguous alternative: `:query A @ someA`.");
     println!("  :validate <sol> [in <cnf>]  validate solution vs Cnf (no in = its origin Cnf)");
     println!("  :show [name] [N]            show Cnf clauses and/or solution (no arg = defaults)");
-    println!("  :eval <expr> [as <sol>]     satisfiability check (bare expr lifts with some;
-                              inherits the *default Cnf's command scope when selected)
-  :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <n>]
-                            result as c ± R (tau); -v adds tuples and detail
-  :mepk lit <decimal> [p <maxp>] [n <intcount>]
-                            decimal literal to (m,e,p,k), optimal precision
-  :mepk widths [n]          show lane widths from for-n-Int rule (+MEPK_* env)");
-    println!("  :sens [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <n>]
-                             single-parameter sensitivity top-3 (dR rank, tau shown; k floor 0)");
-    println!("  :cegar [-v] ( <op> <expr> <expr> ) [g <goal>] [delta <d>] [iters <n>] [guard0 <g0>] [abs <rexp>] [p <maxp>] [n <n>]
-                             expression-tree CEGAR (leaves are lit decimals; parens spaced)");
+    println!("  :eval <expr> [as <sol>]     satisfiability check (bare expr lifts with some;");
+    println!("                              inherits the *default Cnf's command scope when selected)");
+    println!("  :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <intcount>]");
+    println!("                            result as c ± R (tau); -v adds tuples and detail");
+    println!("  :mepk lit <decimal> [p <maxp>] [n <intcount>]");
+    println!("                            decimal literal to (m,e,p,k), optimal precision");
+    println!("  :mepk widths [n <intcount>]  show lane widths from for-n-Int rule (+MEPK_* env)");
+    println!("  :sens [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <intcount>]");
+    println!("                             single-parameter sensitivity top-3 (dR rank, tau shown; k floor 0)");
+    println!("  :cegar [-v] ( <op> <expr> <expr> ) [g <goal>] [delta <d>] [iters <n>] [guard0 <g0>] [abs <rexp>] [budget <b>] [p <maxp>] [n <intcount>]");
+    println!("                             expression-tree CEGAR (leaves are lit decimals; parens spaced)");
     println!("  :max <intexpr> [in <cnf>] [as <sol>]   maximize int expr, save optimum+cost");
     println!("  :min <intexpr> [in <cnf>] [as <sol>]   minimize int expr, save optimum+cost");
     println!("  :maxw <r>:<w>[, ...] [in <cnf>] [as <sol>]  maximize Σ w·#r");
@@ -2199,17 +2203,21 @@ fn print_help() {
     println!("  none (queries like `Int` then read empty; add `for N Int` to");
     println!("  materialize the range).");
     println!("notes: builtin `EReal` (m,e,p,k) error-tracking pseudo-reals:");
-    println!("  `sig A {{ x: EReal }}` then `x.m`, `x.e`, `x.p`, `x.k` read lanes;");
+    println!("  the domain is exactly the bit lanes: `EReal = $M + $E + $P + $K`, so a");
+    println!("  value is the *set* of its lane bits. Hold one in an `in`-sig or a field");
+    println!("  (`sig X in EReal {{}}`, `sig A {{ x: EReal }}`); `for N EReal` and");
+    println!("  `extends EReal` are rejected (scope the lanes: `for N $M, M $E, …`);");
+    println!("  `x.m`, `x.e`, `x.p`, `x.k` read the lanes (`m == 0` or odd, `p > 0`);");
     println!("  `erealAdd/Sub/Mul/Div[c,a,b]`, `erealWellformed[x]`, `erealDivGuard[x]`;");
     println!("  `setEReal[x, 3.14]` binds lanes to a decimal literal (same as `:mepk lit`);");
     println!("  decimal literals are EReal values in `=`/`!=` and `ereal*` args");
     println!("  (`R = 1.2`, `erealAdd[c, a, 2.5]`); needs a decimal point (`1e3` is not a real);");
     println!("  interval comparisons over [c-R, c+R]: `erealExactEq`, `erealMayEq`,");
     println!("  `erealCovers`, `erealLT`, `erealLTE`, `erealMayLTE`;");
-    println!("  `EReal` is abstract: extenders partition it (like any Alloy parent);");
-    println!("  decimal literals are constants needing no atoms (`for 0 EReal` still works);");
-    println!("  lane widths come from `for N Int` (+MEPK_*_WIDTH); `for N EReal` scopes atoms.");
-    println!("notes: builtin `Real` (exact centre `c = m*2^e`, `EReal extends Real`):");
+    println!("  decimal literals are constants, so they need no atoms at all.");
+    println!("notes: builtin `Real` (exact centre `c = m*2^e`): `Real = $M + $E`, the");
+    println!("  narrower of the two domains — a `Real` value is an `EReal` with no");
+    println!("  error bits, so its `x.p`/`x.k` read 0;");
     println!("  `x.m`, `x.e` read the shared centre lanes (`m == 0` or odd);");
     println!("  `realAdd/Sub/Mul/Div[c,a,b]` (exact; inexact division is UNSAT),");
     println!("  `realWellformed[x]`, `realEq`, `realLT`, `realLTE`, `realGT`, `realGTE`;");
@@ -2218,12 +2226,30 @@ fn print_help() {
     println!("  bracket comparison in `realLT/LTE/GT/GTE` (`X < (L)` iff `X <= Down(L)`);");
     println!("  `setRealNearest/Down/Up[x, 0.1]` round to the m-width mantissa");
     println!("  (nearest half-even / toward -inf / toward +inf; error untracked);");
-    println!("  `realSucc/realPred[b, a]` pin the lane successor/predecessor;");
-    println!("  `realUp[x]`/`realDown[x]` functions (hoisted to skolem shape in");
-    println!("  predicate args; top-of-lane is UNSAT);");
-    println!("  `R = 0.5` binds the centre for `Real`-rooted values;");
-    println!("  `Real` is abstract like `EReal`: extenders partition it;");
-    println!("  `for N Real` scopes free atoms (`for M EReal` needs `M <= N`).");
+    println!("  `realSucc/realPred[b, a]` pin the lane successor/predecessor");
+    println!("  (top-of-lane is UNSAT). There is no `realUp`/`realDown` function");
+    println!("  form: a value is a set of lane bits, so there is no single atom");
+    println!("  to hold the result; use the predicate form on an `in`-sig;");
+    println!("  `R = 0.5` binds the centre for `Real`-rooted values; a bare");
+    println!("  integer reads the same way (`R = 0` == `R = 0.0`), since the value");
+    println!("  sort decides it, not the literal spelling;");
+    println!("  `for N Real` is rejected: the domain is exactly `$M + $E`.");
+    println!("  `Real` and `EReal` are independent builtin domains (like `Int`/`Signed`),");
+    println!("  so `one sig X extends EReal` is gone. Hold a value in a plain `sig`");
+    println!("  or a `set`-multiplicity field (`x: set EReal`): one atom is one lane");
+    println!("  bit, and a value needs at least two (m and e), so `one sig X in EReal`");
+    println!("  and `x: one EReal` can only hold a single bit, never a whole value.");
+    println!("notes: bit lanes are exact builtin domains, so their members are");
+    println!("  constants you can write in a model: `M$0`, `E$1`, `P$2`, `K$0`");
+    println!("  (one bit position each, same exemption the `Int` atoms get), and");
+    println!("  `Step$0` for a temporal step position; `mbit[i]`/`ebit[i]`/`pbit[i]`/");
+    println!("  `kbit[i]` name the same bits as values. A set of lane bits carries");
+    println!("  its own sort, which decides what `=` against it means:");
+    println!("  one lane  -> the lane's signed integer  (`{{M$0, M$1}} = 3`);");
+    println!("  m and e   -> a `Real` value               (`{{M$0, E$0}} = 2`, same as `= 2.0`);");
+    println!("  a p or k  -> an `EReal` value             (`{{M$3, E$0, P$2}} = 0.5`);");
+    println!("  mixed with non-lane atoms is an error. Value atoms (`A$0`) stay");
+    println!("  `:query`-only: they are solver outputs, not constants.");
 }
 
 /// Resolve an explicit `:psave` relation argument: exact pool name first,
@@ -2242,6 +2268,250 @@ fn first_token(s: &str) -> &str {
     s.split_whitespace().next().unwrap_or("")
 }
 
+/// Commands that may also be written without the leading `:`. The set is
+/// derived from the same names [`dispatch`] matches, so it cannot drift.
+///
+/// `run`, `check`, `minimize` and `maximize` are deliberately absent: bare,
+/// they are ambiguous with model text, and the caller disambiguates them
+/// (see `main`) by trying `resolve_index` first.
+fn is_bare_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "help" | "h"
+            | "?"
+            | "quit"
+            | "exit"
+            | "q"
+            | "load"
+            | "l"
+            | "list"
+            | "ls"
+            | "cnfs"
+            | "sols"
+            | "use"
+            | "mode"
+            | "m"
+            | "fragments"
+            | "drop"
+            | "psave"
+            | "pread"
+            | "ppin"
+            | "pavoid"
+            | "reset"
+            | "solve"
+            | "s"
+            | "next"
+            | "n"
+            | "validate"
+            | "v"
+            | "show"
+            | "eval"
+            | "query"
+    )
+}
+
+/// Splits `body` into the command name and its whitespace-separated
+/// arguments.
+fn split_command(body: &str) -> (&str, Vec<&str>) {
+    match body.find(char::is_whitespace) {
+        Some(i) => (&body[..i], body[i..].split_whitespace().collect()),
+        None => (body, Vec::new()),
+    }
+}
+
+/// Runs one command. `rest` holds the whitespace-separated arguments;
+/// `raw` is the tail after the command name, kept verbatim for the
+/// free-form commands (`eval`, `query`, `max`, `min`, `maxw`, `minw`).
+///
+/// `colon` only affects usage text, so the explicit and bare spellings stay
+/// in step. Returns `false` for `quit` so the caller can break its loop.
+fn dispatch(sess: &mut Session, cmd: &str, rest: &[&str], raw: &str, colon: bool) -> bool {
+    let sp = if colon { ":" } else { "" };
+    let arg = rest.first().copied();
+
+    // `as <name>` split shared by run/check/solve/next/optimize.
+    let as_split = || {
+        let (head, as_name) = split_as(rest);
+        let bad = as_name == Some("__bad_as__") || head.len() > 1;
+        (head.first().copied(), as_name, bad)
+    };
+    let opt_split = || {
+        let (expr, cnf, sol) = split_opt_args(sess, raw)?;
+        Some((expr, cnf.map(str::to_string), sol.map(str::to_string)))
+    };
+
+    match cmd {
+        "help" | "h" | "?" => print_help(),
+        "quit" | "exit" | "q" => return false,
+        "load" | "l" => match arg {
+            Some(p) => sess.load_file(p),
+            None => println!("usage: {sp}load <file.als>"),
+        },
+        "list" | "ls" => sess.list_commands(),
+        "cnfs" => sess.list_cnfs(),
+        "sols" => sess.list_sols(),
+        "use" => match arg {
+            Some(n) => sess.do_use(n),
+            None => println!("usage: {sp}use <cnf|sol>"),
+        },
+        "mode" | "m" => sess.do_mode(arg),
+        "fragments" => sess.list_fragments(),
+        "drop" => {
+            if rest.len() != 1 {
+                println!("usage: {sp}drop <fragment-index> (:fragments to list)");
+            } else {
+                sess.drop_fragment(arg);
+            }
+        }
+        "psave" => match parse_psave_args(rest) {
+            Ok((file, sol, rels)) => sess.do_psave(file, sol, &rels),
+            Err(usage) => println!("{usage}"),
+        },
+        "pread" => match arg {
+            Some(p) => sess.do_pread(p),
+            None => println!("usage: {sp}pread <file>"),
+        },
+        "ppin" | "pavoid" => {
+            let usage =
+                format!("usage: {sp}{cmd} <file> [rels...] [to <cnf>] [as <sol>] [gated]");
+            match parse_ppin_args(rest, &usage) {
+                Ok(a) if cmd == "ppin" => sess.do_ppin(a.file, &a.rels, a.cnf, a.sol, a.gated),
+                Ok(a) => sess.do_pavoid(a.file, &a.rels, a.cnf, a.sol, a.gated),
+                Err(usage) => println!("{usage}"),
+            }
+        }
+        "reset" => {
+            sess.fragments.clear();
+            sess.rebuild("reset");
+        }
+        "run" | "check" => {
+            let kind = if cmd == "run" {
+                CnfKind::Run
+            } else {
+                CnfKind::Check
+            };
+            let (head, as_name, bad) = as_split();
+            if bad {
+                println!("usage: {sp}{cmd} <index|name> [as <cnf>]");
+            } else {
+                sess.do_build(kind, head, as_name);
+            }
+        }
+        "solve" | "s" => {
+            let (head, as_name, bad) = as_split();
+            if bad {
+                println!("usage: {sp}solve [<cnf>] [as <sol>]");
+            } else {
+                sess.do_solve(head, as_name);
+            }
+        }
+        "next" | "n" => {
+            let (head, as_name, bad) = as_split();
+            if bad {
+                println!("usage: {sp}next [<sol>] [as <sol>]");
+            } else {
+                sess.do_next(head, as_name);
+            }
+        }
+        "optimize" => {
+            let (head, as_name, bad) = as_split();
+            if bad {
+                println!("usage: {sp}optimize [<index|name>] [as <sol>]");
+            } else {
+                sess.do_optimize_command(head, as_name);
+            }
+        }
+        "max" | "min" | "maxw" | "minw" => {
+            let weighted = cmd.ends_with('w');
+            let usage = if weighted {
+                format!("usage: {sp}maxw|{sp}minw <rel>:<w>[, ...] [in <cnf>] [as <sol>]")
+            } else {
+                format!("usage: {sp}max|{sp}min <intexpr> [in <cnf>] [as <sol>]")
+            };
+            let sense = if cmd.starts_with("max") {
+                KkOptSense::Maximize
+            } else {
+                KkOptSense::Minimize
+            };
+            let Some((text, cnf, sol)) = opt_split() else {
+                println!("{usage}");
+                return true;
+            };
+            let target = if weighted {
+                match parse_weights_arg(text) {
+                    Some(pairs) => Some(OptTarget::Weights(pairs, sense)),
+                    None => {
+                        println!("{usage}");
+                        return true;
+                    }
+                }
+            } else {
+                match parse_int_expr(text) {
+                    Ok(ie) => Some(OptTarget::Int(ie, sense)),
+                    Err(e) => {
+                        println!("int expr error: {e}");
+                        return true;
+                    }
+                }
+            };
+            sess.do_optimize(target.unwrap(), cnf.as_deref(), sol.as_deref());
+        }
+        "validate" | "v" => {
+            let (sol, cnf) = split_validate(rest);
+            if sol == Some("__bad__") {
+                println!("usage: {sp}validate <sol> [in <cnf>]");
+            } else {
+                sess.do_validate(sol, cnf);
+            }
+        }
+        "show" => sess.do_show(rest),
+        "mepk" | "sens" | "cegar" => {
+            let out = match cmd {
+                "mepk" => mepk_cmd::run_mepk(rest),
+                "sens" => mepk_cmd::run_sens(rest),
+                _ => mepk_cmd::run_cegar(rest),
+            };
+            for line in out {
+                println!("{line}");
+            }
+        }
+        "eval" | "query" => {
+            let is_eval = cmd == "eval";
+            let usage = if is_eval {
+                format!("usage: {sp}eval <expr|formula> [as <sol>]")
+            } else {
+                format!("usage: {sp}query <expr> [in <sol>]")
+            };
+            if raw.is_empty() {
+                println!("{usage}");
+                return true;
+            }
+            let (kind, expr, target) = if is_eval {
+                // Split a trailing `as <sol>` off the free-form text.
+                let toks: Vec<&str> = raw.split_whitespace().collect();
+                let (_head, as_name) = split_as(&toks);
+                if as_name == Some("__bad_as__") {
+                    println!("{usage}");
+                    return true;
+                }
+                let cut = as_name.and_then(|_| raw.rmatch_indices(" as ").next()).map(|(i, _)| i);
+                let expr = cut.map(|i| raw[..i].trim()).unwrap_or(raw);
+                (InputKind::Eval, expr, as_name.map(str::to_string))
+            } else {
+                let (expr, sol) = split_query_in(sess, raw);
+                (InputKind::Query, expr, sol.map(str::to_string))
+            };
+            if expr.is_empty() {
+                println!("{usage}");
+            } else {
+                start_or_submit(sess, kind, expr, target);
+            }
+        }
+        _ => println!("unknown command `{sp}{cmd}` (:help for list)"),
+    }
+    true
+}
+
 fn second_token(s: &str) -> &str {
     s.split_whitespace().nth(1).unwrap_or("")
 }
@@ -2256,63 +2526,21 @@ fn looks_like_decl(s: &str) -> bool {
     }
 }
 
-/// True when a field TYPE expression mentions `Signed` (so a Signed
-/// range makes rows bitmask-readable). Mirrors the lowerer's
-/// `mentions_int_expr`, restricted to `Signed`.
-fn expr_is_signed(e: &Expr) -> bool {
+/// True when a field TYPE expression names one of `sigs` — the shape
+/// `Signed` / `Real` / `EReal` range detection all share.
+fn expr_mentions(e: &Expr, sigs: &[&str]) -> bool {
     match e {
-        Expr::Name(n, _) => n == "Signed",
-        Expr::Bin(_, a, b) => expr_is_signed(a) || expr_is_signed(b),
+        Expr::Name(n, _) => sigs.contains(&n.as_str()),
+        Expr::Bin(_, a, b) => expr_mentions(a, sigs) || expr_mentions(b, sigs),
         Expr::Transpose(x)
         | Expr::TClosure(x)
         | Expr::RClosure(x)
         | Expr::ArrowMult(_, x)
         | Expr::LeadMult(_, x)
         | Expr::Prime(x)
-        | Expr::AtExpr(x) => expr_is_signed(x),
+        | Expr::AtExpr(x) => expr_mentions(x, sigs),
         Expr::Bracket(base, args) => {
-            expr_is_signed(base) || args.iter().any(|a| expr_is_signed(a))
-        }
-        _ => false,
-    }
-}
-
-/// True when a field TYPE expression mentions `Real` but not `EReal`
-/// (flat bit-set range: empty rows read as the Real zero). Same shape
-/// walk as `expr_is_signed`.
-fn expr_is_real(e: &Expr) -> bool {
-    match e {
-        Expr::Name(n, _) => n == "Real",
-        Expr::Bin(_, a, b) => expr_is_real(a) || expr_is_real(b),
-        Expr::Transpose(x)
-        | Expr::TClosure(x)
-        | Expr::RClosure(x)
-        | Expr::ArrowMult(_, x)
-        | Expr::LeadMult(_, x)
-        | Expr::Prime(x)
-        | Expr::AtExpr(x) => expr_is_real(x),
-        Expr::Bracket(base, args) => {
-            expr_is_real(base) || args.iter().any(|a| expr_is_real(a))
-        }
-        _ => false,
-    }
-}
-
-/// True when a field TYPE expression mentions `Real`/`EReal` (so rows
-/// decode to `c` / `c ± R`). Same shape walk as `expr_is_signed`.
-fn expr_is_ereal(e: &Expr) -> bool {
-    match e {
-        Expr::Name(n, _) => n == "Real" || n == "EReal",
-        Expr::Bin(_, a, b) => expr_is_ereal(a) || expr_is_ereal(b),
-        Expr::Transpose(x)
-        | Expr::TClosure(x)
-        | Expr::RClosure(x)
-        | Expr::ArrowMult(_, x)
-        | Expr::LeadMult(_, x)
-        | Expr::Prime(x)
-        | Expr::AtExpr(x) => expr_is_ereal(x),
-        Expr::Bracket(base, args) => {
-            expr_is_ereal(base) || args.iter().any(|a| expr_is_ereal(a))
+            expr_mentions(base, sigs) || args.iter().any(|a| expr_mentions(a, sigs))
         }
         _ => false,
     }
@@ -2528,10 +2756,12 @@ struct PpinArgs<'a> {
 /// Split `:ppin`/`:pavoid` args: `<file> [rels...] [to <cnf>] [as <sol>] [gated]`.
 /// Relation names may be `+`-joined (`B+f`, `B + f`, `B f` all agree).
 /// `to`/`as`/`gated` are reserved words here (as with `in`/`as` elsewhere).
-fn parse_ppin_args<'a>(
+/// `usage` is echoed back to the caller on a parse error, so the error
+/// borrows it rather than requiring `&'static str`.
+fn parse_ppin_args<'a, 'u>(
     rest: &[&'a str],
-    usage: &'static str,
-) -> Result<PpinArgs<'a>, &'static str> {
+    usage: &'u str,
+) -> Result<PpinArgs<'a>, &'u str> {
     if rest.is_empty() {
         return Err(usage);
     }
@@ -2588,42 +2818,6 @@ fn split_validate<'a>(rest: &[&'a str]) -> (Option<&'a str>, Option<&'a str>) {
         (Some("__bad__"), Some("__bad__"))
     }
 }
-
-const BARE_COMMANDS: &[&str] = &[
-    "help",
-    "h",
-    "?",
-    "quit",
-    "exit",
-    "q",
-    "load",
-    "l",
-    "list",
-    "ls",
-    "fragments",
-    "drop",
-    "save",
-    "add",
-    "psave",
-    "pread",
-    "ppin",
-    "pavoid",
-    "solve",
-    "s",
-    "next",
-    "n",
-    "validate",
-    "v",
-    "show",
-    "reset",
-    "cnfs",
-    "sols",
-    "use",
-    "mode",
-    "m",
-    "query",
-    "eval",
-];
 
 fn main() {
     let cli = Cli::parse();
@@ -2689,319 +2883,25 @@ fn main() {
 
         // Explicit `:command`.
         if let Some(body) = trimmed.strip_prefix(':') {
-            let mut parts = body.split_whitespace();
-            let cmd = parts.next().unwrap_or("");
-            // NOTE: parts borrows body; collect the rest before &mut sess calls.
-            let rest: Vec<&str> = parts.collect();
-            let arg = rest.first().copied();
-            match cmd {
-                "help" | "h" | "?" => print_help(),
-                "quit" | "exit" | "q" => break,
-                "load" | "l" => match arg {
-                    Some(p) => sess.load_file(p),
-                    None => println!("usage: :load <file.als>"),
-                },
-                "list" | "ls" => sess.list_commands(),
-                "cnfs" => sess.list_cnfs(),
-                "sols" => sess.list_sols(),
-                "use" => match arg {
-                    Some(n) => sess.do_use(n),
-                    None => println!("usage: :use <cnf|sol>"),
-                },
-                "mode" | "m" => sess.do_mode(arg),
-                "fragments" => sess.list_fragments(),
-                "drop" => {
-                    if rest.len() != 1 {
-                        println!("usage: :drop <fragment-index> (:fragments to list)");
-                    } else {
-                        sess.drop_fragment(arg);
-                    }
-                }
-                "psave" => match parse_psave_args(&rest) {
-                    Ok((file, sol, rels)) => sess.do_psave(file, sol, &rels),
-                    Err(usage) => println!("{usage}"),
-                },
-                "pread" => match arg {
-                    Some(p) => sess.do_pread(p),
-                    None => println!("usage: :pread <file>"),
-                },
-                "ppin" => match parse_ppin_args(
-                    &rest,
-                    "usage: :ppin <file> [rels...] [to <cnf>] [as <sol>] [gated]",
-                ) {
-                    Ok(a) => sess.do_ppin(a.file, &a.rels, a.cnf, a.sol, a.gated),
-                    Err(usage) => println!("{usage}"),
-                },
-                "pavoid" => match parse_ppin_args(
-                    &rest,
-                    "usage: :pavoid <file> [rels...] [to <cnf>] [as <sol>] [gated]",
-                ) {
-                    Ok(a) => sess.do_pavoid(a.file, &a.rels, a.cnf, a.sol, a.gated),
-                    Err(usage) => println!("{usage}"),
-                },
-                "reset" => {
-                    sess.fragments.clear();
-                    sess.rebuild("reset");
-                }
-                "run" | "check" => {
-                    let kind = if cmd == "run" {
-                        CnfKind::Run
-                    } else {
-                        CnfKind::Check
-                    };
-                    let (head, as_name) = split_as(&rest);
-                    if as_name == Some("__bad_as__") || head.len() > 1 {
-                        println!("usage: :{cmd} <index|name> [as <cnf>]");
-                    } else {
-                        sess.do_build(kind, head.first().copied(), as_name);
-                    }
-                }
-                "solve" | "s" => {
-                    let (head, as_name) = split_as(&rest);
-                    if as_name == Some("__bad_as__") || head.len() > 1 {
-                        println!("usage: :solve [<cnf>] [as <sol>]");
-                    } else {
-                        sess.do_solve(head.first().copied(), as_name);
-                    }
-                }
-                "next" | "n" => {
-                    let (head, as_name) = split_as(&rest);
-                    if as_name == Some("__bad_as__") || head.len() > 1 {
-                        println!("usage: :next [<sol>] [as <sol>]");
-                    } else {
-                        sess.do_next(head.first().copied(), as_name);
-                    }
-                }
-                "optimize" => {
-                    let (head, as_name) = split_as(&rest);
-                    if as_name == Some("__bad_as__") || head.len() > 1 {
-                        println!("usage: :optimize [<index|name>] [as <sol>]");
-                    } else {
-                        sess.do_optimize_command(head.first().copied(), as_name);
-                    }
-                }
-                "max" | "min" => {
-                    let raw = body[cmd.len()..].trim();
-                    let usage = "usage: :max|:min <intexpr> [in <cnf>] [as <sol>]";
-                    match split_opt_args(&sess, raw) {
-                        None => println!("{usage}"),
-                        Some((expr, cnf, sol)) => match parse_int_expr(expr) {
-                            Err(e) => println!("int expr error: {e}"),
-                            Ok(ie) => {
-                                let sense = if cmd == "max" {
-                                    KkOptSense::Maximize
-                                } else {
-                                    KkOptSense::Minimize
-                                };
-                                sess.do_optimize(OptTarget::Int(ie, sense), cnf, sol);
-                            }
-                        },
-                    }
-                }
-                "maxw" | "minw" => {
-                    let raw = body[cmd.len()..].trim();
-                    let usage = "usage: :maxw|:minw <rel>:<w>[, ...] [in <cnf>] [as <sol>]";
-                    match split_opt_args(&sess, raw) {
-                        None => println!("{usage}"),
-                        Some((list, cnf, sol)) => match parse_weights_arg(list) {
-                            None => println!("{usage}"),
-                            Some(pairs) => {
-                                let sense = if cmd == "maxw" {
-                                    KkOptSense::Maximize
-                                } else {
-                                    KkOptSense::Minimize
-                                };
-                                sess.do_optimize(OptTarget::Weights(pairs, sense), cnf, sol);
-                            }
-                        },
-                    }
-                }
-                "validate" | "v" => {
-                    let (sol, cnf) = split_validate(&rest);
-                    if sol == Some("__bad__") {
-                        println!("usage: :validate <sol> [in <cnf>]");
-                    } else {
-                        sess.do_validate(sol, cnf);
-                    }
-                }
-                "show" => sess.do_show(&rest),
-                "mepk" => {
-                    for line in mepk_cmd::run_mepk(&rest) {
-                        println!("{line}");
-                    }
-                }
-                "sens" => {
-                    for line in mepk_cmd::run_sens(&rest) {
-                        println!("{line}");
-                    }
-                }
-                "cegar" => {
-                    for line in mepk_cmd::run_cegar(&rest) {
-                        println!("{line}");
-                    }
-                }
-                "eval" => {
-                    let raw = body["eval".len()..].trim();
-                    if raw.is_empty() {
-                        println!("usage: :eval <expr|formula> [as <sol>]");
-                    } else {
-                        // Split trailing `as <sol>` on the raw text.
-                        let toks: Vec<&str> = raw.split_whitespace().collect();
-                        let (_head, as_name) = split_as(&toks);
-                        if as_name == Some("__bad_as__") {
-                            println!("usage: :eval <expr|formula> [as <sol>]");
-                        } else {
-                            let cut = if as_name.is_some() {
-                                raw.rmatch_indices(" as ").next().map(|(i, _)| i)
-                            } else {
-                                None
-                            };
-                            let expr = match cut {
-                                Some(i) => raw[..i].trim(),
-                                None => raw,
-                            };
-                            if expr.is_empty() {
-                                println!("usage: :eval <expr|formula> [as <sol>]");
-                            } else {
-                                let owned = as_name.map(|s| s.to_string());
-                                start_or_submit(&mut sess, InputKind::Eval, expr, owned);
-                            }
-                        }
-                    }
-                }
-                "query" => {
-                    let raw = body["query".len()..].trim();
-                    if raw.is_empty() {
-                        println!("usage: :query <expr> [in <sol>]");
-                    } else {
-                        let (expr, sol) = split_query_in(&sess, raw);
-                        let owned = sol.map(|s| s.to_string());
-                        start_or_submit(&mut sess, InputKind::Query, expr, owned);
-                    }
-                }
-                _ => println!("unknown command `:{cmd}` (:help for list)"),
+            let (cmd, rest) = split_command(body);
+            let raw = &body[cmd.len()..];
+            if !dispatch(&mut sess, cmd, &rest, raw, true) {
+                break;
             }
             continue;
         }
 
         // Bare line: explicit command name without colon (legacy).
         let head = first_token(trimmed);
-        if BARE_COMMANDS.contains(&head) {
-            let mut parts = trimmed.split_whitespace();
-            let cmd = parts.next().unwrap_or("");
-            let rest: Vec<&str> = parts.collect();
-            let arg = rest.first().copied();
-            // Recompute the raw tail for query/eval (they take free-form text).
-            let tail = trimmed[cmd.len()..].trim();
-            match cmd {
-                "help" | "h" | "?" => print_help(),
-                "quit" | "exit" | "q" => break,
-                "load" | "l" => match arg {
-                    Some(p) => sess.load_file(p),
-                    None => println!("usage: :load <file.als>"),
-                },
-                "list" | "ls" => sess.list_commands(),
-                "cnfs" => sess.list_cnfs(),
-                "sols" => sess.list_sols(),
-                "use" => match arg {
-                    Some(n) => sess.do_use(n),
-                    None => println!("usage: :use <cnf|sol>"),
-                },
-                "mode" | "m" => sess.do_mode(arg),
-                "fragments" => sess.list_fragments(),
-                "drop" => {
-                    if rest.len() != 1 {
-                        println!("usage: drop <fragment-index> (:fragments to list)");
-                    } else {
-                        sess.drop_fragment(arg);
-                    }
-                }
-                "psave" => match parse_psave_args(&rest) {
-                    Ok((file, sol, rels)) => sess.do_psave(file, sol, &rels),
-                    Err(usage) => println!("{usage}"),
-                },
-                "pread" => match arg {
-                    Some(p) => sess.do_pread(p),
-                    None => println!("usage: pread <file>"),
-                },
-                "ppin" => match parse_ppin_args(
-                    &rest,
-                    "usage: ppin <file> [rels...] [to <cnf>] [as <sol>] [gated]",
-                ) {
-                    Ok(a) => sess.do_ppin(a.file, &a.rels, a.cnf, a.sol, a.gated),
-                    Err(usage) => println!("{usage}"),
-                },
-                "pavoid" => match parse_ppin_args(
-                    &rest,
-                    "usage: pavoid <file> [rels...] [to <cnf>] [as <sol>] [gated]",
-                ) {
-                    Ok(a) => sess.do_pavoid(a.file, &a.rels, a.cnf, a.sol, a.gated),
-                    Err(usage) => println!("{usage}"),
-                },
-                "reset" => {
-                    sess.fragments.clear();
-                    sess.rebuild("reset");
-                }
-                "solve" | "s" => {
-                    let (head, as_name) = split_as(&rest);
-                    if as_name == Some("__bad_as__") || head.len() > 1 {
-                        println!("usage: solve [<cnf>] [as <sol>]");
-                    } else {
-                        sess.do_solve(head.first().copied(), as_name);
-                    }
-                }
-                "next" | "n" => {
-                    let (head, as_name) = split_as(&rest);
-                    if as_name == Some("__bad_as__") || head.len() > 1 {
-                        println!("usage: next [<sol>] [as <sol>]");
-                    } else {
-                        sess.do_next(head.first().copied(), as_name);
-                    }
-                }
-                "validate" | "v" => {
-                    let (sol, cnf) = split_validate(&rest);
-                    if sol == Some("__bad__") {
-                        println!("usage: validate <sol> [in <cnf>]");
-                    } else {
-                        sess.do_validate(sol, cnf);
-                    }
-                }
-                "show" => sess.do_show(&rest),
-                "eval" => {
-                    if tail.is_empty() {
-                        println!("usage: eval <expr|formula> [as <sol>]");
-                    } else {
-                        let toks: Vec<&str> = tail.split_whitespace().collect();
-                        let (_head, as_name) = split_as(&toks);
-                        if as_name == Some("__bad_as__") {
-                            println!("usage: eval <expr|formula> [as <sol>]");
-                        } else {
-                            let cut = match as_name {
-                                Some(_) => tail.rmatch_indices(" as ").next().map(|(i, _)| i),
-                                None => None,
-                            };
-                            let expr = match cut {
-                                Some(i) => tail[..i].trim(),
-                                None => tail,
-                            };
-                            let owned = as_name.map(|s| s.to_string());
-                            start_or_submit(&mut sess, InputKind::Eval, expr, owned);
-                        }
-                    }
-                }
-                "query" => {
-                    if tail.is_empty() {
-                        println!("usage: query <expr> [in <sol>]");
-                    } else {
-                        let (expr, sol) = split_query_in(&sess, tail);
-                        let owned = sol.map(|s| s.to_string());
-                        start_or_submit(&mut sess, InputKind::Query, expr, owned);
-                    }
-                }
-                _ => println!("unknown command `{cmd}` (:help for list)"),
+        if is_bare_command(head) {
+            let (cmd, rest) = split_command(trimmed);
+            let raw = &trimmed[cmd.len()..];
+            if !dispatch(&mut sess, cmd, &rest, raw, false) {
+                break;
             }
             continue;
         }
+
 
         // Bare `run`/`check`: build when it names a command, else a fragment.
         if head == "run" || head == "check" {

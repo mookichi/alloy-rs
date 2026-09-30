@@ -3,7 +3,8 @@
 //! `for N $M, M $E`). Values are bit sets held by `in`-sigs or holder
 //! sigs (`sig R in Real {}`, `some sig H { r: Real }`); scalar
 //! quantification (`some x: Real`) cannot hold `(m, e)` centres.
-//! `EReal` stays reified as the control group.
+//! `EReal` is flat too (`EReal = $M + $E + $P + $K`), so `Real` is the
+//! narrower domain of the two rather than a parent of it.
 
 use alloy_front_rs::{parse_module, run, solve};
 
@@ -142,10 +143,23 @@ fn real_value_equality_via_eq() {
 }
 
 #[test]
-fn ereal_models_still_use_ereal_reading() {
-    // `EReal`-rooted `= lit` keeps the legacy lane-exact reading (control).
-    sat("one sig R1 extends EReal {}\nfact { R1 = 0.5 }\nrun {} for 2 EReal");
-    unsat("one sig R1 extends EReal {}\nfact { R1 = 0.5 and R1 = 1.5 }\nrun {} for 2 EReal");
+fn ereal_is_a_narrower_domain_not_a_parent() {
+    // `Real` and `EReal` are two independent type domains over the lane
+    // partition, and `Real` is the narrower one: an exact real is an
+    // `EReal` with no error bits, so every `Real` value is a legal
+    // `EReal` value, but not the other way round.
+    sat("sig R in Real {}\npred p { some r: R | r in EReal }\nrun p");
+    sat("sig R in EReal {}\npred p { some r: R | r in Real }\nrun p");
+    // A `Real` value has no `p`/`k` bits, so those lanes read 0 (the
+    // error lanes have to exist first: they are allocated on an explicit
+    // `EReal`/`$P` mention, like `Int` atoms on `for N Int`).
+    sat("sig R in Real {}\nfact { setReal[R, 0.5] }\npred p { some $P and R.p = 0 and R.k = 0 }\nrun p");
+    // A `p`/`k` bit is out of the `Real` domain.
+    unsat("sig R in Real {}\nfact { R = {M$0, P$2} }\nrun {}");
+    // `for N EReal` is rejected like `for N Real`: the domain derives.
+    build_err("pred p { some $P }\nrun p for 2 EReal", "not scoped in flat mode");
+    build_err("sig X extends EReal {}\nrun {}", "cannot extend EReal");
+    sat("sig X in EReal {}\nrun {}");
 }
 
 #[test]
@@ -156,8 +170,7 @@ fn flat_partition_bans_and_shape() {
     // `Real` is exact: its population is the full lane set, so its
     // cardinality is M+E with no scope of its own.
     sat("pred p { #Real = 13 }\nrun p for 8 $M, 5 $E");
-    // No unconstrained-lane warnings in flat-only models (the legacy
-    // `Real.m`/`Real.e` uppers cover the `EReal` population only).
+    // There is no lane relation any more, so no lane can warn.
     {
         let m = parse_module("sig X in Real {}\nfact { setReal[X, 0.5] }\nrun {}").expect("parse");
         let cnf = run(&m, 0).expect("run");
@@ -171,11 +184,11 @@ fn flat_partition_bans_and_shape() {
     build_err("sig X extends Real {}\nrun {}", "cannot extend Real");
     // `for N Real` is rejected: the population derives as `$M + $E`.
     build_err("pred p { some $M }\nrun p for 2 Real", "not scoped in flat mode");
-    // Scope guard survives: EReal cannot exceed the derived Real budget.
-    build_err(
-        "pred p { some x: EReal, y: Real | erealWellformed[x] and realWellformed[y] }\nrun p for 1 $M, 1 $E",
-        "exceeds",
-    );
+    // A lane is an integer, so it has no set reading: `Real.m` is the
+    // whole domain's lane (loudly), and a lane read in a set position is
+    // a category error rather than a silent join.
+    build_err("pred p { Real.m = 3 }\nrun p", "whole `Real` domain");
+    build_err("sig R in Real {}\npred p { R.m in R }\nrun p", "reads a bit lane");
 }
 
 #[test]
@@ -229,11 +242,22 @@ fn real_succ_pred() {
 }
 
 #[test]
-fn real_up_down_pred_forms() {
-    // `realSucc`/`realPred` pred forms (the `realUp[x]` function form
-    // needs a scalar witness and has no flat reading).
+fn real_succ_pred_is_the_only_form() {
+    // A value is a set of lane bits, so there is no single atom to hold a
+    // successor: the predicate form (over an `in`-sig) is the only one, and
+    // the old `realUp[x]`/`realDown[x]` function form is gone from the
+    // language.
     sat("sig A, B, C in Real {}\nfact { setReal[A, 0.5] and realSucc[B, A] and realPred[C, B] and realEq[A, C] }\nrun {}");
     unsat("sig A, B in Real {}\nfact { setReal[A, 0.5] and realSucc[B, A] and realEq[B, 1.5] }\nrun {}");
+    // The removed names are rejected loudly rather than silently re-read.
+    for name in ["realUp", "realDown"] {
+        build_err(
+            &format!(
+                "fun f[]: one Real {{ {name}[0.5] }}\nsig S {{ x: one Real }}\nfact {{ S.x = f[] }}\nrun {{}}"
+            ),
+            "no longer exists",
+        );
+    }
 }
 
 #[test]
@@ -287,71 +311,18 @@ fn bit_singletons_spell_lane_sets() {
     unsat("sig R in Real {}\nfact { R = mbit[0] + ebit[0] + ebit[1] + ebit[2] + ebit[3] and realEq[R, 1.5] }\nrun {}");
     // Integer readings agree with the bit spelling.
     sat("sig R in Real {}\nfact { R.m = 3 }\npred p { R = mbit[0] + mbit[1] + ebit[0] + ebit[1] + ebit[2] + ebit[3] }\nrun p");
-    // Out-of-range positions fail loudly (M=5 at default widths).
+    // Out-of-range positions fail loudly (M=5 at default widths). A
+    // lane is an integer, so the check belongs on the singleton itself.
+    build_err("pred p { {mbit[7]} = 1 }\nrun p", "outside the lane range");
+    // … and reading a lane in a set position is a category error, not a
+    // join against an unresolvable label.
     build_err(
-        "sig R in Real {}\nfact { R.m = mbit[7] }\nrun {}",
-        "outside the lane range",
+        "sig R in Real {}\nfact { R.m = 3 }\npred p { R.m in Real }\nrun p",
+        "reads a bit lane",
     );
     // `$M` is a builtin domain: always exactly the full bit set.
     sat("pred p { #$M = 5 }\nrun p for 5 $M");
     sat("pred p { some $M }\nrun p for 5 $M");
-}
-
-#[test]
-#[ignore = "item 5 hold: REPL lane-oracle reads reified Real.m/e instance tuples"]
-fn query_real_up_down_uses_oracle() {
-    // Reported REPL case: with `one sig X extends Real`, `Real = {X$0}`,
-    // so the desugared `{ $r: Real | realSucc[$r, X] }` enumerates to
-    // `{}`; `:query realUp[X]` must answer via the lane oracle instead.
-    use alloy_front_rs::{effective_int_count, query_value, QueryValue};
-    use alloy_kodkod_rs::mepk::MepkWidths;
-    use alloy_kodkod_rs::real::{decimal_to_real_rounded, next_down, next_up, RealRound};
-    let src = "one sig X extends Real {}\nfact { X.setRealNearest[0.13] }\nrun {} for 12 Int";
-    let m = parse_module(src).expect("parse");
-    let cnf = run(&m, 0).expect("run");
-    let inst = solve(&cnf).expect("solve").expect("SAT");
-    let scope = &m.commands[0].scope;
-    let w = MepkWidths::from_env(effective_int_count(scope)).expect("widths");
-    let x = decimal_to_real_rounded("0.13", Some(w.m_width), RealRound::Nearest).expect("0.13");
-    let expect_up = next_up(&x, w.m_width, w.e_width).expect("succ");
-    let expect_down = next_down(&x, w.m_width, w.e_width).expect("pred");
-    match query_value(&m, scope, &cnf, "realUp[X]", &inst).expect("query realUp[X]") {
-        QueryValue::Real(v) => assert_eq!(v, expect_up),
-        QueryValue::Set(..) => panic!("expected computed Real"),
-        QueryValue::Int(..) => panic!("expected computed Real"),
-        QueryValue::Bool(..) => panic!("expected computed Real"),
-    }
-    match query_value(&m, scope, &cnf, "realDown[X]", &inst).expect("query realDown[X]") {
-        QueryValue::Real(v) => assert_eq!(v, expect_down),
-        QueryValue::Set(..) => panic!("expected computed Real"),
-        QueryValue::Int(..) => panic!("expected computed Real"),
-        QueryValue::Bool(..) => panic!("expected computed Real"),
-    }
-    // Literal argument folds without an instance atom.
-    match query_value(&m, scope, &cnf, "realUp[0.5]", &inst).expect("query realUp[0.5]") {
-        QueryValue::Real(v) => {
-            let half = decimal_to_real_rounded("0.5", Some(w.m_width), RealRound::Nearest).unwrap();
-            assert_eq!(v, next_up(&half, w.m_width, w.e_width).unwrap());
-        }
-        QueryValue::Set(..) => panic!("expected computed Real"),
-        QueryValue::Int(..) => panic!("expected computed Real"),
-        QueryValue::Bool(..) => panic!("expected computed Real"),
-    }
-    // Predicate-shaped comprehension over the full `Real` type answers
-    // through the same oracle (both orientations).
-    for (src, expect) in [
-        ("{x: Real | x.realSucc[X]}", expect_up),
-        ("{x: Real | x.realPred[X]}", expect_down),
-        ("{x: Real | X.realSucc[x]}", expect_down),
-        ("{x: Real | X.realPred[x]}", expect_up),
-    ] {
-        match query_value(&m, scope, &cnf, src, &inst).expect("query succ comprehension") {
-            QueryValue::Real(v) => assert_eq!(v, expect, "{src}"),
-            QueryValue::Set(..) => panic!("expected computed Real for {src}"),
-            QueryValue::Int(..) => panic!("expected computed Real for {src}"),
-            QueryValue::Bool(..) => panic!("expected computed Real for {src}"),
-        }
-    }
 }
 
 #[test]

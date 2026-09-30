@@ -17,11 +17,10 @@ pub struct DisplayHints {
     pub signed_sigs: HashSet<String>,
     /// Field keys `Owner.field` with `Signed` range.
     pub signed_fields: HashSet<String>,
-    /// Field keys `Owner.field` with `EReal` range (rows decode to
-    /// `c ± R` instead of raw `->EReal$i` tuples).
-    pub ereal_fields: HashSet<String>,
-    /// Unary sig names denoting flat bit sets (`in Real` and friends):
-    /// empty sets read as the Real zero instead of staying raw.
+    /// Field keys `Owner.field` whose range is a `Real`/`EReal` value
+    /// (rows decode to `c` or `c ± R` alongside the raw bit set).
+    /// Unary sig names denoting value bit sets (`in Real` / `in EReal`
+    /// and friends): empty sets read as the Real zero, not raw.
     pub real_sigs: HashSet<String>,
     /// Field keys `Owner.field` with flat `Real` range: empty rows read
     /// as the Real zero instead of staying raw.
@@ -192,12 +191,6 @@ pub fn field_rows_alloy(inst: &Instance, owner: &str, field: &str, ts: &TupleSet
         out.push_str(&format!("\n {line}"));
     }
     out
-}
-
-/// True for the builtin lane relations (`Real.m`/`Real.e` shared centre
-/// lanes plus the `EReal`-only `EReal.p`/`EReal.k`).
-fn is_ereal_lane(name: &str) -> bool {
-    matches!(name, "Real.m" | "Real.e" | "EReal.p" | "EReal.k")
 }
 
 /// Bit position of a lane atom (`M$3` -> 3) with the expected prefix.
@@ -407,219 +400,24 @@ pub fn bitset_field_rows(
     bitset_field_rows_ts(inst.universe(), owner, field, ts, owners, is_real)
 }
 
-/// Decode every `Real$i`/`EReal$i` atom to its lanes plus a one-line
-/// display: `EReal` members with full lanes show `c ± R`, pure-`Real`
-/// members show the exact centre `c`.
-/// `None` when the instance carries no `Real` lanes (legacy path kept).
-fn decode_ereal(inst: &Instance) -> Option<BTreeMap<u32, ((i64, i64, i64, i64), String)>> {
-    let universe = inst.universe();
-    let size = universe.size() as i64;
-    // Lane relations present?
-    let mut lanes: BTreeMap<&str, &TupleSet> = BTreeMap::new();
-    for (r, ts) in inst.relation_tuples() {
-        let name = inst.pool().name(r);
-        match name.as_ref() {
-            "Real.m" => {
-                lanes.insert("m", ts);
-            }
-            "Real.e" => {
-                lanes.insert("e", ts);
-            }
-            "EReal.p" => {
-                lanes.insert("p", ts);
-            }
-            "EReal.k" => {
-                lanes.insert("k", ts);
-            }
-            _ => {}
-        }
-    }
-    if lanes.get("m").is_none() || lanes.get("e").is_none() {
-        return None;
-    }
-    let me_prefixes = [("m", "M"), ("e", "E")];
-    let me_widths: Vec<i64> = me_prefixes
-        .iter()
-        .map(|(_, pre)| lane_width(universe, pre))
-        .collect::<Option<_>>()?;
-    let pk_prefixes = [("p", "P"), ("k", "K")];
-    let pk_widths: Option<Vec<i64>> = pk_prefixes
-        .iter()
-        .map(|(_, pre)| lane_width(universe, pre))
-        .collect();
-    // Owner atom -> (m/e bits, p/k bits).
-    let mut rows: BTreeMap<u32, ([Vec<i64>; 2], [Vec<i64>; 2])> = BTreeMap::new();
-    for (li, (lane, _)) in me_prefixes.iter().enumerate() {
-        let ts = lanes[lane];
-        if ts.arity() != 2 {
-            return None;
-        }
-        for flat in ts.index_view().iter() {
-            let d = digits(size, 2, flat);
-            if d.len() < 2 {
-                return None;
-            }
-            let bit = lane_pos(universe, d[1], me_prefixes[li].1)?;
-            rows.entry(d[0]).or_default().0[li].push(bit);
-        }
-    }
-    if lanes.contains_key("p") && lanes.contains_key("k") && pk_widths.is_some() {
-        for (li, (lane, _)) in pk_prefixes.iter().enumerate() {
-            let ts = lanes[lane];
-            if ts.arity() != 2 {
-                return None;
-            }
-            for flat in ts.index_view().iter() {
-                let d = digits(size, 2, flat);
-                if d.len() < 2 {
-                    return None;
-                }
-                let bit = lane_pos(universe, d[1], pk_prefixes[li].1)?;
-                rows.entry(d[0]).or_default().1[li].push(bit);
-            }
-        }
-    }
-    let mut out: BTreeMap<u32, ((i64, i64, i64, i64), String)> = BTreeMap::new();
-    // Only atoms actually in the `Real`/`EReal` relations decode; sibling
-    // atoms outside the solved extents (e.g. excluded by an extender's
-    // `one`) have unconstrained lanes and would print as noise.
-    let mut members: HashSet<u32> = HashSet::new();
-    let mut ereal_members: HashSet<u32> = HashSet::new();
-    for (r, ts) in inst.relation_tuples() {
-        let name = inst.pool().name(r);
-        if ts.arity() != 1 {
-            continue;
-        }
-        if name.as_ref() == "Real" || name.as_ref() == "EReal" {
-            members.extend(ts.index_view().iter().map(|i| i as u32));
-        }
-        if name.as_ref() == "EReal" {
-            ereal_members.extend(ts.index_view().iter().map(|i| i as u32));
-        }
-    }
-    for (owner, (me_bits, pk_bits)) in rows {
-        if !members.contains(&owner) {
-            continue;
-        }
-        // `EReal`-population atoms (`EReal$i`) outside the solved `EReal`
-        // extent are scope leftovers with unconstrained lanes (legacy
-        // ghost-lane rule); genuine `Real` members always decode.
-        let atom = atom_name(universe, owner);
-        if atom.starts_with("EReal$") && !ereal_members.contains(&owner) {
-            continue;
-        }
-        let me_vals: Vec<i64> = me_bits
-            .iter()
-            .zip(me_widths.iter())
-            .map(|(b, w)| lane_value(*w, b.iter().copied()))
-            .collect::<Option<_>>()?;
-        let (m, e) = (me_vals[0], me_vals[1]);
-        let pk_vals: Option<(i64, i64)> = match (&pk_widths, ereal_members.contains(&owner)) {
-            (Some(ws), true) => {
-                let vs: Option<Vec<i64>> = pk_bits
-                    .iter()
-                    .zip(ws.iter())
-                    .map(|(b, w)| lane_value(*w, b.iter().copied()))
-                    .collect();
-                vs.map(|v| (v[0], v[1]))
-            }
-            _ => None,
-        };
-        let (lanes4, text) = match pk_vals {
-            Some((p, k)) => match Mepk::new(m as i128, e as i32, p as u32, k as i32) {
-                Some(v) => ((m, e, p, k), format!("{} [m={m} e={e} p={p} k={k}]", v.interval_string(0))),
-                None => ((m, e, p, k), format!("(ill-formed lanes m={m} e={e} p={p} k={k})")),
-            },
-            None => match alloy_kodkod_rs::real::RealCenter::new(m as i128, e as i32) {
-                Some(v) => ((m, e, 0, 0), format!("{} [m={m} e={e}]", v.centre_short())),
-                None => ((m, e, 0, 0), format!("(ill-formed lanes m={m} e={e})")),
-            },
-        };
-        out.insert(owner, (lanes4, text));
-    }
-    Some(out)
-}
-
-/// Per-owner rows for an `Owner.field` relation whose range is `EReal`:
-/// `X$0.r = <c ± R>`, multi-mapped rows list each value in `{...}`.
-fn ereal_field_rows(
-    inst: &Instance,
-    owner: &str,
-    field: &str,
-    ts: &TupleSet,
-    ev: &BTreeMap<u32, ((i64, i64, i64, i64), String)>,
-) -> String {
-    let universe = inst.universe();
-    let size = universe.size() as i64;
-    let mut groups: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for flat in ts.index_view().iter() {
-        let d = digits(size, ts.arity(), flat);
-        if d.len() >= 2 {
-            groups.entry(d[0]).or_default().push(d[1]);
-        }
-    }
-    let mut owners: Vec<u32> = Vec::new();
-    for (r, ots) in inst.relation_tuples() {
-        if inst.pool().name(r).as_ref() == owner && ots.arity() == 1 {
-            for idx in ots.index_view().iter() {
-                owners.push(idx as u32);
-            }
-            break;
-        }
-    }
-    if owners.is_empty() {
-        owners = groups.keys().copied().collect();
-    }
-    let mut out = String::new();
-    for o in owners {
-        let oname = atom_name(universe, o);
-        let empty: Vec<u32> = Vec::new();
-        let cols = groups.get(&o).unwrap_or(&empty);
-        let vals: Vec<String> = cols
-            .iter()
-            .map(|c| {
-                ev.get(c)
-                    .map(|(_, t)| t.clone())
-                    .unwrap_or_else(|| atom_name(universe, *c))
-            })
-            .collect();
-        let line = if vals.len() == 1 {
-            format!("{oname}.{field} = {}", vals[0])
-        } else {
-            format!("{oname}.{field} = {{{}}}", vals.join(", "))
-        };
-        out.push_str(&format!("\n {line}"));
-    }
-    out
-}
-
 /// Relations named in `signed` (Signed-rooted sigs) render unary int-atom
 /// sets as their bitmask value (`S = 85`); binary `Owner.field` relations
 /// in `signed_fields` decompose per owner atom (`X$0.s = 123`).
-/// `EReal` lanes decode to `c ± R` per atom; `ereal_fields` decompose
-/// per owner atom the same way. Everything else keeps the `{...}` set shape.
+/// A `Real`/`EReal` value is a set of lane bits, so `real_fields` rows
+/// (and `real_sigs` sets) gain its real-number or interval reading.
+/// Everything else keeps the `{...}` set shape.
 pub fn instance_alloy_hinted(inst: &Instance, hints: &DisplayHints) -> String {
-    let ereal = decode_ereal(inst);
     let mut out = String::from("relations:");
     for (r, ts) in inst.relation_tuples() {
         let name = inst.pool().name(r);
         let name_s: &str = &name;
-        // Raw `Real.m`/`Real.e`/`EReal.p`/`EReal.k` lane tuples are
-        // unreadable bit sets; the decoded per-atom lines (emitted after
-        // `Real = {...}` / `EReal = {...}`) replace them whenever decoding
-        // succeeds.
-        if ereal.is_some() && is_ereal_lane(name_s) {
-            continue;
-        }
         if ts.arity() == 2 {
             if let Some((owner, field)) = name_s.split_once('.') {
                 if hints.signed_fields.contains(&format!("{owner}.{field}")) {
                     out.push_str(&field_rows_alloy(inst, owner, field, ts));
                     continue;
                 }
-                // Flat bit-set rows first: `EReal`-atom columns never
-                // decode, so reified fields fall through to `ereal_fields`
-                // unchanged, while bit sets gain their reading.
+                // Value rows read their lane-bit set as a real/interval.
                 if let Some(s) = bitset_field_rows(
                     inst,
                     owner,
@@ -629,12 +427,6 @@ pub fn instance_alloy_hinted(inst: &Instance, hints: &DisplayHints) -> String {
                 ) {
                     out.push_str(&s);
                     continue;
-                }
-                if let Some(ref ev) = ereal {
-                    if hints.ereal_fields.contains(&format!("{owner}.{field}")) {
-                        out.push_str(&ereal_field_rows(inst, owner, field, ts, ev));
-                        continue;
-                    }
                 }
             }
         }
@@ -651,19 +443,6 @@ pub fn instance_alloy_hinted(inst: &Instance, hints: &DisplayHints) -> String {
             }
         }
         out.push_str(&line);
-        // Decoded `Real$i`/`EReal$i` lines follow their own atom set.
-        if name_s == "Real" || name_s == "EReal" {
-            if let Some(ref ev) = ereal {
-                for (idx, (_, text)) in ev.iter() {
-                    let atom = atom_name(inst.universe(), *idx);
-                    let is_ereal_atom = atom.starts_with("EReal$");
-                    if (name_s == "EReal") != is_ereal_atom {
-                        continue;
-                    }
-                    out.push_str(&format!("\n {atom} = {text}"));
-                }
-            }
-        }
     }
     out.push_str("\nints:");
     // Builtin ints render as one `Int = {0, 1, ...}` set line like every
@@ -678,27 +457,6 @@ pub fn instance_alloy_hinted(inst: &Instance, hints: &DisplayHints) -> String {
         out.push_str(&format!("\n Int = {{{}}}", nums.join(", ")));
     }
     out
-}
-
-pub fn instance_alloy_signed(inst: &Instance, signed: &HashSet<String>) -> String {
-    instance_alloy_hinted(
-        inst,
-        &DisplayHints {
-            signed_sigs: signed.clone(),
-            signed_fields: HashSet::new(),
-            ereal_fields: HashSet::new(),
-            real_sigs: HashSet::new(),
-            real_fields: HashSet::new(),
-        },
-    )
-}
-
-/// An instance in Alloy style: one `name = expr` line per relation.
-/// Kept for callers without sig info; Signed-aware rendering lives in
-/// `instance_alloy_signed`.
-#[allow(dead_code)]
-pub fn instance_alloy(inst: &Instance) -> String {
-    instance_alloy_signed(inst, &HashSet::new())
 }
 
 #[cfg(test)]
@@ -784,7 +542,7 @@ mod tests {
         let mut ts = TupleSet::new(&u, 2).unwrap();
         ts.insert_index(1);
         inst.add(r, &ts).unwrap();
-        let s = instance_alloy(&inst);
+        let s = instance_alloy_hinted(&inst, &DisplayHints::default());
         assert!(s.contains("A.f = {A$0->B$0}"), "got: {s}");
         assert!(!s.contains("->["), "old bracket style leaked: {s}");
     }
@@ -819,6 +577,10 @@ mod tests {
         assert_eq!(mask_value(&u, &wide), None);
     }
 
+    fn signed() -> HashSet<String> {
+        ["S".to_string()].into_iter().collect()
+    }
+
     #[test]
     fn signed_instance_renders_integer() {
         let u = u8();
@@ -826,11 +588,10 @@ mod tests {
         let r = pool.intern("S", 1);
         let mut inst = Instance::new(&u, &pool);
         inst.add(r, &mask_ts(&u, &[0, 2, 4, 6])).unwrap();
-        let signed: HashSet<String> = ["S".to_string()].into_iter().collect();
-        let s = instance_alloy_signed(&inst, &signed);
+        let s = instance_alloy_hinted(&inst, &DisplayHints { signed_sigs: signed(), ..Default::default() });
         assert!(s.contains("S = 85"), "got: {s}");
         // unnamed relations keep the set shape.
-        let plain = instance_alloy_signed(&inst, &HashSet::new());
+        let plain = instance_alloy_hinted(&inst, &DisplayHints::default());
         assert!(plain.contains("S = {0, 2, 4, 6}"), "got: {plain}");
     }
 
@@ -866,7 +627,6 @@ mod tests {
         inst.add(rel, &ts).unwrap();
         let hints = DisplayHints {
             signed_sigs: HashSet::new(),
-            ereal_fields: HashSet::new(),
             real_sigs: HashSet::new(),
             real_fields: HashSet::new(),
             signed_fields: ["X.s".to_string()].into_iter().collect(),
@@ -887,7 +647,6 @@ mod tests {
         inst.add(rel, &TupleSet::new(&u, 2).unwrap()).unwrap();
         let hints = DisplayHints {
             signed_sigs: HashSet::new(),
-            ereal_fields: HashSet::new(),
             real_sigs: HashSet::new(),
             real_fields: HashSet::new(),
             signed_fields: ["X.s".to_string()].into_iter().collect(),
@@ -922,7 +681,6 @@ mod tests {
         inst.add(rel, &ts).unwrap();
         let hints = DisplayHints {
             signed_sigs: HashSet::new(),
-            ereal_fields: HashSet::new(),
             real_sigs: HashSet::new(),
             real_fields: HashSet::new(),
             signed_fields: ["Y.v".to_string()].into_iter().collect(),
@@ -933,47 +691,34 @@ mod tests {
     }
 
     #[test]
-    fn ereal_decodes_to_interval() {
-        let src = "one sig X { r: one EReal }\nfact { all x: X | setEReal[x.r, 0.5] }\nrun {} for 1 EReal";
-        let m = alloy_front_rs::parse_module(src).unwrap();
-        let cnf = alloy_front_rs::run(&m, 0).unwrap();
-        let inst = alloy_front_rs::solve(&cnf)
-            .unwrap()
-            .expect("SAT");
-        let hints = DisplayHints {
-            signed_sigs: HashSet::new(),
-            signed_fields: HashSet::new(),
-            ereal_fields: ["X.r".to_string()].into_iter().collect(),
-            real_sigs: HashSet::new(),
-            real_fields: HashSet::new(),
-        };
-        let s = instance_alloy_hinted(&inst, &hints);
+    fn ereal_row_reads_as_an_interval() {
+        // A value is the set of its lane bits, so a holder field row shows
+        // the raw bits and gains the `c ± R` reading. There is no lane
+        // relation left to hide.
+        let src = "one sig X { r: EReal }\nfact { setEReal[X.r, 0.5] }\nrun {}";
+        let inst = solve_first(src);
+        let s = instance_alloy_hinted(&inst, &DisplayHints::default_for_test());
         assert!(!s.contains("Real.m ="), "raw lanes leaked: {s}");
-        assert!(!s.contains("Real.e ="), "raw lanes leaked: {s}");
         assert!(!s.contains("EReal.p ="), "raw lanes leaked: {s}");
-        assert!(!s.contains("EReal.k ="), "raw lanes leaked: {s}");
-        // `$M`/`$E`/`$P`/`$K` are public builtin sigs, as are the
-        // exact `Real`/`EReal` domains: their atoms may only appear
-        // inside their own lines, never in lane tuples.
         assert!(
-            s.lines()
-                .filter(|l| {
-                    let t = l.trim_start();
-                    !(t.starts_with("$M")
-                        || t.starts_with("$E")
-                        || t.starts_with("$P")
-                        || t.starts_with("$K")
-                        || t.starts_with("Real =")
-                        || t.starts_with("EReal ="))
-                })
-                .all(|l| !l.contains("M$")
-                    && !l.contains("E$")
-                    && !l.contains("P$")
-                    && !l.contains("K$")),
-            "raw lane atoms leaked outside $M/$E/$P/$K lines: {s}"
+            s.contains("X$0.r = {M$3,"),
+            "raw bit set missing from the row: {s}"
         );
-        assert!(s.contains("EReal$0 = 0.5"), "got: {s}");
-        assert!(s.contains("X$0.r = 0.5"), "got: {s}");
+        assert!(
+            s.contains("[m=8 e=-1 p=4 k=0]"),
+            "interval reading missing: {s}"
+        );
+    }
+
+    impl DisplayHints {
+        fn default_for_test() -> Self {
+            DisplayHints {
+                signed_sigs: HashSet::new(),
+                signed_fields: HashSet::new(),
+                real_sigs: HashSet::new(),
+                real_fields: HashSet::new(),
+            }
+        }
     }
 
     #[test]
@@ -1049,9 +794,7 @@ mod tests {
     #[test]
     fn flat_bitset_ereal_interval() {
         // Sets with p/k bits read as EReal intervals (direct decode).
-        let inst = solve_first(
-            "one sig R1 extends EReal {}\nfact { setEReal[R1, 0.5] }\nrun {} for 2 EReal",
-        );
+        let inst = solve_first("sig R1 in EReal {}\nfact { setEReal[R1, 0.5] }\nrun {}");
         let u = inst.universe();
         let idx = |n: &str| u.index(n).unwrap() as u32;
         // 0.5 is (m=8, e=-1, p=4, k=0): e=-1 needs E$0..E$3 at width 4.

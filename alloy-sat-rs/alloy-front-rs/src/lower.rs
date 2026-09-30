@@ -90,20 +90,45 @@ type BindEntry = (ExprId, u32, SetKind);
 /// Variable environment: name -> (kodkod var, arity, abstract flavor).
 type Env = Vec<(String, kk::VarId, u32, SetKind)>;
 
-/// Builtin numeric lanes: (`owner`, `lane`, `group`) for the `Real`
-/// centre (`Real.m`, `Real.e`) plus the `EReal`-only lanes (`EReal.p`,
-/// `EReal.k`). `EReal` reads its centre through the shared `Real.m`/`Real.e`
-/// (`EReal extends Real`).
-fn builtin_lanes() -> Vec<(&'static str, &'static str, u32)> {
-    crate::bounds::REAL_LANES
-        .iter()
-        .map(|(f, g)| ("Real", *f, *g))
-        .chain(
-            crate::bounds::EREAL_EXTRA_LANES
-                .iter()
-                .map(|(f, g)| ("EReal", *f, *g)),
-        )
-        .collect()
+use crate::bounds::BUILTIN_LANES;
+
+/// A resolved lane read: which group the lane is, and whether a user
+/// field shares the label (in which case the read is ambiguous and must
+/// error rather than silently read 0).
+#[derive(Clone, Copy)]
+struct LaneRead {
+    group: u32,
+    lane: &'static str,
+    ambiguous: bool,
+}
+
+/// Diagnostic for a lane label a user field also uses.
+fn ambiguous_lane_msg(lane: &str) -> String {
+    format!("ambiguous lane `.{}`: a user field shares this label; qualify explicitly", lane)
+}
+
+/// Which builtin value domain an operand belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueRoot {
+    Real,
+    EReal,
+}
+
+/// The base of a join, if the base is a plain name (`S` in `S.x`).
+fn base_name_of(e: &Expr) -> &Expr {
+    match e {
+        Expr::Bin(BinOp::Join, base, _) => base,
+        _ => e,
+    }
+}
+
+impl From<AtomSetSort> for ValueRoot {
+    fn from(sort: AtomSetSort) -> ValueRoot {
+        match sort {
+            AtomSetSort::EReal => ValueRoot::EReal,
+            _ => ValueRoot::Real,
+        }
+    }
 }
 
 /// Relation handles interned once and shared by the query and model-setup
@@ -112,6 +137,7 @@ struct Interned {
     rels: HashMap<String, RelationId>,
     field_arity: HashMap<String, u32>,
     field_int: HashMap<String, SetKind>,
+    field_value: HashMap<String, AtomSetSort>,
     ordering_info: HashMap<String, (RelationId, RelationId)>,
     open_params: HashMap<String, Vec<String>>,
 }
@@ -230,221 +256,22 @@ impl<'m> Lowerer<'m> {
                         }
                     }
                 }
-                // `extends Real`/`extends EReal` partition (Alloy hierarchy
-                // semantics over the shared populations): each extender is a
-                // subset of its parent, siblings are disjoint, and an
-                // *abstract-like* parent is covered by its direct extenders.
-                // Roots: builtin `Real` (with the builtin `EReal` as a
-                // direct child, `EReal extends Real`) plus the transitive
-                // user extenders. Transitive (`A extends B extends EReal`)
-                // handled level by level; `in`-children keep the
-                // subset-only rule above.
-                // `Real` itself is NOT covered (free `Real` values keep
-                // working alongside extenders, like the old non-abstract
-                // `EReal` value sort); `EReal` and abstract user parents
-                // keep coverage (with extenders present they collapse onto
-                // the union — sound now that decimal literals are
-                // constant tuples needing no witness atoms).
+                // User `extends` hierarchies: Alloy partition semantics.
+                // Each extender is a subset of its parent, sibling
+                // extenders are disjoint, and an `abstract` parent is
+                // covered by its direct extenders. Without these, an
+                // abstract parent solves to `{}` and `x in Parent` misses
+                // extender atoms. (`Real`/`EReal` need none of it: they
+                // are flat type domains, not value sorts, and user
+                // `extends Real`/`extends EReal` is rejected — a value is
+                // a set of lane bits, so a junk value atom would read 0.)
                 {
-                    use std::collections::HashSet;
-                    let mut rooted: HashSet<String> = HashSet::new();
-                    rooted.insert("Real".to_string());
-                    let mut kids_of: HashMap<String, Vec<String>> = HashMap::new();
-                    // Builtin edge: `EReal extends Real` (only when the
-                    // `EReal` population is allocated; otherwise `Real`
-                    // has no builtin child).
-                    if ctx.res.ereal_atoms.is_empty() {
-                        // No EReal population: nothing to link.
-                    } else {
-                        kids_of
-                            .entry("Real".to_string())
-                            .or_default()
-                            .push("EReal".to_string());
-                        rooted.insert("EReal".to_string());
-                    }
-                    loop {
-                        let mut grew = false;
-                        for sd in &ctx.module.sigs {
-                            if sd.rel == crate::ast::SigRel::In {
-                                continue;
-                            }
-                            if let Some(p) = &sd.extends {
-                                if rooted.contains(p) {
-                                    for n in &sd.names {
-                                        let e = kids_of.entry(p.clone()).or_default();
-                                        if !e.contains(n) {
-                                            e.push(n.clone());
-                                        }
-                                        if rooted.insert(n.clone()) {
-                                            grew = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if !grew {
-                            break;
-                        }
-                    }
-                    let rel_of = |ctx: &Ctx<'_>, name: &str| {
-                        ctx.lookup_rel(name).ok_or_else(|| {
-                            FrontError::Resolve(format!("unknown sig '{name}'"))
-                        })
-                    };
-                    // `no (A op B)` helper.
-                    let no_some = |arena: &mut kk::AstArena,
-                                   op: kk::BinaryOp,
-                                   a: RelationId,
-                                   b: RelationId| {
-                        let ae = arena.expr_relation(a);
-                        let be = arena.expr_relation(b);
-                        let combined = arena
-                            .binary_expr(op, ae, be)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        let some = arena
-                            .multiplicity_formula(Multiplicity::Some, combined)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        Ok::<_, FrontError>(arena.not(some))
-                    };
-                    let mut parents: Vec<String> = kids_of.keys().cloned().collect();
-                    parents.sort();
-                    for p in &parents {
-                        let kids = &kids_of[p];
-                        let pe = rel_of(ctx, p)?;
-                        // subset: kid in parent
-                        for k in kids {
-                            let ke = rel_of(ctx, k)?;
-                            parts.push(no_some(arena, kk::BinaryOp::Difference, ke, pe)?);
-                        }
-                        // disjoint siblings
-                        for (i, a) in kids.iter().enumerate() {
-                            for b in &kids[..i] {
-                                let ae = rel_of(ctx, a)?;
-                                let be = rel_of(ctx, b)?;
-                                parts.push(no_some(
-                                    arena,
-                                    kk::BinaryOp::Intersection,
-                                    ae,
-                                    be,
-                                )?);
-                            }
-                        }
-                        // coverage: parent in union(kids).
-                        // The builtin `EReal` is abstract like any other
-                        // parent: with extenders present it is covered by
-                        // them, so `one sig R extends EReal` collapses
-                        // `EReal` onto `R`. This is sound now that decimal
-                        // literals are `ERealConstant` tuples needing no
-                        // witness atoms (previously the exemption kept room
-                        // for hoisted `$elit` witnesses). Parents without
-                        // kids never reach this loop, so free `EReal` values
-                        // (`some a: EReal`, `for N EReal`) keep working.
-                        // Subset/disjoint apply everywhere (Java parity).
-                        // Exception: the builtin `Real` root is covered only
-                        // when user extenders exist (abstract `Real`).
-                        // With the builtin `EReal` as the sole child (or
-                        // no children at all), `Real` keeps free values:
-                        // covering would force foreign-population atoms
-                        // into `EReal` (unsound) or empty `Real` against
-                        // a live `EReal` extent (UNSAT everywhere).
-                        if p == "Real"
-                            && !kids.iter().any(|k| k != "EReal")
-                        {
-                            continue;
-                        }
-                        let mut union = {
-                            let first = rel_of(ctx, &kids[0])?;
-                            arena.expr_relation(first)
-                        };
-                        for k in &kids[1..] {
-                            let ke = arena.expr_relation(rel_of(ctx, k)?);
-                            union = arena
-                                .binary_expr(kk::BinaryOp::Union, union, ke)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        }
-                        let pe2 = arena.expr_relation(pe);
-                        let diff = arena
-                            .binary_expr(kk::BinaryOp::Difference, pe2, union)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        let some_diff = arena
-                            .multiplicity_formula(Multiplicity::Some, diff)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        parts.push(arena.not(some_diff));
-                    }
-                    // Sig multiplicities on the shared Real/EReal population are
-                    // cardinality formulas (Java `BoundsComputer`: `one` /
-                    // `some` / `lone` formulas when bounds do not pin);
-                    // exact bounds would pin every shared atom.
-                    let mut shared = crate::bounds::ereal_shared_sigs(ctx.module);
-                    shared.extend(crate::bounds::real_shared_sigs(ctx.module));
-                    for sd in &ctx.module.sigs {
-                        let op = match sd.mult {
-                            crate::ast::SigMult::One => Multiplicity::One,
-                            crate::ast::SigMult::Lone => Multiplicity::Lone,
-                            crate::ast::SigMult::Some => Multiplicity::Some,
-                            _ => continue,
-                        };
-                        for n in &sd.names {
-                            if !shared.contains(n) {
-                                continue;
-                            }
-                            let re = arena.expr_relation(rel_of(ctx, n)?);
-                            parts.push(
-                                arena
-                                    .multiplicity_formula(op, re)
-                                    .map_err(|e| FrontError::Resolve(e.to_string()))?,
-                            );
-                        }
-                    }
-                }
-                // General user `extends` hierarchies (everything the
-                // Real-rooted block above does not own): Alloy partition
-                // semantics. Each extender is a subset of its parent,
-                // sibling extenders are disjoint, and an `abstract`
-                // parent is covered by its direct extenders. Without
-                // these, an abstract parent solves to `{}` and `x in
-                // Parent` misses extender atoms. (Parents rooted at
-                // `Real`/`EReal` stay with the block above, which carries
-                // the value-sort exceptions.)
-                {
-                    use std::collections::HashSet;
-                    // Parents owned by the Real-rooted block: `Real` plus
-                    // the transitive `extends` closure beneath it (mirrors
-                    // that block's `rooted` computation).
-                    let mut real_owned: HashSet<String> = HashSet::new();
-                    real_owned.insert("Real".to_string());
-                    if !ctx.res.ereal_atoms.is_empty() {
-                        real_owned.insert("EReal".to_string());
-                    }
-                    loop {
-                        let mut grew = false;
-                        for sd in &ctx.module.sigs {
-                            if sd.rel != crate::ast::SigRel::Extends {
-                                continue;
-                            }
-                            if let Some(p) = &sd.extends {
-                                if real_owned.contains(p) {
-                                    for n in &sd.names {
-                                        if real_owned.insert(n.clone()) {
-                                            grew = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if !grew {
-                            break;
-                        }
-                    }
                     let mut kids_of: HashMap<String, Vec<String>> = HashMap::new();
                     for sd in &ctx.module.sigs {
                         if sd.rel != crate::ast::SigRel::Extends {
                             continue; // `in`-children: subset-only rule above.
                         }
                         if let Some(p) = &sd.extends {
-                            if real_owned.contains(p) {
-                                continue;
-                            }
                             let e = kids_of.entry(p.clone()).or_default();
                             for n in &sd.names {
                                 if !e.contains(n) {
@@ -453,76 +280,43 @@ impl<'m> Lowerer<'m> {
                             }
                         }
                     }
-                    let rel_of = |ctx: &Ctx<'_>, name: &str| {
-                        ctx.lookup_rel(name).ok_or_else(|| {
-                            FrontError::Resolve(format!("unknown sig '{name}'"))
-                        })
-                    };
-                    // `no (A op B)` helper (same shape as the Real block).
-                    let no_some = |arena: &mut kk::AstArena,
-                                   op: kk::BinaryOp,
-                                   a: RelationId,
-                                   b: RelationId| {
-                        let ae = arena.expr_relation(a);
-                        let be = arena.expr_relation(b);
-                        let combined = arena
-                            .binary_expr(op, ae, be)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        let some = arena
-                            .multiplicity_formula(Multiplicity::Some, combined)
-                            .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                        Ok::<_, FrontError>(arena.not(some))
-                    };
                     let mut parents: Vec<String> = kids_of.keys().cloned().collect();
                     parents.sort();
                     for p in &parents {
-                        let kids = &kids_of[p];
-                        let pe = rel_of(ctx, p)?;
-                        // subset: kid in parent.
-                        for k in kids {
-                            let ke = rel_of(ctx, k)?;
-                            parts.push(no_some(arena, kk::BinaryOp::Difference, ke, pe)?);
-                        }
-                        // disjoint siblings.
-                        for (i, a) in kids.iter().enumerate() {
-                            for b in &kids[..i] {
-                                let ae = rel_of(ctx, a)?;
-                                let be = rel_of(ctx, b)?;
-                                parts.push(no_some(
-                                    arena,
-                                    kk::BinaryOp::Intersection,
-                                    ae,
-                                    be,
-                                )?);
-                            }
-                        }
                         // coverage iff the parent is `abstract`: no
                         // (parent - union(kids)). Non-abstract parents
                         // stay flexible (Java parity).
-                        let abstract_parent = ctx.module.sigs.iter().any(|sd| {
+                        let cover = ctx.module.sigs.iter().any(|sd| {
                             sd.names.iter().any(|n| n == p)
                                 && sd.mult == crate::ast::SigMult::Abstract
                         });
-                        if abstract_parent {
-                            let mut union = {
-                                let first = rel_of(ctx, &kids[0])?;
-                                arena.expr_relation(first)
-                            };
-                            for k in &kids[1..] {
-                                let ke = arena.expr_relation(rel_of(ctx, k)?);
-                                union = arena
-                                    .binary_expr(kk::BinaryOp::Union, union, ke)
-                                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            }
-                            let pe2 = arena.expr_relation(pe);
-                            let diff = arena
-                                .binary_expr(kk::BinaryOp::Difference, pe2, union)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            let some_diff = arena
-                                .multiplicity_formula(Multiplicity::Some, diff)
-                                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                            parts.push(arena.not(some_diff));
-                        }
+                        ctx.emit_partition(arena, &mut parts, p, &kids_of[p], cover)?;
+                    }
+                }
+                // An `in`-sig inherits its parent's atoms, so its `one` /
+                // `lone` / `some` cannot be an exact bound (that would pin
+                // the whole population); they are cardinality formulas, as
+                // in Java's `BoundsComputer`.
+                for sd in &ctx.module.sigs {
+                    if sd.rel != crate::ast::SigRel::In {
+                        continue;
+                    }
+                    let op = match sd.mult {
+                        crate::ast::SigMult::One => Multiplicity::One,
+                        crate::ast::SigMult::Lone => Multiplicity::Lone,
+                        crate::ast::SigMult::Some => Multiplicity::Some,
+                        _ => continue,
+                    };
+                    for n in &sd.names {
+                        let re = arena.expr_relation(
+                            ctx.lookup_rel(n)
+                                .ok_or_else(|| FrontError::Resolve(format!("unknown sig '{n}'")))?,
+                        );
+                        parts.push(
+                            arena
+                                .multiplicity_formula(op, re)
+                                .map_err(|e| FrontError::Resolve(e.to_string()))?,
+                        );
                     }
                 }
                 // AlloyMax `soft fact`s: lowered and wrapped as soft
@@ -731,17 +525,6 @@ impl<'m> Lowerer<'m> {
             rels.insert(name.clone(), r);
         }
         let mut field_arity: HashMap<String, u32> = HashMap::new();
-        // Builtin numeric lanes (binary `owner -> lane-atoms`); unallocated
-        // lanes declare nothing.
-        for (owner, fname, group) in builtin_lanes() {
-            if res.lane_atoms.get(&group).map_or(true, |v| v.is_empty()) {
-                continue;
-            }
-            let key = format!("{owner}.{fname}");
-            let fa = arena.relation(&key, 2);
-            field_arity.insert(key.clone(), 2);
-            rels.insert(key, fa);
-        }
         // Field relations (per owning sig name).
         for sd in &self.module.sigs {
             for owner in &sd.names {
@@ -782,28 +565,28 @@ impl<'m> Lowerer<'m> {
         }
         // Int-flavored fields, plus Int-flavored builtin lanes when allocated.
         let mut field_int: HashMap<String, SetKind> = HashMap::new();
+        let mut field_value: HashMap<String, AtomSetSort> = HashMap::new();
         for sd in &self.module.sigs {
             for owner in &sd.names {
                 for d in &sd.fields {
                     for fname in &d.names {
-                        field_int.insert(
-                            format!("{owner}.{fname}"),
-                            SetKind::from_bool(mentions_int_expr(&d.expr)),
-                        );
+                        let key = format!("{owner}.{fname}");
+                        field_int
+                            .insert(key.clone(), SetKind::from_bool(mentions_int_expr(&d.expr)));
+                        // A holder field over a value domain makes
+                        // `S.x = 3` a value comparison, like `S.x = 3.0`.
+                        if let Some(sort) = value_range_sort(&d.expr) {
+                            field_value.insert(key, sort);
+                        }
                     }
                 }
             }
-        }
-        for (owner, fname, group) in builtin_lanes() {
-            if res.lane_atoms.get(&group).map_or(true, |v| v.is_empty()) {
-                continue;
-            }
-            field_int.insert(format!("{owner}.{fname}"), SetKind::Int);
         }
         Ok(Interned {
             rels,
             field_arity,
             field_int,
+            field_value,
             ordering_info,
             open_params,
         })
@@ -821,19 +604,17 @@ impl<'m> Lowerer<'m> {
             module: self.module,
             res: &res,
             rels: &it.rels,
-            field_arity: &it.field_arity,
             field_int: it.field_int,
+            field_value: it.field_value,
             ordering_info: &it.ordering_info,
             depth: std::cell::Cell::new(0),
             open_params: it.open_params,
             expr_binds: std::cell::RefCell::new(HashMap::new()),
             let_binds: std::cell::RefCell::new(Vec::new()),
-            var_roots: std::cell::RefCell::new(HashMap::new()),
             // Query-only: atom references resolve against the solved Cnf's
             // universe (Java's solve-after `frame.a2k` equivalent).
             allow_atoms: true,
             pin_seq: std::cell::Cell::new(0),
-            rup_memo: std::cell::RefCell::new(HashMap::new()),
             markers: std::cell::RefCell::new(Vec::new()),
             marker_time: std::cell::Cell::new(None),
         };
@@ -899,38 +680,6 @@ impl<'m> Lowerer<'m> {
                     }
                 }
             }
-        }
-        // ------------------------------------------------------------------
-        // Builtin lane relations (binary over the dedicated lane atoms).
-        // FLAT-EXPERIMENT: `Real.m`/`Real.e` range over the `EReal`
-        // population only (its sole remaining reader: `EReal` centres;
-        // `Real` values read through the `x & $M`/`x & $E` partition, so
-        // the old full-closure upper only produced unconstrained-tuple
-        // warnings); `EReal.p`/`EReal.k` likewise. Allocated lazily.
-        for (owner, fname, group) in builtin_lanes() {
-            let lane = res.lane_atoms.get(&group).cloned().unwrap_or_default();
-            // Unallocated lanes bind nothing (no empty shells).
-            if lane.is_empty() {
-                continue;
-            }
-            let key = format!("{owner}.{fname}");
-            let fa = it.rels[&key];
-            let mut ts =
-                alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
-                    .map_err(|e| FrontError::Resolve(e.to_string()))?;
-            let owners: Vec<String> = res.ereal_atoms.clone();
-            for o in &owners {
-                for t in &lane {
-                    let tup = bounds::tuple_of(&res, &[o.clone(), t.clone()])
-                        .map_err(FrontError::Resolve)?;
-                    ts.insert(&tup)
-                        .map_err(|e| FrontError::Resolve(e.to_string()))?;
-                }
-            }
-            let lo = alloy_kodkod_rs::tupleset::TupleSet::new(&res.universe, 2)
-                .map_err(|e| FrontError::Resolve(e.to_string()))?;
-            b.bound(fa, &lo, &ts)
-                .map_err(|e| FrontError::Resolve(e.to_string()))?;
         }
         // `totalOrder[S, S.next]`: pin the binary field relation
         // (i.e. `S<:next`) to the canonical chain
@@ -1041,15 +790,7 @@ impl<'m> Lowerer<'m> {
 
         // Bit-lane exact bounds (lazy like Int): value `v` is the
         // bit position, read with signed-MSB weight via `BitsIn(group)`.
-        for (owner, fname, group) in crate::bounds::REAL_LANES
-            .iter()
-            .map(|(f, g)| ("Real", *f, *g))
-            .chain(
-                crate::bounds::EREAL_EXTRA_LANES
-                    .iter()
-                    .map(|(f, g)| ("EReal", *f, *g)),
-            )
-        {
+        for (_lane, group) in BUILTIN_LANES {
             let lane = res.lane_atoms.get(&group).cloned().unwrap_or_default();
             for (v, name) in lane.iter().enumerate() {
                 let idx = res
@@ -1060,7 +801,7 @@ impl<'m> Lowerer<'m> {
                     .map_err(|e| FrontError::Resolve(e.to_string()))?;
                 ts.insert_index(idx as i64);
                 b.bound_exactly_int_in(group, v as i64, &ts)
-                    .map_err(|e| FrontError::Resolve(format!("{owner}.{fname}: {e}")))?;
+                    .map_err(|e| FrontError::Resolve(format!("{name}: {e}")))?;
             }
         }
 
@@ -1074,19 +815,17 @@ impl<'m> Lowerer<'m> {
             module: self.module,
             res: &res,
             rels: &it.rels,
-            field_arity: &it.field_arity,
             field_int: it.field_int,
+            field_value: it.field_value,
             ordering_info: &it.ordering_info,
             depth: std::cell::Cell::new(0),
             open_params: it.open_params,
             expr_binds: std::cell::RefCell::new(HashMap::new()),
             let_binds: std::cell::RefCell::new(Vec::new()),
-            var_roots: std::cell::RefCell::new(HashMap::new()),
             // Model builds never resolve atom names (Java parity: atoms
             // are solver outputs, not language terms).
             allow_atoms: false,
             pin_seq: std::cell::Cell::new(0),
-            rup_memo: std::cell::RefCell::new(HashMap::new()),
             markers: std::cell::RefCell::new(Vec::new()),
             marker_time: std::cell::Cell::new(None),
         };
@@ -1203,10 +942,7 @@ impl<'m> Lowerer<'m> {
                 }
             }
             Expr::Univ | Expr::None_ | Expr::IntAtom => 1,
-            other => {
-                let _ = other;
-                return self.unsup("complex expression in field declaration");
-            }
+            _ => return self.unsup("complex expression in field declaration"),
         })
     }
 
@@ -1305,8 +1041,6 @@ struct Ctx<'a> {
     module: &'a Module,
     res: &'a Resolved,
     rels: &'a HashMap<String, RelationId>,
-    #[allow(dead_code)]
-    field_arity: &'a HashMap<String, u32>,
     ordering_info: &'a HashMap<String, (RelationId, RelationId)>,
     depth: std::cell::Cell<u32>,
     /// alias -> parameter type names (from `open util/graph[Type] as graph`)
@@ -1317,12 +1051,11 @@ struct Ctx<'a> {
     /// Per-field abstract flavor (key `Owner.field`): `Int` when the
     /// field type mentions `int`/`Int`/`Signed` (bitmask-comparable).
     field_int: HashMap<String, SetKind>,
+    /// Value-typed holder fields (key `Owner.field`): the sort of a field
+    /// declared over `Real`/`EReal`, so a bare integer compares values.
+    field_value: HashMap<String, AtomSetSort>,
     /// let-binding scope: name -> `BindEntry`.
     let_binds: std::cell::RefCell<Vec<HashMap<String, BindEntry>>>,
-    /// FLAT-EXPERIMENT: quantifier/comprehension variable -> declared
-    /// root sig (`Real`/`EReal`/other). Lets `x.m` reads pick the bit
-    /// partition (Real-rooted) or the legacy join (EReal-rooted).
-    var_roots: std::cell::RefCell<HashMap<String, String>>,
     /// Whether universe atom names (`A$0`) resolve as singleton sets.
     /// True only for the `:query` path (solve-after evaluation, mirroring
     /// Java's `frame.a2k`); model text (run/check/eval builds) rejects
@@ -1332,20 +1065,77 @@ struct Ctx<'a> {
     /// A counter (not source positions): one `pin` inside a twice-called
     /// predicate expands twice and must not collide with itself.
     pin_seq: std::cell::Cell<u32>,
-    /// Memoized `realUp`/`realDown` lowerings: `(name, source pos,
-    /// env-var fingerprint, temporal marker)` -> lowered set. The same
-    /// call site is lowered once per lane join (plus once per use);
-    /// sharing one lowering lets the kodkod matrix memo hit instead of
-    /// re-expanding the successor core per lane. Arena-stable: `Ctx`
-    /// (and this map) is fresh per lowering run.
-    rup_memo: std::cell::RefCell<
-        HashMap<(String, usize, Vec<kk::VarId>, Option<TimePoint>), (kk::ExprId, u32)>,
-    >,
     /// Collected in-body `maximize`/`minimize` markers.
     markers: std::cell::RefCell<Vec<OptMarker>>,
     /// Innermost enclosing state-pinning temporal operator for markers
     /// (`initially`/`goal`/`restore`); `None` outside temporal contexts.
     marker_time: std::cell::Cell<Option<TimePoint>>,
+}
+
+impl<'a> Ctx<'a> {
+    /// Emits the Alloy partition constraints for one parent and its direct
+    /// `extends` children: every child is a subset of the parent, siblings
+    /// are disjoint, and — when `cover` holds — the parent is covered by the
+    /// union of its children (which is what makes an `abstract` parent
+    /// non-empty).
+    fn emit_partition(
+        &self,
+        arena: &mut kk::AstArena,
+        parts: &mut Vec<FormulaId>,
+        parent: &str,
+        kids: &[String],
+        cover: bool,
+    ) -> LResult<()> {
+        let rel_of = |name: &str| {
+            self.lookup_rel(name)
+                .ok_or_else(|| FrontError::Resolve(format!("unknown sig '{name}'")))
+        };
+        // `no (A op B)`.
+        let no_some = |arena: &mut kk::AstArena, op: kk::BinaryOp, a: RelationId, b: RelationId| {
+            let ae = arena.expr_relation(a);
+            let be = arena.expr_relation(b);
+            let combined = arena
+                .binary_expr(op, ae, be)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            let some = arena
+                .multiplicity_formula(Multiplicity::Some, combined)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+            Ok::<_, FrontError>(arena.not(some))
+        };
+        let pe = rel_of(parent)?;
+        // subset: kid - parent is empty.
+        for k in kids {
+            parts.push(no_some(arena, kk::BinaryOp::Difference, rel_of(k)?, pe)?);
+        }
+        // disjoint siblings.
+        for (i, a) in kids.iter().enumerate() {
+            for b in &kids[..i] {
+                parts.push(no_some(arena, kk::BinaryOp::Intersection, rel_of(a)?, rel_of(b)?)?);
+            }
+        }
+        if !cover {
+            return Ok(());
+        }
+        let mut union = {
+            let first = rel_of(&kids[0])?;
+            arena.expr_relation(first)
+        };
+        for k in &kids[1..] {
+            let ke = arena.expr_relation(rel_of(k)?);
+            union = arena
+                .binary_expr(kk::BinaryOp::Union, union, ke)
+                .map_err(|e| FrontError::Resolve(e.to_string()))?;
+        }
+        let pe2 = arena.expr_relation(pe);
+        let diff = arena
+            .binary_expr(kk::BinaryOp::Difference, pe2, union)
+            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+        let some_diff = arena
+            .multiplicity_formula(Multiplicity::Some, diff)
+            .map_err(|e| FrontError::Resolve(e.to_string()))?;
+        parts.push(arena.not(some_diff));
+        Ok(())
+    }
 }
 
 impl<'a> Ctx<'a> {
@@ -1563,225 +1353,6 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Hoist `realUp`/`realDown` calls out of transparent expression
-    /// positions: rewrites the occurrence to a fresh `$rhN` variable and
-    /// records `(var, pred, arg)` triples (innermost first) for the
-    /// caller to wrap in `some $vars: Real | succs & rest`. Returns
-    /// `None` when no hoisting applies (no clone). Does NOT descend
-    /// into nested Formula contexts (quantifier/comprehension bodies,
-    /// `if` conditions): those lower per predicate call site anyway,
-    /// and remaining value positions use the comprehension desugar.
-    /// Fresh `$`-names can never collide with user bindings (the lexer
-    /// bans `$`, and `pin_seq` is monotonic process-wide here).
-    fn hoist_real_fun(
-        &self,
-        e: &Expr,
-        out: &mut Vec<(String, String, Expr)>,
-    ) -> Option<Expr> {
-        match e {
-            Expr::Name(..)
-            | Expr::Univ
-            | Expr::None_
-            | Expr::Iden
-            | Expr::IntAtom
-            | Expr::StepAtom
-            | Expr::Bits(..)
-            | Expr::RealLit(..)
-            | Expr::ApproxRealLit(..) => None,
-            Expr::Bin(op, a, b) => {
-                let na = self.hoist_real_fun(a, out);
-                let nb = self.hoist_real_fun(b, out);
-                if na.is_none() && nb.is_none() {
-                    None
-                } else {
-                    Some(Expr::Bin(
-                        *op,
-                        Box::new(na.unwrap_or_else(|| a.as_ref().clone())),
-                        Box::new(nb.unwrap_or_else(|| b.as_ref().clone())),
-                    ))
-                }
-            }
-            Expr::Transpose(x)
-            | Expr::TClosure(x)
-            | Expr::RClosure(x)
-            | Expr::Prime(x)
-            | Expr::AtExpr(x) => {
-                let nx = self.hoist_real_fun(x, out)?;
-                Some(match e {
-                    Expr::Transpose(_) => Expr::Transpose(Box::new(nx)),
-                    Expr::TClosure(_) => Expr::TClosure(Box::new(nx)),
-                    Expr::RClosure(_) => Expr::RClosure(Box::new(nx)),
-                    Expr::Prime(_) => Expr::Prime(Box::new(nx)),
-                    _ => Expr::AtExpr(Box::new(nx)),
-                })
-            }
-            Expr::ArrowMult(m, x) | Expr::LeadMult(m, x) => {
-                let nx = self.hoist_real_fun(x, out)?;
-                Some(match e {
-                    Expr::ArrowMult(..) => Expr::ArrowMult(*m, Box::new(nx)),
-                    _ => Expr::LeadMult(*m, Box::new(nx)),
-                })
-            }
-            Expr::Comprehension(ds, body) => {
-                let mut changed = false;
-                let nds: Vec<Decl> = ds
-                    .iter()
-                    .map(|d| match self.hoist_real_fun(&d.expr, out) {
-                        None => d.clone(),
-                        Some(ne) => {
-                            changed = true;
-                            Decl { expr: ne, ..d.clone() }
-                        }
-                    })
-                    .collect();
-                if changed {
-                    Some(Expr::Comprehension(nds, body.clone()))
-                } else {
-                    None
-                }
-            }
-            Expr::Find(sel, ds, body) => {
-                let mut changed = false;
-                let nds: Vec<Decl> = ds
-                    .iter()
-                    .map(|d| match self.hoist_real_fun(&d.expr, out) {
-                        None => d.clone(),
-                        Some(ne) => {
-                            changed = true;
-                            Decl { expr: ne, ..d.clone() }
-                        }
-                    })
-                    .collect();
-                if changed {
-                    Some(Expr::Find(*sel, nds, body.clone()))
-                } else {
-                    None
-                }
-            }
-            Expr::If(c, t, el) => {
-                let nt = self.hoist_real_fun(t, out);
-                let ne = self.hoist_real_fun(el, out);
-                if nt.is_none() && ne.is_none() {
-                    None
-                } else {
-                    Some(Expr::If(
-                        c.clone(),
-                        Box::new(nt.unwrap_or_else(|| t.as_ref().clone())),
-                        Box::new(ne.unwrap_or_else(|| el.as_ref().clone())),
-                    ))
-                }
-            }
-            Expr::Bracket(base, args) => {
-                let nb = self.hoist_real_fun(base, out);
-                let mut nargs: Vec<Box<Expr>> = Vec::with_capacity(args.len());
-                let mut changed = nb.is_some();
-                for a in args {
-                    match self.hoist_real_fun(a, out) {
-                        None => nargs.push(a.clone()),
-                        Some(na) => {
-                            changed = true;
-                            nargs.push(Box::new(na));
-                        }
-                    }
-                }
-                if changed {
-                    Some(Expr::Bracket(
-                        Box::new(nb.unwrap_or_else(|| base.as_ref().clone())),
-                        nargs,
-                    ))
-                } else {
-                    None
-                }
-            }
-            Expr::LetBind(binds, body) => {
-                let mut changed = false;
-                let nbinds: Vec<(String, Expr)> = binds
-                    .iter()
-                    .map(|(n, ex)| match self.hoist_real_fun(ex, out) {
-                        None => (n.clone(), ex.clone()),
-                        Some(ne) => {
-                            changed = true;
-                            (n.clone(), ne)
-                        }
-                    })
-                    .collect();
-                match self.hoist_real_fun(body, out) {
-                    None if !changed => None,
-                    None => Some(Expr::LetBind(nbinds, body.clone())),
-                    Some(nb) => Some(Expr::LetBind(nbinds, Box::new(nb))),
-                }
-            }
-            Expr::Call(name, cargs, pos) => {
-                let mut nargs = Vec::with_capacity(cargs.len());
-                for a in cargs {
-                    match self.hoist_real_fun(a, out) {
-                        None => nargs.push(a.clone()),
-                        Some(na) => nargs.push(na),
-                    }
-                }
-                if (name == "realUp" || name == "realDown") && nargs.len() == 1 {
-                    let pred = if name == "realUp" { "realSucc" } else { "realPred" };
-                    let n = self.pin_seq.get();
-                    self.pin_seq.set(n + 1);
-                    let v = format!("$rhh{n}");
-                    out.push((v.clone(), pred.to_string(), nargs.pop().unwrap()));
-                    Some(Expr::Name(v, *pos))
-                } else if nargs
-                    .iter()
-                    .zip(cargs.iter())
-                    .any(|(a, b)| a != b)
-                {
-                    Some(Expr::Call(name.clone(), nargs, *pos))
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    /// Hoist wrapper for builtin predicate calls: rewrites `args`,
-    /// lowering `pred[hoisted...]` under `some $vars: Real | succs`.
-    /// Returns `None` when no occurrence applies (caller proceeds
-    /// normally). Recursion terminates (hoisted args are `realUp`-free).
-    fn hoist_real_funs_call(
-        &self,
-        arena: &mut kk::AstArena,
-        name: &str,
-        args: &[Expr],
-        env: &mut Env,
-    ) -> LResult<Option<FormulaId>> {
-        let mut hoists: Vec<(String, String, Expr)> = Vec::new();
-        let mut hoisted: Vec<Expr> = Vec::with_capacity(args.len());
-        for a in args {
-            match self.hoist_real_fun(a, &mut hoists) {
-                None => hoisted.push(a.clone()),
-                Some(na) => hoisted.push(na),
-            }
-        }
-        if hoists.is_empty() {
-            return Ok(None);
-        }
-        let mut decls = Vec::with_capacity(hoists.len());
-        let mut conj = Vec::with_capacity(hoists.len() + 1);
-        for (v, pred, arg) in hoists {
-            decls.push(Decl {
-                disj: false,
-                names: vec![v.clone()],
-                expr: Expr::Name("Real".into(), 0),
-                pos: 0,
-                is_var: false,
-            });
-            conj.push(Formula::Call(pred, vec![Expr::Name(v, 0), arg], 0));
-        }
-        conj.push(Formula::Call(name.to_string(), hoisted, 0));
-        let wrapped = Formula::Quant(
-            QuantKind::Some,
-            decls,
-            Box::new(ereal_and_all(conj)),
-        );
-        Ok(Some(self.lower_formula(arena, &wrapped, env)?))
-    }
-
     /// Try to resolve a builtin `Real` predicate call.
     /// Returns Some(formula) if the name matches (`realAdd` etc.): desugars
     /// to exact-centre constraints over the shared `Real.m`/`Real.e` lanes.
@@ -1794,10 +1365,6 @@ impl<'a> Ctx<'a> {
         args: &[Expr],
         env: &mut Env,
     ) -> LResult<Option<FormulaId>> {
-        // Hoist `realUp`/`realDown` out of value positions (skolem-fast).
-        if let Some(hoisted) = self.hoist_real_funs_call(arena, name, args, env)? {
-            return Ok(Some(hoisted));
-        }
         let body = match name {
             "realAdd" | "realSub" => {
                 if args.len() != 3 {
@@ -2016,7 +1583,7 @@ impl<'a> Ctx<'a> {
                 // input (mirrored for negatives, pinned for zero):
                 // per-scale optima with pairwise extremality, all
                 // division on lane-small non-negatives (see
-                // `real_next_core`). Backs `realUp`/`realDown`.
+                // `real_next_core`), backing `realSucc`/`realPred`.
                 if args.len() != 2 {
                     return Err(FrontError::Resolve(format!("'{name}' expects 2 args")));
                 }
@@ -2128,10 +1695,6 @@ impl<'a> Ctx<'a> {
         // resolve to `ERealConstant` tuples inline (no witness atoms).
         // `erealNeedsRefine` takes an integer goal second, so only its
         // first arg is an operand; `setEReal` keeps its literal second arg.
-        // Hoist `realUp`/`realDown` out of value positions (skolem-fast).
-        if let Some(hoisted) = self.hoist_real_funs_call(arena, name, args, env)? {
-            return Ok(Some(hoisted));
-        }
         let body = match name {
             "erealAdd" | "erealSub" => {
                 if args.len() != 3 {
@@ -2359,18 +1922,14 @@ impl<'a> Ctx<'a> {
                 )));
             }
         }
-        if self.lane_group_ambiguous(e) {
-            return Err(FrontError::Resolve(
-                "ambiguous EReal lane: a user field shares this label; qualify explicitly"
-                    .to_string(),
-            ));
-        }
-        // FLAT-EXPERIMENT: Real-rooted `x.m` reads the partition.
-        if let Some(r) = self.lane_partition_redirect(e) {
-            return Ok(IntExpr::BitsVal(Box::new(r), 0));
-        }
-        if self.lane_group_of(e).is_some() {
-            return Ok(IntExpr::BitsVal(Box::new(e.clone()), 0));
+        if self.lane_read(e).is_some() {
+            let Some((read, part)) = self.lane_partition_read(e) else {
+                return Err(self.sort_lane_error(e));
+            };
+            if read.ambiguous {
+                return Err(FrontError::Resolve(ambiguous_lane_msg(read.lane)));
+            }
+            return Ok(IntExpr::BitsVal(Box::new(part), 0));
         }
         Err(FrontError::Resolve(format!(
             "compose expects an integer literal or lane read for the {lane} lane"
@@ -2997,124 +2556,79 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Abstract flavor of the LAST field of a dotted chain (`a.x` -> `x`):
-    /// Some(kind) when the label resolves to declared fields.
-    /// Bit-lane group of the LAST field of a dotted chain (`a.m` -> `m`):
-    /// Some(group) when the label uniquely resolves to a builtin `EReal`
-    /// lane (`EReal.m` etc.). Labels shared with user fields decline to
-    /// None unless `EReal` is allocated (then the use is genuinely
-    /// ambiguous and the caller must error loudly, never read 0).
-    fn lane_group_of(&self, e: &Expr) -> Option<u32> {
-        let field = trailing_field_name(e)?;
-        // Desugared lanes use the qualified `Real.{lane}` / `EReal.{lane}`
-        // spelling; match on the trailing segment either way.
-        let short = field.rsplit('.').next().unwrap_or(&field);
-        let mut found: Option<u32> = None;
-        let mut count = 0;
-        for key in self.field_int.keys() {
-            if key.rsplit('.').next() == Some(short) {
-                count += 1;
-                // Builtin lanes: `Real.m`/`Real.e` (shared centre) plus
-                // `EReal.p`/`EReal.k`.
-                let group = [
-                    ("Real.m", crate::bounds::LANE_M),
-                    ("Real.e", crate::bounds::LANE_E),
-                    ("EReal.p", crate::bounds::LANE_P),
-                    ("EReal.k", crate::bounds::LANE_K),
-                ]
-                .iter()
-                .find(|(k, _)| key == *k)
-                .map(|(_, g)| *g);
-                if let Some(group) = group {
-                    // Ignore the builtin lane while its group is unallocated:
-                    // a lone user field keeps its legacy reading.
-                    let allocated = self
-                        .res
-                        .lane_atoms
-                        .get(&group)
-                        .is_some_and(|v| !v.is_empty());
-                    if !allocated {
-                        count -= 1;
-                        continue;
-                    }
-                    found = Some(group);
-                }
+    /// A lane read: `x.m` / `a.x.p` and friends. The label must name an
+    /// *allocated* builtin lane and no user field; a label shared with a
+    /// user field is genuinely ambiguous and reported as such (never a
+    /// silent empty read).
+    fn lane_read(&self, e: &Expr) -> Option<LaneRead> {
+        let short = trailing_field_name(e)?.rsplit('.').next()?.to_string();
+        let (group, lane) = BUILTIN_LANES
+            .iter()
+            .find(|(label, _)| *label == short)
+            .map(|(label, group)| (*group, *label))?;
+        if !self
+            .res
+            .lane_atoms
+            .get(&group)
+            .is_some_and(|v| !v.is_empty())
+        {
+            // Lane not allocated: the label is a plain user field.
+            return None;
+        }
+        let user_field = self
+            .field_int
+            .keys()
+            .any(|key| key.rsplit('.').next() == Some(short.as_str()));
+        Some(LaneRead {
+            group,
+            lane,
+            ambiguous: user_field,
+        })
+    }
+
+    /// A lane join `x.m` resolved to its bit-set reading: the lane and
+    /// `x & $LANE`. The base's sort is irrelevant — a value *is* the set
+    /// of its lane bits, so `m` is `x & $M` for a `Real` and an `EReal`
+    /// alike (a `Real` has no `p`/`k` bits, so those read 0).
+    ///
+    /// `None` for anything that is not a lane read *of a value*: a bare
+    /// sort name (`Real.m`) is the whole domain, whose `m` lane is just
+    /// `$M`, and reading it as `-1` instead of rejecting it would be
+    /// silent nonsense.
+    fn lane_partition_read(&self, e: &Expr) -> Option<(LaneRead, Expr)> {
+        let read = self.lane_read(e)?;
+        let base = strip_join_label(e, read.lane)?;
+        if let Expr::Name(n, _) = &base {
+            if is_builtin_domain(n) {
+                return None;
             }
         }
-        if count == 1 { found } else { None }
+        Some((read, flat_partition_read(&base, lane_sig_of(read.lane))))
     }
 
-    /// True when `e`'s trailing label names both an allocated builtin
-    /// (`Real`/`EReal`) lane and a user field: genuinely ambiguous.
-    fn lane_label_ambiguous(&self, e: &Expr) -> bool {
-        let Some(field) = trailing_field_name(e) else {
-            return false;
+    /// Diagnostic for a lane read whose base is a whole builtin domain.
+    fn sort_lane_error(&self, e: &Expr) -> FrontError {
+        let (base, label) = match e {
+            Expr::Bin(BinOp::Join, base, d) => (
+                trailing_field_name(base).unwrap_or_default(),
+                trailing_field_name(d).unwrap_or_default(),
+            ),
+            _ => (String::new(), String::new()),
         };
-        let short = field.rsplit('.').next().unwrap_or(&field);
-        let lane_allocated = [
-            ("m", crate::bounds::LANE_M),
-            ("e", crate::bounds::LANE_E),
-            ("p", crate::bounds::LANE_P),
-            ("k", crate::bounds::LANE_K),
-        ]
-        .iter()
-        .any(|(fname, g)| {
-            *fname == short && self.res.lane_atoms.get(g).is_some_and(|v| !v.is_empty())
-        });
-        lane_allocated
-            && self.field_int.keys().any(|key| {
-                key.rsplit('.').next() == Some(short)
-                    && !key.starts_with("Real.")
-                    && !key.starts_with("EReal.")
-            })
+        FrontError::Resolve(format!(
+            "`{base}.{label}` is the `{label}` lane of the whole `{base}` domain, \
+             not of a value; read a value's lane instead (`x.{label}` on a sig or field, \
+             or `x & ${}`).",
+            label_sig(&label)
+        ))
     }
 
-    /// True when the trailing field label also matches a builtin `EReal`
-    /// lane (allocated) alongside user fields: the lane reading is
-    /// genuinely ambiguous and must error, never silently read 0.
-    fn lane_group_ambiguous(&self, e: &Expr) -> bool {
-        self.lane_label_ambiguous(e)
-    }
-
-    /// FLAT-EXPERIMENT: `x.m` / `x.e` lane reads route to the bit
-/// partition (`x & $M` / `x & $E`) when the base is Real-rooted
-/// (sig-typed or variable-typed, never `EReal`-rooted). Returns the
-/// replacement `Expr`, or `None` for the legacy join reading
-/// (`EReal` control group, `p`/`k` lanes, unresolvable shapes).
-fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
-    let group = self.lane_group_of(e)?;
-    let part = match group {
-        g if g == crate::bounds::LANE_M => "$M",
-        g if g == crate::bounds::LANE_E => "$E",
-        _ => return None,
-    };
-    let Expr::Bin(BinOp::Join, base, _) = e else {
-        return None;
-    };
-    // Root of the base: bound variables consult `var_roots`
-    // (EReal-typed vars keep the legacy join); otherwise the sig
-    // hierarchy decides (`R.m` for `R in Real` redirects).
-    let root: Option<String> = match base.as_ref() {
-        Expr::Name(n, _) => self
-            .var_roots
-            .borrow()
-            .get(n)
-            .cloned()
-            .or_else(|| self.sig_root(n)),
-        _ => None,
-    };
-    match root.as_deref() {
-        Some("Real") => Some(flat_partition_read(base, part)),
-        _ => None,
-    }
-}
 
 /// Lane equality rewritten as integer comparisons: `x.m = 3` means
     /// the lane's bitmask value is 3, and `x.m = y.m` compares values
     /// (relational set equality could never hold across disjoint lane
-    /// namespaces). Returns None for non-lane shapes (legacy reading).
-    /// A label shared with a user field while `EReal` is allocated is a
-    /// hard error (never a silent empty read).
+    /// namespaces). Returns None for non-lane shapes. A label shared
+    /// with a user field is a hard error (never a silent empty read).
     fn rewrite_lane_lit_cmp(
         &self,
         kind: &CmpKind,
@@ -3127,20 +2641,15 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
             _ => return Ok(None),
         };
         for side in [l, r] {
-            if self.lane_label_ambiguous(side) {
-                return Err(FrontError::Resolve(
-                    "ambiguous EReal lane: a user field shares this label; qualify explicitly"
-                        .to_string(),
-                ));
+            if let Some(read) = self.lane_read(side) {
+                if read.ambiguous {
+                    return Err(FrontError::Resolve(ambiguous_lane_msg(read.lane)));
+                }
             }
         }
         let lane_int = |e: &Expr| -> Option<IntExpr> {
-            // FLAT-EXPERIMENT: Real-rooted `x.m` reads the partition.
-            if let Some(r) = self.lane_partition_redirect(e) {
-                return Some(IntExpr::BitsVal(Box::new(r), 0));
-            }
-            self.lane_group_of(e)?;
-            Some(IntExpr::BitsVal(Box::new(e.clone()), 0))
+            let (_, part) = self.lane_partition_read(e)?;
+            Some(IntExpr::BitsVal(Box::new(part), 0))
         };
         // Lane-vs-lane first (values may differ per lane namespace).
         if let (Some(li), Some(ri)) = (lane_int(l), lane_int(r)) {
@@ -3241,12 +2750,35 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 } else {
                     r
                 };
-                if self.lane_group_of(other).is_some() {
+                if self.lane_read(other).is_some() {
                     return Err(FrontError::Resolve(
-                        "type mismatch: decimal literals cannot appear in integer lane position (e.g. `x.m = 3.14`); compare EReal values instead"
+                        "type mismatch: decimal literals cannot appear in integer lane position (e.g. `x.m = 3.14`); compare values instead"
                             .to_string(),
                     ));
                 }
+                // A set of lane bits carries its own sort: `m`+`e` is a
+                // `Real` value, a `p`/`k` bit makes it an `EReal` value,
+                // and a single lane is an *integer* that a decimal
+                // literal cannot be compared with. A lane-bit set is not
+                // an atom, so its lanes read through the partition.
+                let bit_set = match classify_atom_set(other) {
+                    AtomSetSort::Real => None, // `real_set` below already reads that way
+                    AtomSetSort::EReal => Some(ereal_set_reading(
+                        other,
+                        lit,
+                        max_p,
+                        lane_partition_bits,
+                    )?),
+                    AtomSetSort::Signed(_) | AtomSetSort::Mixed => {
+                        return Err(FrontError::Resolve(
+                            "type mismatch: this set holds bits of a single lane, so it is an \
+                             integer; compare it with an integer (`= 3`) or read a whole value \
+                             (`x = 0.5`)"
+                                .to_string(),
+                        ));
+                    }
+                    AtomSetSort::Other => None,
+                };
                 // `EReal`-rooted values keep the legacy `setEReal`
                 // reading (pins `m/e/p/k`); everything else (`Real`
                 // values, quantifier variables, unrecognized shapes)
@@ -3254,23 +2786,26 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 // only — still centre-correct for `EReal` atoms, with
                 // `p`/`k` left free). Plain non-dyadic `Real` literals
                 // are UNSAT (`=`)/true (`!=`); `(d)` binds nearest.
-                let body = if self.expr_is_ereal_rooted(other) {
-                    ereal_set(other, lit, max_p)?
-                } else {
-                    let mw = self.res.mepk_widths.m_width;
-                    let lit_text = match lit {
-                        Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => s.as_str(),
-                        _ => unreachable!(),
-                    };
-                    let is_approx = matches!(lit, Expr::ApproxRealLit(..));
-                    if !is_approx
-                        && decimal_to_real(lit_text, Some(mw)).is_none()
-                        && decimal_to_real_rounded(lit_text, Some(mw), RealRound::Nearest).is_some()
-                    {
-                        // No dyadic centre equals the literal.
-                        return Ok(Some(Formula::Const(neg)));
+                let body = match bit_set {
+                    Some(body) => body,
+                    None if self.expr_is_ereal_rooted(other) => ereal_set(other, lit, max_p)?,
+                    None => {
+                        let mw = self.res.mepk_widths.m_width;
+                        let lit_text = match lit {
+                            Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) => s.as_str(),
+                            _ => unreachable!(),
+                        };
+                        let is_approx = matches!(lit, Expr::ApproxRealLit(..));
+                        if !is_approx
+                            && decimal_to_real(lit_text, Some(mw)).is_none()
+                            && decimal_to_real_rounded(lit_text, Some(mw), RealRound::Nearest)
+                                .is_some()
+                        {
+                            // No dyadic centre equals the literal.
+                            return Ok(Some(Formula::Const(neg)));
+                        }
+                        real_set(other, lit, mw)?
                     }
-                    real_set(other, lit, mw)?
                 };
                 Ok(Some(if neg {
                     Formula::Not(Box::new(body))
@@ -3282,28 +2817,94 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         }
     }
 
-    /// Root builtin of a sig name (`Real`/`EReal`/other) following the
-    /// user `extends` chain. `None` for unknown names (quantifier
-    /// variables carry no sig type here).
+    /// Is this operand a *value* set, so a bare integer beside it reads
+    /// as a value rather than a bitmask? Three shapes qualify: a
+    /// lane-bit set spanning `m`+`e` (or `p`/`k`), a sig under the
+    /// `Real`/`EReal` domain, and a holder field declared over one.
+    /// Everything else — a single lane's bits, a lane read, an
+    /// `Int`/`Signed` set, an ordinary relation — is an integer or a
+    /// plain set and keeps the reading `lower_int_cast` gives it.
+    ///
+    /// This gate has to be syntactic and *closed under the rewrite*:
+    /// the value reading it admits synthesizes lane pins (`x & $M` as an
+    /// integer), which come back through here. Those are differences
+    /// and bitwise ops, never a name or a field join, so rejecting
+    /// everything that is not one of the three shapes ends the recursion
+    /// by construction.
+    fn is_value_set(&self, e: &Expr) -> bool {
+        match classify_atom_set(e) {
+            // A single lane is an integer; a mix is neither.
+            AtomSetSort::Real | AtomSetSort::EReal => return true,
+            AtomSetSort::Signed(_) | AtomSetSort::Mixed | AtomSetSort::Other => {}
+        }
+        if self.lane_read(e).is_some() {
+            return false;
+        }
+        matches!(
+            self.value_root(e),
+            Some(ValueRoot::Real) | Some(ValueRoot::EReal)
+        )
+    }
+
+    /// Which builtin value domain a set-typed operand belongs to, for a
+    /// name, a field join, or a bracket thereof. A `Real`/`EReal` sig
+    /// (including `in`/`extends` children) and a holder field declared
+    /// over one both count; plain user sigs and `Int`/`Signed` sigs do
+    /// not.
+    fn value_root(&self, e: &Expr) -> Option<ValueRoot> {
+        match e {
+            Expr::Name(n, _) => match self.sig_root(n)?.as_str() {
+                "Real" => Some(ValueRoot::Real),
+                "EReal" => Some(ValueRoot::EReal),
+                _ => None,
+            },
+            Expr::Bin(BinOp::Join, _, field) => {
+                // The field's *declared* range decides, since the owner
+                // is usually not itself a value sig. Matching on the bare
+                // field name (as `field_int_flavored` does) keeps a
+                // quantified base working: `o.x` resolves the same as
+                // `S.x`. An `owner.field` hit is preferred when the base
+                // is a plain name, so a same-named field on two owners
+                // with different ranges resolves per owner.
+                let name = trailing_field_name(field)?;
+                if let Expr::Name(base, _) = base_name_of(e) {
+                    if let Some(&sort) = self.field_value.get(&format!("{base}.{name}")) {
+                        return Some(sort.into());
+                    }
+                }
+                let mut found: Option<AtomSetSort> = None;
+                for (key, &sort) in &self.field_value {
+                    if key.rsplit('.').next() == Some(name.as_str()) {
+                        // Same field name on owners with different ranges:
+                        // take the wider one rather than guess low.
+                        found = Some(if found == Some(AtomSetSort::EReal) {
+                            AtomSetSort::EReal
+                        } else {
+                            sort
+                        });
+                    }
+                }
+                found.map(Into::into)
+            }
+            Expr::Bracket(base, _) => self.value_root(base),
+            _ => None,
+        }
+    }
+
+    /// Root of the builtin domain tree a sig name sits under (`Real`,
+    /// `EReal`, or the sig itself), following the parent chain recorded
+    /// in `bounds::resolve`. `None` for names outside it (a quantifier
+    /// variable over a comprehension, a bare field, …).
     fn sig_root(&self, name: &str) -> Option<String> {
-        if name == "Real" {
-            return Some("Real".to_string());
-        }
-        if name == "EReal" {
-            return Some("EReal".to_string());
-        }
         let mut cur = name.to_string();
         loop {
-            let sd = self
-                .module
-                .sigs
-                .iter()
-                .find(|s| s.names.iter().any(|n| n == &cur))?;
-            match &sd.extends {
+            let parent = self.res.sigs.get(&cur)?.parent.clone();
+            match parent {
                 None => return Some(cur),
-                Some(p) if p == "Real" => return Some("Real".to_string()),
-                Some(p) if p == "EReal" => return Some("EReal".to_string()),
-                Some(p) => cur = p.clone(),
+                // `EReal` is an independent builtin now (`Int`/`Signed`
+                // style), so the walk stops there rather than at `Real`.
+                Some(p) if p == "EReal" || p == "Real" => return Some(p),
+                Some(p) => cur = p,
             }
         }
     }
@@ -3312,6 +2913,11 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
     /// `EReal` sig itself, an `extends`-descendant, or a join/bracket
     /// built on one). Used to pick the `setEReal` literal reading.
     fn expr_is_ereal_rooted(&self, e: &Expr) -> bool {
+        // A holder field's *declared* range decides before the owner is
+        // consulted: `S.x` on `x: one EReal` is `EReal`-rooted even
+        // though `S` itself is not. Recursing into the join's left side
+        // alone would read such a field as a `Real` and pin only `m`/`e`,
+        // leaving `p`/`k` free — a silently wrong literal reading.
         match e {
             Expr::Name(n, _) => self.sig_root(n).as_deref() == Some("EReal"),
             Expr::Bin(_, a, _) => self.expr_is_ereal_rooted(a),
@@ -3427,6 +3033,62 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         }
     }
 
+    /// `{M$0, E$0} = 3`: a multi-lane bit set denotes a `Real`/`EReal`
+    /// *value*, and an integer written in a value position is that same
+    /// value without the decimal point. Rewriting the integer as `<v>.0`
+    /// and reusing `real_set`/`ereal_set` makes the two spellings
+    /// identical by construction: mantissa normalization, lane-range
+    /// validation and the error-vs-UNSAT choice are all the decimal
+    /// path's, so `X = 2` and `X = 2.0` cannot drift apart.
+    ///
+    /// Only `=`/`!=` qualify: ordering a *value* against an integer is a
+    /// category error (`realLT` is the ordered comparison). A
+    /// non-literal right-hand side falls through to `lower_int_cast`,
+    /// which reports it.
+    fn fold_atom_set_value_cmp(
+        &self,
+        arena: &mut kk::AstArena,
+        op: IntCmpOp,
+        l: &IntExpr,
+        r: &IntExpr,
+        env: &mut Env,
+    ) -> LResult<Option<FormulaId>> {
+        let neq = match op {
+            IntCmpOp::Eq => false,
+            IntCmpOp::Neq => true,
+            _ => return Ok(None),
+        };
+        // `set = 3` parses as an integer comparison, but when the set is
+        // a *value* the bare integer denotes exactly what the decimal
+        // literal does, so `X = 3` and `X = 3.0` are the same formula by
+        // construction: the literal is synthesized and handed to the
+        // decimal path rather than re-decided here. Both operand orders
+        // are accepted, with the negation re-derived from the order.
+        let (set, v): (&Expr, i64) = match (l, r) {
+            (IntExpr::BitsVal(s, _), IntExpr::Lit(v, _)) => (s, *v),
+            (IntExpr::Lit(v, _), IntExpr::BitsVal(s, _)) => (s, *v),
+            (IntExpr::Val(s, _), IntExpr::Lit(v, _)) => (s, *v),
+            (IntExpr::Lit(v, _), IntExpr::Val(s, _)) => (s, *v),
+            _ => return Ok(None),
+        };
+        // An `Int`/`Signed` set keeps the bitmask reading (`A = 3` on an
+        // `Int` sig is the atom `3`), and a lane read is an integer
+        // (`x.m = 3` pins the lane). Both are handled by
+        // `lower_int_cast`, which reports a genuine mismatch. Everything
+        // that is not a value set keeps that path, which is also what
+        // stops this rewrite from re-entering on its own lane pins.
+        if self.set_int_flavored(set, env).is_int() || !self.is_value_set(set) {
+            return Ok(None);
+        }
+        let lit = Expr::RealLit(format!("{v}.0"), 0);
+        let kind = if neq { CmpKind::Neq } else { CmpKind::Eq };
+        let Some(body) = self.rewrite_ereal_lit_cmp(&kind, set, &lit)? else {
+            return Ok(None);
+        };
+        let fid = self.lower_formula(arena, &body, env)?;
+        Ok(Some(fid))
+    }
+
     /// Single gate for set-typed operands in integer position: checks the
     /// abstract flavor, then lowers and applies the BITS bitmask cast
     /// (lane-scoped `BitsIn` for builtin `EReal` lanes).
@@ -3446,33 +3108,49 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 .cast_to_int(CastToIntOp::BitsIn(group), ee)
                 .map_err(|e| FrontError::Resolve(e.to_string()));
         }
-        // FLAT-EXPERIMENT: Real-rooted `x.m` joins (which the parser
-        // routes here directly via `set_eq_int`, bypassing the `Cmp`
-        // rewrites) read the partition instead of the legacy join.
-        // `EReal`-rooted bases keep the legacy reading (control).
-        if let Some(r) = self.lane_partition_redirect(e) {
-            if let Some(group) = flat_lane_group(&r) {
-                let (ee, _) = self.lower_expr(arena, &r, env)?;
+        // A set of lane bits reads as a *signed integer* of its own lane
+        // (`{M$0, M$1} = 3`, the same reading as `x.m`), so the cast must
+        // name that lane's int-bound group. Group 0 would be wrong in a
+        // way nothing downstream can catch: its int layer holds no lane
+        // atoms, so both the translator and the evaluator would silently
+        // read 0 (`fol::bits_cast` / `eval::bits_of_set`).
+        // A set spanning several lanes denotes a `Real`/`EReal` *value*
+        // instead, which is not an integer: the comparison pre-hook
+        // (`fold_atom_set_value_cmp`) has already handled the literal
+        // cases, so reaching here is a type error.
+        match classify_atom_set(e) {
+            AtomSetSort::Signed(group) => {
+                let (ee, _) = self.lower_expr(arena, e, env)?;
                 return arena
                     .cast_to_int(CastToIntOp::BitsIn(group), ee)
                     .map_err(|e| FrontError::Resolve(e.to_string()));
             }
+            sort @ (AtomSetSort::Real | AtomSetSort::EReal | AtomSetSort::Mixed) => {
+                return Err(FrontError::Resolve(atom_set_sort_error(sort)));
+            }
+            AtomSetSort::Other => {}
+        }
+        // A lane read (`x.m`, `a.x.p`) in integer position. The parser
+        // routes `set = int` here directly via `set_eq_int`, bypassing the
+        // `Cmp` rewrites, so this is the only place that has to catch it.
+        if self.lane_read(e).is_some() {
+            let Some((read, part)) = self.lane_partition_read(e) else {
+                return Err(self.sort_lane_error(e));
+            };
+            if read.ambiguous {
+                return Err(FrontError::Resolve(ambiguous_lane_msg(read.lane)));
+            }
+            let (ee, _) = self.lower_expr(arena, &part, env)?;
+            return arena
+                .cast_to_int(CastToIntOp::BitsIn(read.group), ee)
+                .map_err(|e| FrontError::Resolve(e.to_string()));
         }
         if !self.set_int_flavored(e, env).is_int() {
             return Err(FrontError::Resolve(INT_MISMATCH_MSG.to_string()));
         }
-        if self.lane_group_ambiguous(e) {
-            return Err(FrontError::Resolve(
-                "ambiguous EReal lane: a user field shares this label; qualify explicitly".to_string(),
-            ));
-        }
         let (ee, _) = self.lower_expr(arena, e, env)?;
-        let op = match self.lane_group_of(e) {
-            Some(group) => CastToIntOp::BitsIn(group),
-            None => CastToIntOp::Bits,
-        };
         arena
-            .cast_to_int(op, ee)
+            .cast_to_int(CastToIntOp::Bits, ee)
             .map_err(|e| FrontError::Resolve(e.to_string()))
     }
 
@@ -3721,27 +3399,27 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         let id = arena.unary_expr(op, ex).unwrap();
         Ok((id, ax))
     }
-    /// Function calls: builtin sugars (`realUp`/`realDown`, lane
-    /// bits), ordering/stdlib builtins, relation bracket indexing,
-    /// and user `fun` inlining (with recursion guard).
+    /// Function calls: builtin sugars (lane bits), ordering/stdlib
+    /// builtins, relation bracket indexing, and user `fun` inlining
+    /// (with recursion guard).
     fn lower_expr_call(
         &self,
         arena: &mut kk::AstArena,
         name: &str,
         args: &[Expr],
-        pos: usize,
+        _pos: usize,
         env: &mut Env,
     ) -> LResult<(ExprId, u32)> {
-        // Builtin `Real` successor functions (desugared to a
-        // singleton comprehension over `realSucc`/`realPred`, so
-        // no witness relations are needed and nesting works
-        // through the standard comprehension path).
-        // Decimal literals constant-fold through the oracle
-        // (`ERealConstant` philosophy): the result pins exact
-        // lanes, keeping literal-heavy models trivial. Only
-        // dyadic literals fold (round explicitly first).
-        if name == "realUp" || name == "realDown" {
-            return self.lower_expr_call_real_step(arena, name, args, pos, env);
+        // Removed with the flat value representation: a successor has no
+        // single atom to be returned in (a value is a set of lane bits).
+        // Reject by name rather than let the bracket form re-read as
+        // something else.
+        if matches!(name, "realUp" | "realDown") {
+            return Err(FrontError::Resolve(format!(
+                "`{name}[..]` no longer exists: a `Real` value is a set of lane \
+                 bits, so there is no single atom to hold the result. Use the \
+                 predicate form `realSucc[b, a]` / `realPred[b, a]` on an `in`-sig."
+            )));
         }
         // Bit-position singletons (`mbit[0]` = `{M$0}`): the flat
         // spelling for individual lane bits, so lane sets can be
@@ -3854,115 +3532,6 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         Ok((arena.expr_atoms(vec![idx]), 1))
     }
 
-    /// Builtin `realUp`/`realDown`: decimal literals constant-fold
-    /// through the oracle, anything else desugars to a singleton
-    /// comprehension over `realSucc`/`realPred` (memoized per call site).
-    fn lower_expr_call_real_step(
-        &self,
-        arena: &mut kk::AstArena,
-        name: &str,
-        args: &[Expr],
-        pos: usize,
-        env: &mut Env,
-    ) -> LResult<(ExprId, u32)> {
-        if args.len() != 1 {
-            return Err(FrontError::Resolve(format!("'{name}' expects 1 arg")));
-        }
-        if let Expr::RealLit(s, _) | Expr::ApproxRealLit(s, _) = &args[0] {
-            let approx = matches!(&args[0], Expr::ApproxRealLit(..));
-            let w = &self.res.mepk_widths;
-            let v = if approx {
-                decimal_to_real_rounded(s, Some(w.m_width), RealRound::Nearest).ok_or_else(|| {
-                    FrontError::Resolve(format!(
-                        "cannot convert ({s:?}) to Real (malformed or outside the m lane)"
-                    ))
-                })?
-            } else {
-                decimal_to_real(s, Some(w.m_width)).ok_or_else(|| {
-                    FrontError::Resolve(format!(
-                        "cannot convert {s:?} to Real exactly; round it with setRealNearest first"
-                    ))
-                })?
-            };
-            let nv = if name == "realUp" {
-                alloy_kodkod_rs::real::next_up(&v, w.m_width, w.e_width)
-            } else {
-                alloy_kodkod_rs::real::next_down(&v, w.m_width, w.e_width)
-            }
-            .ok_or_else(|| {
-                FrontError::Resolve(format!(
-                    "'{name}' of {s:?} leaves the lane range"
-                ))
-            })?;
-            let n = self.pin_seq.get();
-            self.pin_seq.set(n + 1);
-            let vnm = format!("$rup{n}");
-            let decl = Decl {
-                disj: false,
-                names: vec![vnm.clone()],
-                expr: Expr::Name("Real".into(), 0),
-                pos: 0,
-                is_var: false,
-            };
-            // Pin the witness lanes to the computed centre.
-            let pin = ereal_and_all(vec![
-                Formula::IntCmp(
-                    IntCmpOp::Eq,
-                    ereal_lane(&Expr::Name(vnm.clone(), 0), "m"),
-                    IntExpr::Lit(nv.m as i64, 0),
-                    0,
-                ),
-                Formula::IntCmp(
-                    IntCmpOp::Eq,
-                    ereal_lane(&Expr::Name(vnm.clone(), 0), "e"),
-                    IntExpr::Lit(nv.e as i64, 0),
-                    0,
-                ),
-            ]);
-            return self.lower_expr(
-                arena,
-                &Expr::Comprehension(vec![decl], Box::new(pin)),
-                env,
-            );
-        }
-        let pred = if name == "realUp" { "realSucc" } else { "realPred" };
-        let n = self.pin_seq.get();
-        self.pin_seq.set(n + 1);
-        let v = format!("$rup{n}");
-        let decl = Decl {
-            disj: false,
-            names: vec![v.clone()],
-            expr: Expr::Name("Real".into(), 0),
-            pos: 0,
-            is_var: false,
-        };
-        let body = Formula::Call(
-            pred.into(),
-            vec![Expr::Name(v, 0), args[0].clone()],
-            0,
-        );
-        // Memoize per call site: the same occurrence is
-        // lowered once per lane join (plus once per use);
-        // sharing one lowering lets the kodkod matrix memo
-        // hit instead of re-expanding the core per lane.
-        let key = (
-            name.to_string(),
-            pos,
-            env.iter().map(|(_, vid, _, _)| *vid).collect::<Vec<_>>(),
-            self.marker_time.get(),
-        );
-        if let Some(hit) = self.rup_memo.borrow().get(&key) {
-            return Ok(*hit);
-        }
-        let out = self.lower_expr(
-            arena,
-            &Expr::Comprehension(vec![decl], Box::new(body)),
-            env,
-        )?;
-        self.rup_memo.borrow_mut().insert(key, out);
-        Ok(out)
-    }
-
     /// Resolves a name through let scopes, quantifier env, expression
     /// bindings, relations (incl. ambiguous-field union), ordering
     /// builtins, zero-arg functions, and atom fallbacks.
@@ -4053,6 +3622,18 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
             let s = self.int_atom_singleton(arena, (w as i64) - 1)?;
             return Ok((s, 1));
         }
+        // Members of the exact builtin domains (`M$0`, `E$1`, `P$2`,
+        // `K$0`, `Step$0`): named constants whose positions the scope
+        // fixes (`for N $M` / `for W Int` / `for N steps`), so they are
+        // compile-time values, not solver outputs. They resolve in model
+        // text exactly like the `Int` atoms below — same exemption,
+        // only the `$` spelling differs. Declarations still cannot
+        // contain `$` (`parser::nod`), so nothing can shadow them.
+        if crate::ast::is_exact_builtin_atom(n) {
+            if let Ok(idx) = self.res.universe.index(n) {
+                return Ok((arena.expr_atoms(vec![idx]), 1));
+            }
+        }
         // Atom literal (`A$0` in `:query`): a universe atom name
         // denotes its singleton set. Declared names win (checked
         // above), so this is strictly a fallback. Positions are
@@ -4101,6 +3682,25 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         b: &Expr,
         env: &mut Env,
     ) -> LResult<(ExprId, u32)> {
+        // A bit lane is an *integer* (`x & $M`), not a relation, so a lane
+        // read has no set meaning. Integer positions were already taken
+        // (`lower_int_cast`) and comparisons rewritten
+        // (`rewrite_lane_lit_cmp`); anything left is a category error,
+        // and lowering it as a join would just fail on the lane label.
+        if *op == BinOp::Join {
+            if let Some(read) =
+                self.lane_read(&Expr::Bin(BinOp::Join, Box::new(a.clone()), Box::new(b.clone())))
+            {
+                return Err(FrontError::Resolve(format!(
+                    "`.{}` reads a bit lane, which is an integer, not a set; \
+                     compare it with an integer (`x.{} = 3`) or read the lane \
+                     bits as a set (`x & ${}`)",
+                    read.lane,
+                    read.lane,
+                    label_sig(read.lane)
+                )));
+            }
+        }
         let (ea, aa) = self.lower_expr(arena, a, env)?;
         let (eb, ab) = self.lower_expr(arena, b, env)?;
         let id = (match op {
@@ -4164,7 +3764,6 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         })
         .map_err(|e| FrontError::Resolve(e.to_string()))?;
         let ar = arena.arity(id);
-        let _ = (aa, ab);
         Ok((id, ar))
     }
 
@@ -4175,17 +3774,8 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         decls: &[Decl],
         env: &mut Env,
     ) -> LResult<(kk::DeclsId, usize)> {
-        if decls.len() > 1 && decls.iter().any(|d| d.disj) {
-            // disj across groups unsupported for now
-        }
         let mut list = Vec::new();
         let mut pushed = 0usize;
-        // FLAT-EXPERIMENT: remember each variable's declared root sig
-        // for lane-read routing (`x.m` -> partition iff Real-rooted).
-        // Removed on exit: all inserts below happen inside this call
-        // (callers pop `env` symmetrically; shadowing restores via
-        // re-insertion on the outer scope's own lowering).
-        let mut added_roots: Vec<String> = Vec::new();
         for d in decls {
             let domain_int = self.set_int_flavored(&d.expr, env);
             // Decimal literals in domain position denote their lane-bit
@@ -4207,11 +3797,6 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 }
                 _ => self.lower_expr(arena, &d.expr, env)?,
             };
-            // Only plain sig names resolve (joins/arrows keep legacy routing).
-            let decl_root = match &d.expr {
-                Expr::Name(n, _) => self.sig_root(n),
-                _ => None,
-            };
             for n in &d.names {
                 let v = arena.variable(n);
                 let da = arena.decl(v, Multiplicity::One, dom).map_err(|e| {
@@ -4222,18 +3807,10 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 })?;
                 list.push(da);
                 env.push((n.clone(), v, arena.variable_arity(v), domain_int));
-                if let Some(ref r) = decl_root {
-                    self.var_roots.borrow_mut().insert(n.clone(), r.clone());
-                    added_roots.push(n.clone());
-                }
                 pushed += 1;
             }
         }
-        let out = arena.add_decls(list);
-        for n in added_roots {
-            self.var_roots.borrow_mut().remove(&n);
-        }
-        Ok((out, pushed))
+        Ok((arena.add_decls(list), pushed))
     }
 
     fn lower_int(&self, arena: &mut kk::AstArena, ie: &IntExpr, env: &mut Env) -> LResult<IntId> {
@@ -4249,9 +3826,9 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 // Lane sets (`x.m`) have no meaningful atom-value sum
                 // (positions, not values); reject loudly instead of
                 // silently reading 0.
-                if self.lane_group_of(e).is_some() {
+                if self.lane_read(e).is_some() {
                     return Err(FrontError::Resolve(
-                        "sum over EReal lanes is unsupported (positions are not values)".to_string(),
+                        "sum over a bit lane is unsupported (positions are not values)".to_string(),
                     ));
                 }
                 let (ee, _) = self.lower_expr(arena, e, env)?;
@@ -4317,7 +3894,7 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         &self,
         arena: &mut kk::AstArena,
         name: &str,
-        pos: usize,
+        _pos: usize,
         env: &mut Env,
     ) -> LResult<FormulaId> {
         let pd = self
@@ -4326,7 +3903,6 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
             .iter()
             .find(|p| p.name == name)
             .ok_or_else(|| FrontError::Resolve(format!("unknown partial '{name}'")))?;
-        let _ = pos;
         // Distinct labels in first-seen order: (prefix, tag, full).
         let mut labels: Vec<(String, String, String)> = Vec::new();
         for e in &pd.entries {
@@ -4424,9 +4000,8 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
         right: &'e Expr,
         op: PartialOp,
         pname: &str,
-        pos: usize,
+        _pos: usize,
     ) -> LResult<PinNorm<'e>> {
-        let _ = pos;
         let lh = expr_has_label(left);
         let rh = expr_has_label(right);
         // Exact-empty: `R = none` (either orientation).
@@ -4593,6 +4168,12 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
             }
             Formula::Cmp(kind, l, r, _) => self.lower_formula_cmp(arena, kind, l, r, env)?,
             Formula::IntCmp(op, l, r, _) => {
+                // A multi-lane bit set compared with an integer is a
+                // value comparison, not a bitmask one (see
+                // `fold_atom_set_value_cmp`).
+                if let Some(f) = self.fold_atom_set_value_cmp(arena, *op, l, r, env)? {
+                    return Ok(f);
+                }
                 let il = self.lower_int(arena, l, env)?;
                 let ir = self.lower_int(arena, r, env)?;
                 let kop = match op {
@@ -4774,9 +4355,6 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                 let name = decls[0].names[0].clone();
                 let alt = format!("{}'", name);
                 let second = subst_formula(body, &name, &alt);
-                // decls for x' reuse same domain
-                let mut ds2 = decls.to_vec();
-                ds2[0].names = vec![alt.clone()];
                 let neq = Formula::Cmp(
                     CmpKind::Neq,
                     Expr::Name(name.clone(), 0),
@@ -4801,7 +4379,6 @@ fn lane_partition_redirect(&self, e: &Expr) -> Option<Expr> {
                     ],
                     Box::new(pair_body),
                 );
-                let _ = ds2;
                 let two_f = self.lower_formula(arena, &two, env)?;
                 let not_two = arena.not(two_f);
                 if *kind == QuantKind::Lone {
@@ -5017,14 +4594,28 @@ fn collect_pin_labels(e: &Expr, out: &mut Vec<(String, String, String)>) -> LRes
     }
 }
 
-/// Textual variable renaming used by lone/one desugaring; stops at
-/// shadowing redeclarations of `from`.
-/// Leaf action for the shared variable-substitution traversal:
-/// either rename `from` to another name, or replace it with an expression.
-/// Also reused by the query-time value enumeration (`snippet.rs`).
+/// Leaf action for the shared variable-substitution traversal: what a
+/// reference to `from` becomes.
+///
+/// The traversal is reused by lone/one desugaring (rename a binder),
+/// name capture (replace it with an expression), and the query-time
+/// value enumeration (`snippet.rs`), where the `{x in D | F}` binder reads
+/// as the candidate *set expression* in set positions and as the candidate
+/// *integer* in integer positions.
 pub(crate) enum NameTarget<'a> {
+    /// Rename the binder (textual substitution).
     Rename(&'a str),
+    /// Replace the binder with an expression.
     Replace(&'a Expr),
+    /// Replace the binder with a find-form candidate: `set` in set
+    /// positions, `int` in integer positions.
+    Value {
+        set: &'a Expr,
+        /// `None` for a candidate with no integer reading (a `Real`
+        /// centre). Integer positions then substitute in set positions
+        /// underneath, so lowering rejects the shape loudly.
+        int: Option<i64>,
+    },
 }
 
 impl<'a> NameTarget<'a> {
@@ -5034,7 +4625,15 @@ impl<'a> NameTarget<'a> {
         }
         match self {
             NameTarget::Rename(to) => Some(Expr::Name((*to).to_string(), pos)),
-            NameTarget::Replace(to) => Some((*to).clone()),
+            NameTarget::Replace(to) | NameTarget::Value { set: to, .. } => Some((*to).clone()),
+        }
+    }
+
+    /// Integer reading of the substituted binder, if this target has one.
+    fn map_int(&self) -> Option<i64> {
+        match self {
+            NameTarget::Value { int, .. } => *int,
+            _ => None,
         }
     }
 }
@@ -5510,7 +5109,11 @@ pub(crate) fn fold_int(i: &IntExpr, from: &str, to: &NameTarget) -> IntExpr {
             Box::new(fold_int(a, from, to)),
             Box::new(fold_int(b, from, to)),
         ),
-        IntExpr::Val(e, p) => IntExpr::Val(Box::new(fold_expr(e, from, to)), *p),
+        // A find-form `Int` binder reads as the integer itself.
+        IntExpr::Val(e, p) => match (to.map_int(), e.as_ref()) {
+            (Some(v), Expr::Name(n, _)) if n == from => IntExpr::Lit(v, *p),
+            _ => IntExpr::Val(Box::new(fold_expr(e, from, to)), *p),
+        },
         IntExpr::SumOf(e, p) => IntExpr::SumOf(Box::new(fold_expr(e, from, to)), *p),
         IntExpr::BitsVal(e, p) => IntExpr::BitsVal(Box::new(fold_expr(e, from, to)), *p),
     }
@@ -5819,16 +5422,19 @@ fn scan_total_order_intexpr(e: &IntExpr, out: &mut Vec<(String, String)>) {
 // Lane reads lower through the lane-scoped `BitsIn` cast. Result centres
 // are window-pinned (see `ereal_add_window`/`ereal_result_normalized`);
 // only an exact-centre rounding encoding is left for the future.
-/// FLAT-EXPERIMENT: bit-partition read (`x & $M` / `x & $E`): the lane's
-/// bitmask value comes from the `$M`/`$E` int-bound group, not group 0.
+/// FLAT-EXPERIMENT: bit-partition read (`x & $M` / `x & $E` / …): the
+/// lane's bitmask value comes from the `$M`/`$E`/`$P`/`$K` int-bound
+/// group, not group 0.
 fn flat_lane_group(e: &Expr) -> Option<u32> {
     if let Expr::Bin(BinOp::Intersect, a, b) = e {
         for side in [a.as_ref(), b.as_ref()] {
             if let Expr::Name(n, _) = side {
-                match n.as_str() {
-                    "$M" => return Some(crate::bounds::LANE_M),
-                    "$E" => return Some(crate::bounds::LANE_E),
-                    _ => {}
+                if let Some(group) = n
+                    .strip_prefix('$')
+                    .and_then(|s| s.chars().next())
+                    .and_then(lane_group_of_prefix)
+                {
+                    return Some(group);
                 }
             }
         }
@@ -5845,29 +5451,218 @@ fn flat_partition_read(base: &Expr, part: &str) -> Expr {
     )
 }
 
-/// Lane read `base.lane` in integer position.
-fn ereal_lane(base: &Expr, lane: &str) -> IntExpr {
-    // Qualified owner: `m`/`e` live in the shared `Real` lanes
-    // (`EReal extends Real`), `p`/`k` in the `EReal`-only lanes.
-    // A bare lane name (`e`, `m`, `p`, `k`) would resolve through the
-    // quantifier environment first, so a user variable named `e` (etc.)
-    // shadows the lane relation and produces a 1+1 join
-    // (`join arity too low`). The qualified key always hits the lane
-    // relation directly (env names never contain `.`).
-    // Lane helpers below normalize the trailing segment, so `EReal.m`
-    // is still recognised as lane `m`.
-    let owner = match lane {
-        "m" | "e" => "Real",
-        _ => "EReal",
+/// The flat lane sig holding a lane label (`m` -> `$M`).
+fn lane_sig_of(lane: &str) -> &'static str {
+    match lane {
+        "m" => "$M",
+        "e" => "$E",
+        "p" => "$P",
+        _ => "$K",
+    }
+}
+
+/// The builtin sig holding a lane label, for diagnostics.
+fn label_sig(lane: &str) -> &'static str {
+    lane_sig_of(lane).trim_start_matches('$')
+}
+
+/// Drop the last segment of a dotted join chain (`a.b.m` -> `a.b`),
+/// accepting either nesting direction: the parser builds `a.b.c` as
+/// `Join(a, Join(b, c))` in some positions and `Join(Join(a, b), c)` in
+/// others, and a lane read may be the tail of either.
+fn strip_join_label(e: &Expr, label: &str) -> Option<Expr> {
+    let Expr::Bin(BinOp::Join, l, r) = e else {
+        return None;
     };
-    IntExpr::BitsVal(
-        Box::new(Expr::Bin(
-            BinOp::Join,
-            Box::new(base.clone()),
-            Box::new(Expr::Name(format!("{owner}.{lane}"), 0)),
-        )),
-        0,
+    if let Expr::Name(n, _) = r.as_ref() {
+        return (n == label).then(|| (**l).clone());
+    }
+    let peeled = strip_join_label(r, label)?;
+    Some(Expr::Bin(BinOp::Join, l.clone(), Box::new(peeled)))
+}
+
+/// The builtin exact domains: reading a *lane* of one of these is a
+/// category error (the whole domain's `m` lane is just `$M`), unlike a
+/// user sig, whose atoms are values and so may carry lanes.
+fn is_builtin_domain(n: &str) -> bool {
+    matches!(n, "Int" | "Signed" | "Step" | "univ" | "none")
+        || crate::bounds::is_lane_sig(n)
+        || n == "Real"
+        || n == "EReal"
+}
+
+/// Lane read of a *bit set* value: `x & $LANE`, through that lane's own
+/// int-bound group. This is the reading `x.m` uses, and the only one
+/// available for a set of lane atoms (which is not an atom, so the
+/// reified lane relations do not apply to it).
+fn lane_partition_bits(x: &Expr, lane: &str) -> IntExpr {
+    IntExpr::BitsVal(Box::new(flat_partition_read(x, lane_sig_of(lane))), 0)
+}
+
+/// Bit-lane group of a lane atom prefix (`M` -> `LANE_M`).
+fn lane_group_of_prefix(p: char) -> Option<u32> {
+    Some(match p {
+        'M' => crate::bounds::LANE_M,
+        'E' => crate::bounds::LANE_E,
+        'P' => crate::bounds::LANE_P,
+        'K' => crate::bounds::LANE_K,
+        _ => return None,
+    })
+}
+
+/// Lane prefix denoted by a `mbit[i]`/`ebit[i]`/`pbit[i]`/`kbit[i]`
+/// singleton call (they name one lane bit position each).
+fn lane_bit_call_prefix(name: &str) -> Option<char> {
+    match name {
+        "mbit" | "ebit" | "pbit" | "kbit" => Some(name.as_bytes()[0].to_ascii_uppercase() as char),
+        _ => None,
+    }
+}
+
+/// What a set of exact-builtin atoms denotes when it appears in integer
+/// position (`{M$0, M$1} = 3`). The answer is the *sort* of the value,
+/// which then decides how the comparison reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomSetSort {
+    /// One lane family: a signed integer in that lane's group, read
+    /// exactly like `x.m` (MSB weighs negative). `{M$0, M$1} = 3`.
+    Signed(u32),
+    /// `m` and `e` only: a `Real` *value* (centre `c = m*2^e`), not an
+    /// integer. `{M$0, E$0} = 2` compares values.
+    Real,
+    /// `p` or `k` present: an `EReal` *value* (`c ± R`), not an integer.
+    EReal,
+    /// Lane atoms mixed with something that is not a lane atom (`{0, M$0}`,
+    /// `{M$0, X}`): neither an integer nor a value.
+    Mixed,
+    /// No lane atom at all (`{0, 1}`): the ordinary bit-vector reading.
+    Other,
+}
+
+/// Classify a set expression by the lane atoms it is built from. `mbit[i]`
+/// style singletons count as the lane atom they name, so the two spellings
+/// of a lane bit set mean the same thing.
+fn classify_atom_set(e: &Expr) -> AtomSetSort {
+    let mut groups: Vec<u32> = Vec::new();
+    let mut other = false;
+    fn walk(e: &Expr, groups: &mut Vec<u32>, other: &mut bool) {
+        match e {
+            Expr::Name(n, _) => match crate::ast::lane_atom_prefix(n) {
+                Some(p) => {
+                    if let Some(g) = lane_group_of_prefix(p) {
+                        groups.push(g);
+                    }
+                }
+                None => *other = true,
+            },
+            Expr::Call(name, args, _) => {
+                let prefix = lane_bit_call_prefix(name)
+                    .filter(|_| args.len() == 1)
+                    .and_then(lane_group_of_prefix);
+                match prefix {
+                    Some(g) => groups.push(g),
+                    None => *other = true,
+                }
+            }
+            // `{a, b}` is a left-nested union; `none` contributes nothing.
+            Expr::Bin(BinOp::Union, a, b) => {
+                walk(a, groups, other);
+                walk(b, groups, other);
+            }
+            Expr::None_ => {}
+            _ => *other = true,
+        }
+    }
+    walk(e, &mut groups, &mut other);
+    if groups.is_empty() {
+        return AtomSetSort::Other;
+    }
+    if other {
+        return AtomSetSort::Mixed;
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    match groups.as_slice() {
+        [one] => AtomSetSort::Signed(*one),
+        [m, e] if *m == crate::bounds::LANE_M && *e == crate::bounds::LANE_E => {
+            AtomSetSort::Real
+        }
+        _ => AtomSetSort::EReal,
+    }
+}
+
+/// Value sort of a declared range (`one EReal`, `set Real`, …): the
+/// widest builtin value domain the type mentions. `None` for ranges
+/// that are not value-typed (`univ`, `Int`, a user sig).
+fn value_range_sort(e: &Expr) -> Option<AtomSetSort> {
+    fn walk(e: &Expr, found: &mut Option<AtomSetSort>) {
+        let leaf = match e {
+            Expr::Name(n, _) if n == "EReal" => Some(AtomSetSort::EReal),
+            Expr::Name(n, _) if n == "Real" => Some(AtomSetSort::Real),
+            _ => None,
+        };
+        if let Some(sort) = leaf {
+            // `EReal` is the wider domain, so it wins over a `Real` also
+            // mentioned in the same range.
+            if *found != Some(AtomSetSort::EReal) {
+                *found = Some(sort);
+            }
+            return;
+        }
+        match e {
+            Expr::Bin(_, a, b) => {
+                walk(a, found);
+                walk(b, found);
+            }
+            Expr::ArrowMult(_, x) | Expr::LeadMult(_, x) => walk(x, found),
+            Expr::Transpose(x)
+            | Expr::TClosure(x)
+            | Expr::RClosure(x)
+            | Expr::Prime(x)
+            | Expr::AtExpr(x) => walk(x, found),
+            Expr::Call(_, args, _) => args.iter().for_each(|a| walk(a, found)),
+            Expr::Bracket(base, args) => {
+                walk(base, found);
+                args.iter().for_each(|a| walk(a, found));
+            }
+            Expr::If(_, t, el) => {
+                walk(t, found);
+                walk(el, found);
+            }
+            _ => {}
+        }
+    }
+    let mut found = None;
+    walk(e, &mut found);
+    found
+}
+
+/// Why a lane-atom set cannot be read as an integer.
+fn atom_set_sort_error(sort: AtomSetSort) -> String {
+    let kind = match sort {
+        AtomSetSort::Real => "a `Real` value (m/e lanes)",
+        AtomSetSort::EReal => "an `EReal` value (m/e/p/k lanes)",
+        AtomSetSort::Mixed => return "a set mixing lane bits with non-lane atoms is neither \
+            an integer nor a value; keep the two kinds apart"
+            .to_string(),
+        AtomSetSort::Other | AtomSetSort::Signed(_) => {
+            unreachable!("non-value sorts have no integer-reading complaint")
+        }
+    };
+    format!(
+        "this set of lane bits denotes {kind}, not an integer; \
+         compare it as a set, or against a decimal literal (e.g. `= 2.0`), \
+         or read one lane at a time (`x.m`, `x & $M`)"
     )
+}
+
+/// Lane read `base.lane` in integer position.
+/// Lane read `base.lane` in integer position: the lane's bit set
+/// (`base & $LANE`) read through that lane's int-bound group. One
+/// reading for both value sorts, since a value *is* the set of its lane
+/// bits — a `Real` simply has no `p`/`k` bits, so its `p`/`k` read 0.
+fn ereal_lane(base: &Expr, lane: &str) -> IntExpr {
+    lane_partition_bits(base, lane)
 }
 
 fn ereal_lit(v: i64) -> IntExpr {
@@ -6690,6 +6485,19 @@ pub(crate) fn centre_lane_indices(
 /// Desugars to four lane equalities; the literal text is never rounded
 /// through `f64`. Out-of-range literals fail loudly at lowering.
 fn ereal_set(x: &Expr, lit: &Expr, max_p: u32) -> LResult<Formula> {
+    ereal_set_reading(x, lit, max_p, ereal_lane)
+}
+
+/// [`ereal_set`] with an explicit lane read. An atom-valued operand reads
+/// the reified lane relations; a *bit set* of lane atoms is not an atom,
+/// so it reads through the partition instead (`x & $M` / …), which is the
+/// same reading `x.m` uses.
+fn ereal_set_reading(
+    x: &Expr,
+    lit: &Expr,
+    max_p: u32,
+    lane: fn(&Expr, &str) -> IntExpr,
+) -> LResult<Formula> {
     let s = decimal_lit_text(lit, "setEReal")?;
     let conv = decimal_to_mepk(&s, max_p).ok_or_else(|| {
         FrontError::Resolve(format!(
@@ -6704,10 +6512,10 @@ fn ereal_set(x: &Expr, lit: &Expr, max_p: u32) -> LResult<Formula> {
         ("k", conv.v.k as i64),
     ];
     let mut parts = Vec::with_capacity(4);
-    for (lane, v) in lanes {
+    for (l, v) in lanes {
         parts.push(Formula::IntCmp(
             IntCmpOp::Eq,
-            ereal_lane(x, lane),
+            lane(x, l),
             IntExpr::Lit(v, 0),
             0,
         ));
@@ -6735,11 +6543,7 @@ enum RealOp<'e> {
 // (`x & $M`), not the `Real.m` join.
 fn real_lane_of(op: &RealOp, lane: &str) -> IntExpr {
     match op {
-        RealOp::Ref(e) => match lane {
-            "m" => IntExpr::BitsVal(Box::new(flat_partition_read(e, "$M")), 0),
-            "e" => IntExpr::BitsVal(Box::new(flat_partition_read(e, "$E")), 0),
-            _ => unreachable!("unknown Real lane {lane}"),
-        },
+        RealOp::Ref(e) => lane_partition_bits(e, lane),
         RealOp::Const(v) => {
             let n = match lane {
                 "m" => v.m as i64,
@@ -6862,17 +6666,10 @@ fn lane_range(w: u32) -> (i64, i64) {
 /// FLAT-EXPERIMENT: pin a `Real` value's lane through the bit
 /// partition (`x & $M`), not the `Real.m` join.
 fn real_pin(x: &Expr, lane: &str, v: i64) -> Formula {
-    let part = match lane {
-        "m" => "$M",
-        "e" => "$E",
-        _ => unreachable!("unknown Real lane {lane}"),
-    };
-    Formula::IntCmp(
-        IntCmpOp::Eq,
-        IntExpr::BitsVal(Box::new(flat_partition_read(x, part)), 0),
-        IntExpr::Lit(v, 0),
-        0,
-    )
+    if !matches!(lane, "m" | "e") {
+        unreachable!("unknown Real lane {lane}");
+    }
+    ereal_icmp(IntCmpOp::Eq, lane_partition_bits(x, lane), ereal_lit(v))
 }
 
 fn real_set(x: &Expr, lit: &Expr, m_width: u32) -> LResult<Formula> {
@@ -7426,23 +7223,20 @@ fn field_mult_constraint(
     ) -> LResult<()> {
         match e {
             Expr::LeadMult(m, inner) => {
-                let end = offset + arity_of_seg(inner, ()) as usize;
+                let end = offset + arity_of_seg(inner) as usize;
                 walk(inner, offset, markers, total_cols)?;
                 markers.push((0, *m, false, end));
                 Ok(())
             }
             Expr::ArrowMult(m, inner) => {
-                let end = offset + arity_of_seg(inner, ()) as usize;
+                let end = offset + arity_of_seg(inner) as usize;
                 walk(inner, offset, markers, total_cols)?;
                 markers.push((offset, *m, true, end));
                 Ok(())
             }
             Expr::Bin(BinOp::Product, a, b) => {
                 walk(a, offset, markers, total_cols)?;
-                let aa = {
-                    res_static();
-                    arity_of_seg(a, ())
-                };
+                let aa = arity_of_seg(a);
                 walk(b, offset + aa as usize, markers, total_cols)?;
                 Ok(())
             }
@@ -7468,14 +7262,13 @@ fn field_mult_constraint(
             )),
         }
     }
-    fn arity_of_seg(e: &Expr, _r: ()) -> u32 {
+    fn arity_of_seg(e: &Expr) -> u32 {
         match e {
-            Expr::ArrowMult(_, i) | Expr::LeadMult(_, i) => arity_of_seg(i, ()),
-            Expr::Bin(BinOp::Product, a, b) => arity_of_seg(a, ()) + arity_of_seg(b, ()),
+            Expr::ArrowMult(_, i) | Expr::LeadMult(_, i) => arity_of_seg(i),
+            Expr::Bin(BinOp::Product, a, b) => arity_of_seg(a) + arity_of_seg(b),
             _ => 1,
         }
     }
-    fn res_static() {}
 
     let mut markers: Vec<(usize, crate::ast::Mult3, bool, usize)> = Vec::new();
     let mut ncols = 0usize;

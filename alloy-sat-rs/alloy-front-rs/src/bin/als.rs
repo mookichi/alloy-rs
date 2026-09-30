@@ -10,7 +10,8 @@ use alloy_front_rs::{
     CnfKind, CommandKind, Instance, Module, Scope,
 };
 
-/// Print a solved instance with EReal decoding.
+/// Print a solved instance, with Real/EReal values read as
+/// real numbers / error intervals.
 fn print_solution(inst: &Instance) {
     println!("    {}", format_instance(inst));
 }
@@ -514,7 +515,7 @@ mod tests {
 
     #[test]
     fn eval_inherits_command_scope() {
-        let src = "one sig x extends EReal {} run for 10 int";
+        let src = "sig x in EReal {} run for 10 int";
         let module = parse_module(src).expect("parse");
         assert_eq!(module.commands.len(), 1);
         let eval_src = format!("{src}\nrun {{ x }}");
