@@ -92,10 +92,6 @@ impl Cnf {
         self.kind == CnfKind::Check
     }
 
-    pub fn num_clauses(&self) -> usize {
-        self.clauses.len()
-    }
-
     /// One-line summary for REPL display.
     pub fn summary(&self) -> String {
         if self.is_temporal {

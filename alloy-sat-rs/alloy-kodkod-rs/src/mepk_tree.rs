@@ -194,10 +194,8 @@ fn leaf_round(num: i128, den: i128, p: u32) -> Option<Mepk> {
         return None;
     }
     let m = if neg { -(m0 as i128) } else { m0 as i128 };
-    let lsb = e.checked_sub(p as i32)?.checked_add(1)?;
-    // Reuse the oracle rounding path shape: centre `(m, e')` with
-    // `e' = lsb + p − 1 = e`. (Direct construction; identical result.)
-    let _ = lsb;
+    // The oracle's rounding path would compute `lsb = e - p + 1` and rebuild
+    // the centre as `(m, lsb + p - 1)`, i.e. exactly `e`. Construct directly.
     Mepk::new(m, e, p, 0)
 }
 

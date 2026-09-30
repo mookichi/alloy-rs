@@ -81,7 +81,7 @@ pub fn run_cegis(synth: &Cnf, verify: &Cnf, cfg: &CegisConfig) -> Result<CegisRe
         ));
     }
     // Resolve holes in the synthesizer (names, never cross-session ids).
-    let mut hole_ids: Vec<(String, RelationId)> = Vec::new();
+    let mut hole_ids: Vec<RelationId> = Vec::new();
     for h in &cfg.holes {
         let r = find_relation(&synth.bounds, h)
             .ok_or_else(|| FrontError::Resolve(format!("synth has no relation `{h}`")))?;
@@ -90,7 +90,7 @@ pub fn run_cegis(synth: &Cnf, verify: &Cnf, cfg: &CegisConfig) -> Result<CegisRe
                 "hole `{h}` is a skolem witness (cannot pin)"
             )));
         }
-        hole_ids.push((h.clone(), r));
+        hole_ids.push(r);
     }
 
     let mut synth_s = IncrementalSession::open(synth)?;
@@ -118,7 +118,7 @@ pub fn run_cegis(synth: &Cnf, verify: &Cnf, cfg: &CegisConfig) -> Result<CegisRe
         // file-backed path (`verifier_pin_from_partial`) shares one checked
         // implementation with the live path (same name/arity/universe/upper
         // checks as the former inline hole loop).
-        let hole_names: Vec<&str> = hole_ids.iter().map(|(h, _)| h.as_str()).collect();
+        let hole_names: Vec<&str> = cfg.holes.iter().map(String::as_str).collect();
         let partial = PartialInstance::extract(&candidate, Some(&hole_names))?;
         let assumes = verifier_pin_from_partial(&ver_s, &partial, &hole_names)?;
 
@@ -133,9 +133,11 @@ pub fn run_cegis(synth: &Cnf, verify: &Cnf, cfg: &CegisConfig) -> Result<CegisRe
             }
             // Counterexample: exclude this hole projection from synth.
             Some(_) => {
-                let mut block = block_of(&synth_s, &hole_ids, &candidate);
+                // Restrict the block to the hole relations; if the
+                // projection is vacuous, fall back to the whole model.
+                let mut block = synth_s.block_clause(&candidate, Some(&hole_ids));
                 if block.is_empty() && cfg.full_block_fallback {
-                    block = block_of_all(&synth_s, &candidate);
+                    block = synth_s.block_clause(&candidate, None);
                 }
                 if block.is_empty() {
                     return Ok(report(CegisOutcome::Timeout { iters }, &synth_s, &ver_s));
@@ -144,41 +146,6 @@ pub fn run_cegis(synth: &Cnf, verify: &Cnf, cfg: &CegisConfig) -> Result<CegisRe
             }
         }
     }
-}
-
-/// Blocking clause negating `candidate` restricted to `holes`.
-fn block_of(
-    sess: &IncrementalSession,
-    holes: &[(String, RelationId)],
-    candidate: &Instance,
-) -> Vec<i64> {
-    let mut block = Vec::new();
-    for o in sess.origins() {
-        if !holes.iter().any(|(_, r)| *r == o.relation) {
-            continue;
-        }
-        let present = candidate
-            .tuples(o.relation)
-            .map(|t| t.contains_index(o.tuple_index))
-            .unwrap_or(false);
-        let lit = o.slot as i64;
-        block.push(if present { -lit } else { lit });
-    }
-    block
-}
-
-/// Full-model blocking clause (fallback when the projection is vacuous).
-fn block_of_all(sess: &IncrementalSession, candidate: &Instance) -> Vec<i64> {
-    let mut block = Vec::new();
-    for o in sess.origins() {
-        let present = candidate
-            .tuples(o.relation)
-            .map(|t| t.contains_index(o.tuple_index))
-            .unwrap_or(false);
-        let lit = o.slot as i64;
-        block.push(if present { -lit } else { lit });
-    }
-    block
 }
 
 #[cfg(test)]

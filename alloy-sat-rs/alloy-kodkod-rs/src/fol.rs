@@ -704,7 +704,6 @@ impl<'a> FolTranslator<'a> {
                 match op {
                     CastToIntOp::Cardinality => {
                         let mut acc = IntCircuit::constant(0, bw, &self.ctx);
-                        let one = IntCircuit::constant(1, bw, &self.ctx);
                         for (_, cell) in m.iter() {
                             let term_bits = vec![cell];
                             let mut term = IntCircuit::from_bits(term_bits, &self.ctx);
@@ -716,7 +715,6 @@ impl<'a> FolTranslator<'a> {
                             // detected like any other relation-derived op.
                             acc = acc.add(&term.with_taint(true), bw);
                         }
-                        let _ = &one;
                         // Relation-derived: tainted (overflow-prohibited).
                         acc.with_taint(true)
                     }

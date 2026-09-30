@@ -72,11 +72,10 @@ pub fn round_to_precision_raw(raw: i128, raw_lsb: i32, p: u32) -> Option<(i128, 
         let m = if neg { -(m_mag as i128) } else { m_mag as i128 };
         return Some((m, e_base));
     }
+    // `1 <= drop <= 127`: `bl <= 128` (|raw| <= 2^127) and `p >= 1`.
     let drop = bl - p;
-    // `drop >= 1` here; `drop - 1 < 127` since `bl <= 128` and `p >= 1`.
     let kept = mag >> drop;
-    let rest_mask = if drop >= 128 { u128::MAX } else { (1u128 << drop) - 1 };
-    let rest = mag & rest_mask;
+    let rest = mag & ((1u128 << drop) - 1);
     let half = 1u128 << (drop - 1);
     let mut kept = kept;
     let mut e = e_base;

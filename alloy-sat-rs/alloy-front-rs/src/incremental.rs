@@ -91,8 +91,6 @@ pub struct IncrementalSession<S = IpasirSolver> {
     solver: S,
     bounds: Bounds,
     origins: Vec<alloy_kodkod_rs::fol::VarOrigin>,
-    num_primary: usize,
-    last_sat: Option<bool>,
     last_instance: Option<Instance>,
     stats: SessionStats,
 }
@@ -114,8 +112,6 @@ impl<S: SatSolver> IncrementalSession<S> {
             solver,
             bounds: cnf.bounds.clone(),
             origins: cnf.origins.clone(),
-            num_primary: cnf.num_vars,
-            last_sat: None,
             last_instance: None,
             stats: SessionStats::default(),
         })
@@ -136,12 +132,10 @@ impl<S: SatSolver> IncrementalSession<S> {
                 SatSolver::value_of(&self.solver, slot as i64)
             })
             .map_err(FrontError::Solve)?;
-            self.last_sat = Some(true);
             self.last_instance = Some(inst.clone());
             self.stats.sat += 1;
             Ok(Some(inst))
         } else {
-            self.last_sat = Some(false);
             self.last_instance = None;
             self.stats.unsat += 1;
             Ok(None)
@@ -417,11 +411,10 @@ impl<S: SatSolver> IncrementalSession<S> {
         }
     }
 
-    fn block_instance_filtered(
-        &mut self,
-        inst: &Instance,
-        relations: Option<&[RelationId]>,
-    ) -> Result<bool, FrontError> {
+    /// The clause that forbids `inst` on `relations` (all relations when
+    /// `None`): each origin literal negated iff the candidate contains that
+    /// tuple. Empty when no origin is in scope.
+    pub fn block_clause(&self, inst: &Instance, relations: Option<&[RelationId]>) -> Vec<i64> {
         let mut clause = Vec::new();
         for o in &self.origins {
             if let Some(rs) = relations {
@@ -436,6 +429,16 @@ impl<S: SatSolver> IncrementalSession<S> {
             let lit = o.slot as i64;
             clause.push(if present { -lit } else { lit });
         }
+        clause
+    }
+
+    /// Adds [`Self::block_clause`] as a unit clause.
+    fn block_instance_filtered(
+        &mut self,
+        inst: &Instance,
+        relations: Option<&[RelationId]>,
+    ) -> Result<bool, FrontError> {
+        let clause = self.block_clause(inst, relations);
         if clause.is_empty() {
             return Ok(false);
         }
@@ -489,16 +492,6 @@ impl<S: SatSolver> IncrementalSession<S> {
     /// Frozen slot origins.
     pub fn origins(&self) -> &[alloy_kodkod_rs::fol::VarOrigin] {
         &self.origins
-    }
-
-    /// Number of primary SAT variables loaded at `open`.
-    pub fn num_primary(&self) -> usize {
-        self.num_primary
-    }
-
-    /// Last solve outcome, if any.
-    pub fn last_sat(&self) -> Option<bool> {
-        self.last_sat
     }
 
     /// Measurement counters.

@@ -895,6 +895,23 @@ impl AstArena {
         self.compose_formula(FormulaBinOp::And, formulas)
     }
 
+    /// The top-level conjuncts of `f`: flattens nested `AND` nodes, left to
+    /// right, and leaves every other node as one conjunct.
+    pub fn conjuncts(&self, f: FormulaId) -> Vec<FormulaId> {
+        let mut out = Vec::new();
+        let mut stack = vec![f];
+        while let Some(cur) = stack.pop() {
+            match self.formula(cur) {
+                FormulaNode::Nary {
+                    op: FormulaBinOp::And,
+                    children,
+                } => stack.extend(children.iter().rev().copied()),
+                _ => out.push(cur),
+            }
+        }
+        out
+    }
+
     pub fn or(&mut self, formulas: &[FormulaId]) -> FormulaId {
         self.compose_formula(FormulaBinOp::Or, formulas)
     }

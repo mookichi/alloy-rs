@@ -151,16 +151,6 @@ impl Objective {
         Objective::Collected
     }
 
-    /// Builds a maximization objective from Pardinus target weights.
-    pub fn max_from_pardinus(pb: &crate::pardinus::PardinusBounds) -> Objective {
-        Objective::max_weighted(pb.weights().clone())
-    }
-
-    /// Builds a minimization objective from Pardinus target weights.
-    pub fn min_from_pardinus(pb: &crate::pardinus::PardinusBounds) -> Objective {
-        Objective::min_weighted(pb.weights().clone())
-    }
-
     fn sense(&self) -> OptSense {
         match self {
             Objective::Int { sense, .. } => *sense,

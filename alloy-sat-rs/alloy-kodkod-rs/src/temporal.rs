@@ -111,11 +111,6 @@ impl TemporalExpansion {
 }
 
 impl TemporalExpansion {
-    /// flat index of state atom `Time{i}_{j}`
-    pub fn state_index(&self, i: usize, j: usize) -> i64 {
-        (self.base + j * self.steps + i) as i64
-    }
-
     pub fn state_atom_name(i: usize, j: usize) -> String {
         if j == 0 {
             format!("{STATE_ATOM}{STATE_SEP}{i}")
@@ -1525,7 +1520,6 @@ pub fn extract_temporal_instance(
                     return Err(TemporalError::BadTraceLength);
                 }
             }
-            let _ = chosen;
         } else if r == exp.ids.prefix
             || r == exp.ids.first
             || r == exp.ids.last
@@ -1616,41 +1610,7 @@ impl<'a> TemporalEval<'a> {
         l: i64,
         r: i64,
     ) -> Result<i64, EvalError> {
-        // Mirror the `Evaluator` readout: exact i128 math, wrapped to the
-        // node's static width (`Shl`) or i64-checked (`Add`/`Sub`).
-        Ok(match op {
-            crate::ast::WidenOp::Add => crate::eval::wrap_int(
-                (l as i128) + (r as i128),
-                self.bitwidth,
-                &self.overflow,
-            ),
-            crate::ast::WidenOp::Sub => crate::eval::wrap_int(
-                (l as i128) - (r as i128),
-                self.bitwidth,
-                &self.overflow,
-            ),
-            crate::ast::WidenOp::Mul => crate::eval::wrap_int(
-                (l as i128) * (r as i128),
-                self.bitwidth,
-                &self.overflow,
-            ),
-            crate::ast::WidenOp::Shl(width) => {
-                let v = if !(0..=60).contains(&r) {
-                    0i128
-                } else {
-                    (l as i128) << (r as u32)
-                };
-                crate::eval::wrap_int(v, width, &self.overflow)
-            }
-            crate::ast::WidenOp::ShlConst(k) => {
-                let v = (l as i128).checked_shl(k).unwrap_or(if l >= 0 {
-                    i128::MAX
-                } else {
-                    i128::MIN
-                });
-                crate::eval::wrap_int(v, 64, &self.overflow)
-            }
-        })
+        Ok(crate::eval::apply_widenop(op, l, r, self.bitwidth, &self.overflow))
     }
 
     fn horizon(&self) -> usize {
@@ -1995,8 +1955,6 @@ impl<'a> TemporalEval<'a> {
                         .map(|d| arena.variable_arity(d.variable) as usize)
                         .sum()
                 });
-                let n = self.ti.len();
-                let _ = n;
                 let uni = self.ti.states()[0].universe().clone();
                 let mut out =
                     TupleSet::new(&uni, arity as u32).map_err(|_| EvalError::UnboundVariable)?;

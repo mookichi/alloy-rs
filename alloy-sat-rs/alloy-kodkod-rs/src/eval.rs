@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use crate::ast::{
     AstArena, BinaryOp, CastToIntOp, ConstantExpr, ExprId, FormulaId, IntBinOp, IntCompOp, IntId,
-    IntNode, Multiplicity, Quantifier, VarId,
+    IntNode, Multiplicity, Quantifier, VarId, WidenOp,
 };
 use crate::instance::Instance;
 use crate::intset::{Int, IntSet};
@@ -77,6 +77,34 @@ pub fn apply_int_binop(
         IntBinOp::Min => wrap((l as i128).min(r as i128)),
         IntBinOp::Max => wrap((l as i128).max(r as i128)),
     })
+}
+
+/// Readout for a `WidenOp` node: exact `i128` math wrapped to the node's
+/// static width (`Shl`) or to `bitwidth` (the widening ops, and
+/// `ShlConst`, which is always 64-bit). `TemporalEval` delegates here for
+/// the same reason as [`apply_int_binop`].
+pub fn apply_widenop(op: WidenOp, l: i64, r: i64, bitwidth: u32, overflow: &Cell<bool>) -> i64 {
+    let wrap = |v: i128| wrap_int(v, bitwidth, overflow);
+    match op {
+        WidenOp::Add => wrap(l as i128 + r as i128),
+        WidenOp::Sub => wrap(l as i128 - r as i128),
+        WidenOp::Mul => wrap(l as i128 * r as i128),
+        WidenOp::Shl(width) => {
+            // Oversized shifts saturate to 0 (low bits are all zero).
+            let v = if !(0..=60).contains(&r) {
+                0i128
+            } else {
+                (l as i128) << (r as u32)
+            };
+            wrap_int(v, width, overflow)
+        }
+        WidenOp::ShlConst(k) => {
+            let v = (l as i128)
+                .checked_shl(k)
+                .unwrap_or(if l >= 0 { i128::MAX } else { i128::MIN });
+            wrap_int(v, 64, overflow)
+        }
+    }
 }
 
 /// Wrap an exact integer value to `bitwidth` two's-complement,
@@ -486,33 +514,7 @@ impl<'a> Evaluator<'a> {
             IntNode::Widen { op, left, right } => {
                 let l = self.int_value(arena, left, env)?;
                 let r = self.int_value(arena, right, env)?;
-                Ok(match op {
-                    crate::ast::WidenOp::Add => {
-                        self.wrap((l as i128) + (r as i128))
-                    }
-                    crate::ast::WidenOp::Sub => {
-                        self.wrap((l as i128) - (r as i128))
-                    }
-                    crate::ast::WidenOp::Mul => {
-                        self.wrap((l as i128) * (r as i128))
-                    }
-                    crate::ast::WidenOp::Shl(width) => {
-                        let v = if !(0..=60).contains(&r) {
-                            0i128
-                        } else {
-                            (l as i128) << (r as u32)
-                        };
-                        wrap_int(v, width, &self.overflow)
-                    }
-                    crate::ast::WidenOp::ShlConst(k) => {
-                        let v = (l as i128).checked_shl(k).unwrap_or(if l >= 0 {
-                            i128::MAX
-                        } else {
-                            i128::MIN
-                        });
-                        wrap_int(v, 64, &self.overflow)
-                    }
-                })
+                Ok(apply_widenop(op, l, r, self.bitwidth, &self.overflow))
             }
             IntNode::If { cond, then, els } => {
                 if self.formula_bool(arena, cond, env)? {

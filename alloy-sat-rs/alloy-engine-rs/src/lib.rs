@@ -35,7 +35,6 @@ use alloy_kodkod_rs::ast::*;
 use alloy_kodkod_rs::bounds::Bounds;
 use alloy_kodkod_rs::relation::RelationPool;
 use alloy_kodkod_rs::solver::{Solver, SolverOptions};
-use alloy_kodkod_rs::tuple::Tuple;
 use alloy_kodkod_rs::tupleset::TupleSet;
 use alloy_kodkod_rs::universe::Universe;
 
@@ -146,10 +145,6 @@ impl Writer {
     fn bytes(&mut self, b: &[u8]) {
         self.0.extend_from_slice(b);
     }
-    #[allow(dead_code)]
-    fn u8(&mut self, v: u8) {
-        self.0.push(v);
-    }
     fn str16(&mut self, s: &str) {
         let b = s.as_bytes();
         assert!(b.len() <= u16::MAX as usize, "string too long");
@@ -193,9 +188,6 @@ impl<'a> Reader<'a> {
     }
     fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
-    }
-    fn bytes(&mut self, n: usize) -> Result<&'a [u8], String> {
-        self.take(n)
     }
     fn str16(&mut self) -> Result<String, String> {
         let len = u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as usize;
@@ -263,7 +255,7 @@ fn op_err(tag: &'static str, got: u8) -> String {
 /// Decode a wire-format problem buffer (ARE1 or ARE2).
 pub fn decode_problem(input: &[u8]) -> Result<Problem, String> {
     let mut r = Reader::new(input);
-    let magic_bytes = r.bytes(4)?;
+    let magic_bytes = r.take(4)?;
     let is_v2 = match magic_bytes {
         m if m == PROBLEM_MAGIC => false,
         m if m == PROBLEM_MAGIC_V2 => true,
@@ -909,6 +901,3 @@ fn err_answer(msg: &str) -> Vec<u8> {
 pub fn error_answer_public(msg: &str) -> Vec<u8> {
     err_answer(msg)
 }
-
-#[allow(dead_code)]
-fn unused(_: &Tuple) {}

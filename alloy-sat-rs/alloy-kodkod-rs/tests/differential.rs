@@ -6,9 +6,8 @@
 //! Regression guard for the spurious-SAT bug family found on
 //! addressBook2e/m15 (quantified implication over shared join/difference
 //! subexpressions). NOTE: the current random generator does NOT trigger
-//! the known bug yet (500 seeds pass); the deterministic repro lives in
-//! alloy-engine-rs/examples/repro_spurious_sat.rs. Extend generators or
-//! raise DIFF_SEEDS after fixes to widen coverage.
+//! that family; the deterministic repro lives in `spurious_sat.rs`.
+//! Extend generators or raise DIFF_SEEDS after fixes to widen coverage.
 
 use alloy_kodkod_rs::ast::*;
 use alloy_kodkod_rs::bounds::Bounds;

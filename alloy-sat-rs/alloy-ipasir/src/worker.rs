@@ -7,6 +7,10 @@ use crate::backend::{create_backend, Backend, CancelToken, Outcome};
 
 /// Solve status: still running / no result yet.
 pub const STATUS_RUNNING: c_int = -1;
+/// Solve status: satisfiable.
+pub const SAT: c_int = 10;
+/// Solve status: unsatisfiable.
+pub const UNSAT: c_int = 20;
 
 enum Command {
     Add(Vec<c_int>),
@@ -16,12 +20,10 @@ enum Command {
 }
 
 /// Shared solve-result slot. The posting side sets `STATUS_RUNNING` before
-/// submitting a solve; the worker overwrites it with 10/20/0 and notifies.
+/// submitting a solve; the worker overwrites it with `SAT`/`UNSAT`/0 and
+/// notifies.
 #[derive(Default)]
 struct Slot(Mutex<c_int>, Condvar);
-
-const SAT: c_int = 10;
-const UNSAT: c_int = 20;
 
 impl Slot {
     fn set(&self, v: c_int) {

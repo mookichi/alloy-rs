@@ -221,9 +221,6 @@ impl Bounds {
         removed
     }
 
-    pub fn unbind_int(&mut self, i: i64) -> bool {
-        self.intbounds.remove(&i).is_some()
-    }
 }
 
 impl Clone for Bounds {

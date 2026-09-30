@@ -19,34 +19,12 @@
 
 use std::collections::HashSet;
 
-use crate::ast::{AstArena, FormulaBinOp, FormulaId, FormulaNode};
+use crate::ast::{AstArena, FormulaId};
 use crate::bounds::Bounds;
 use crate::cnf::translate_conjunct_def;
 use crate::fol::{FolTranslator, TranslateError};
 use crate::instance::Instance;
 use crate::sat::SatSolver;
-
-/// Flattens `f` into its top-level conjuncts (kodkod `Nodes.conjuncts`):
-/// nested N-ary ANDs are expanded, everything else is atomic.
-pub fn conjuncts_of(arena: &AstArena, f: FormulaId) -> Vec<FormulaId> {
-    let mut out = Vec::new();
-    collect(arena, f, &mut out);
-    fn collect(arena: &AstArena, f: FormulaId, out: &mut Vec<FormulaId>) {
-        if let FormulaNode::Nary {
-            op: FormulaBinOp::And,
-            children,
-        } = arena.formula(f)
-        {
-            let children = children.clone();
-            for &c in &children {
-                collect(arena, c, out);
-            }
-        } else {
-            out.push(f);
-        }
-    }
-    out
-}
 
 /// Result of [`solve_core_with`] / [`Solver::solve_core`](crate::Solver).
 #[derive(Debug)]
@@ -78,7 +56,7 @@ pub fn solve_core_with<S: SatSolver>(
                 .into(),
         ));
     }
-    let conjuncts = conjuncts_of(arena, formula);
+    let conjuncts = arena.conjuncts(formula);
     let mut translator = FolTranslator::with_options(
         crate::BoolCtx::new(),
         bounds,

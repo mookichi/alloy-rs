@@ -84,10 +84,6 @@ impl Solver {
         &self.options
     }
 
-    pub fn options_mut(&mut self) -> &mut SolverOptions {
-        &mut self.options
-    }
-
     /// Solve `formula` under `bounds` with a caller-provided SAT solver.
     ///
     /// On SAT the model is materialized into an [`Instance`].

@@ -32,9 +32,9 @@ use std::time::Duration;
 use worker::Worker;
 
 /// Return code for a satisfiable formula.
-pub const IPASIR_SAT: c_int = 10;
+pub use worker::SAT as IPASIR_SAT;
 /// Return code for an unsatisfiable formula.
-pub const IPASIR_UNSAT: c_int = 20;
+pub use worker::UNSAT as IPASIR_UNSAT;
 /// Return code when solving was interrupted or no result is available.
 pub const IPASIR_INTERRUPTED: c_int = 0;
 
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn alloy_worker_failed(worker: *mut Worker, lit: c_int) ->
 }
 
 /// Status value meaning "solve still running".
-pub const STATUS_RUNNING_C: c_int = -1;
+pub use worker::STATUS_RUNNING as STATUS_RUNNING_C;
 
 /// Returns a short description of the active backend (stable `'static'`
 /// pointer for the lifetime of the process).

@@ -24,7 +24,7 @@
 //! lower/upper bracket every time slice).
 
 use crate::ast::{
-    AstArena, BinaryOp, ConstantExpr, ExprCompOp, ExprId, ExprNode, FormulaBinOp, FormulaId,
+    AstArena, BinaryOp, ConstantExpr, ExprCompOp, ExprId, ExprNode, FormulaId,
     FormulaNode,
 };
 use crate::bounds::{Bounds, BoundsError};
@@ -51,8 +51,7 @@ pub fn simplify_bounds(
     bounds: &mut Bounds,
     formula: FormulaId,
 ) -> Result<SimplifyOutcome, BoundsError> {
-    let mut conjuncts = Vec::new();
-    flatten_ands(arena, formula, &mut conjuncts);
+    let conjuncts = arena.conjuncts(formula);
     let mut ever_changed = false;
     // Single pass suffices for Java (its loop returns after one round);
     // a short fixpoint is cheap and strictly stronger.
@@ -87,21 +86,6 @@ pub fn simplify_bounds(
     } else {
         SimplifyOutcome::Unchanged
     })
-}
-
-fn flatten_ands(arena: &AstArena, f: FormulaId, out: &mut Vec<FormulaId>) {
-    if let FormulaNode::Nary {
-        op: FormulaBinOp::And,
-        children,
-    } = arena.formula(f)
-    {
-        let children = children.clone();
-        for &c in &children {
-            flatten_ands(arena, c, out);
-        }
-    } else {
-        out.push(f);
-    }
 }
 
 /// Java `simplify_in(a, b)` UNSAT check only: caller runs `shrink_in`

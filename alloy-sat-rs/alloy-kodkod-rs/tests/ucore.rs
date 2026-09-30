@@ -7,7 +7,7 @@
 use alloy_kodkod_rs::ast::*;
 use alloy_kodkod_rs::relation::RelationPool;
 use alloy_kodkod_rs::sat::{RecordingSolver, SatSolver};
-use alloy_kodkod_rs::ucore::{conjuncts_of, extract_cnf_core, SoftGroup};
+use alloy_kodkod_rs::ucore::{extract_cnf_core, SoftGroup};
 use std::sync::Arc;
 
 #[test]
@@ -17,7 +17,7 @@ fn conjuncts_flatten_nested_ands() {
     let b = arena.bool_formula(false);
     let inner = arena.and(&[a, b]);
     let root = arena.and(&[inner, a]);
-    let cs = conjuncts_of(&arena, root);
+    let cs = arena.conjuncts(root);
     assert_eq!(cs.len(), 3);
 }
 

@@ -72,25 +72,6 @@ impl BoolFactory {
         BoolRef(slot as i32)
     }
 
-    /// Debug helper: structural description of a slot's node.
-    pub fn debug_node(&self, slot: u32) -> String {
-        match slot.checked_sub(1).and_then(|i| self.nodes.get(i as usize)) {
-            None => format!("#{slot}=<oob>"),
-            Some(BoolNode::Var) => format!("v{slot}"),
-            Some(BoolNode::And(ins)) => {
-                let parts: Vec<String> = ins.iter().map(|r| format!("{}", r.0)).collect();
-                format!("{}=AND{}", slot, parts.join(","))
-            }
-            Some(BoolNode::Or(ins)) => {
-                let parts: Vec<String> = ins.iter().map(|r| format!("{}", r.0)).collect();
-                format!("{}=OR{}", slot, parts.join(","))
-            }
-            Some(BoolNode::Ite { c, t, e }) => {
-                format!("{}=ITE({},{},{})", slot, c.0, t.0, e.0)
-            }
-        }
-    }
-
     pub fn num_slots(&self) -> usize {
         self.nodes.len()
     }
@@ -135,8 +116,6 @@ impl BoolFactory {
         if t == e {
             return t;
         }
-        let nt = self.not(t);
-        let ne = self.not(e);
         if t == const_true() && e == const_false() {
             return c;
         }
@@ -155,7 +134,6 @@ impl BoolFactory {
         if t == const_true() {
             return self.or(&[c, e]);
         }
-        let _ = (nt, ne);
         let k = GateKey::Ite(c.slot() as i32, c.sign(), t.0, e.0);
         let kids = vec![c, t, e];
         self.gate(k, kids)

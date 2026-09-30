@@ -437,20 +437,10 @@ pub fn decimal_to_real_rounded(
     let rem = num.checked_rem(den)?;
     let qmag = match mode {
         RealRound::Nearest => round_half_even_step(q0, rem, den)?,
-        RealRound::Down => {
-            // `≤ 真値`: 正は切り捨て、負は切り上げ (絶対値増)。
-            if rem == 0 {
-                q0
-            } else if neg {
-                q0.checked_add(1)?
-            } else {
-                q0
-            }
-        }
-        RealRound::Up => {
-            if rem == 0 {
-                q0
-            } else if neg {
+        // `Down` = `≤ 真値` (負は絶対値増), `Up` = `≥ 真値` (正は絶対値増)。
+        // つまり「絶対値を 1 上げる」のは `neg` と方向が食い違う側だけ。
+        RealRound::Down | RealRound::Up => {
+            if rem == 0 || neg == matches!(mode, RealRound::Up) {
                 q0
             } else {
                 q0.checked_add(1)?
@@ -475,183 +465,7 @@ pub fn decimal_down_up(s: &str, m_width: Option<u32>) -> Option<(RealCenter, Rea
     Some((d, u))
 }
 
-/// Exact rational `num/den` (`den > 0`)。検証・leaf 入力用。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rat {
-    pub num: i128,
-    pub den: i128,
-}
-
-impl Rat {
-    pub fn new(num: i128, den: i128) -> Option<Self> {
-        if den <= 0 {
-            return None;
-        }
-        Some(Rat { num, den })
-    }
-
-    fn add(self, o: Rat) -> Option<Rat> {
-        Rat::new(
-            self.num.checked_mul(o.den)?.checked_add(o.num.checked_mul(self.den)?)?,
-            self.den.checked_mul(o.den)?,
-        )
-    }
-
-    fn sub(self, o: Rat) -> Option<Rat> {
-        Rat::new(
-            self.num.checked_mul(o.den)?.checked_sub(o.num.checked_mul(self.den)?)?,
-            self.den.checked_mul(o.den)?,
-        )
-    }
-
-    fn mul(self, o: Rat) -> Option<Rat> {
-        Rat::new(self.num.checked_mul(o.num)?, self.den.checked_mul(o.den)?)
-    }
-
-    fn div(self, o: Rat) -> Option<Rat> {
-        if o.num == 0 {
-            return None;
-        }
-        let (n, d) = if o.num > 0 {
-            (self.num.checked_mul(o.den)?, self.den.checked_mul(o.num)?)
-        } else {
-            (
-                self.num.checked_mul(o.den)?.checked_neg()?,
-                self.den.checked_mul(o.num.checked_neg()?)?,
-            )
-        };
-        Rat::new(n, d)
-    }
-}
-
-/// leaf の exact 入力を `RealCenter` に丸めなしで変換。
-/// dyadic のみ `Some` (非 dyadic は leaf 自体が表現不能で `None`)。
-fn leaf_round(num: i128, den: i128) -> Option<RealCenter> {
-    if den <= 0 {
-        return None;
-    }
-    if num == 0 {
-        return Some(RealCenter { m: 0, e: 0 });
-    }
-    if den == 1 {
-        return RealCenter::new(num, 0);
-    }
-    // num/den を約分し、分母が 2 の冪のみなら exact dyadic。
-    let neg = (num < 0) != (den < 0);
-    let n = num.unsigned_abs();
-    let d = den.unsigned_abs();
-    let g = gcd_u128(n, d);
-    let n = n / g;
-    let mut d = d / g;
-    let mut e: i32 = 0;
-    while d.is_multiple_of(2) {
-        d /= 2;
-        e = e.checked_sub(1)?;
-    }
-    if d != 1 {
-        return None;
-    }
-    let raw = to_i128(n)?;
-    let raw = if neg { raw.checked_neg()? } else { raw };
-    RealCenter::new(raw, e)
-}
-
-// ---------------------------------------------------------------------------
-// 式木 (ランタイム評価用、CEGAR なし)
-// ---------------------------------------------------------------------------
-
-/// 二項演算子。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RealOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-}
-
-/// 式木: exact-rational leaf + 演算子ノード。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RealExpr {
-    Leaf { num: i128, den: i128 },
-    Bin {
-        op: RealOp,
-        left: Box<RealExpr>,
-        right: Box<RealExpr>,
-    },
-}
-
-impl RealExpr {
-    pub fn leaf(num: i128, den: i128) -> Self {
-        RealExpr::Leaf { num, den }
-    }
-
-    pub fn bin(op: RealOp, left: RealExpr, right: RealExpr) -> Self {
-        RealExpr::Bin {
-            op,
-            left: Box::new(left),
-            right: Box::new(right),
-        }
-    }
-}
-
-/// 評価失敗理由。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RealEvalError {
-    /// ゼロ除算。
-    DivByZero,
-    /// 割り切れない除算 (exact 表現なし)。
-    InexactDiv,
-    /// 非 dyadic leaf (丸めなしでは表現不能)。
-    InexactLeaf,
-    /// `i128` 範囲超過。
-    OracleRange,
-}
-
-/// 中心のみのボトムアップ評価 (exact)。
-pub fn evaluate(e: &RealExpr) -> Result<RealCenter, RealEvalError> {
-    match e {
-        RealExpr::Leaf { num, den } => leaf_round(*num, *den).ok_or_else(|| {
-            if *den <= 0 {
-                RealEvalError::OracleRange
-            } else {
-                RealEvalError::InexactLeaf
-            }
-        }),
-        RealExpr::Bin { op, left, right } => {
-            let l = evaluate(left)?;
-            let r = evaluate(right)?;
-            match op {
-                RealOp::Add => real_add(&l, &r, 1).ok_or(RealEvalError::OracleRange),
-                RealOp::Sub => real_add(&l, &r, -1).ok_or(RealEvalError::OracleRange),
-                RealOp::Mul => real_mul(&l, &r).ok_or(RealEvalError::OracleRange),
-                RealOp::Div => {
-                    if r.m == 0 {
-                        return Err(RealEvalError::DivByZero);
-                    }
-                    real_div(&l, &r).ok_or(RealEvalError::InexactDiv)
-                }
-            }
-        }
-    }
-}
-
-/// 真値伝播 (検証用)。`None` はオーバーフロー・ゼロ除算。
-pub fn true_value(e: &RealExpr) -> Option<Rat> {
-    match e {
-        RealExpr::Leaf { num, den } => Rat::new(*num, *den),
-        RealExpr::Bin { op, left, right } => {
-            let (l, r) = (true_value(left)?, true_value(right)?);
-            match op {
-                RealOp::Add => l.add(r),
-                RealOp::Sub => l.sub(r),
-                RealOp::Mul => l.mul(r),
-                RealOp::Div => l.div(r),
-            }
-        }
-    }
-}
-
-/// Lane-successor / predecessor (`realUp` / `realDown` oracle).
+/// Lane-successor / predecessor (`realSucc` / `realPred` oracle).
 ///
 /// `next_up(v)` is the smallest lane-representable value strictly greater
 /// than `v`: odd `m` with `|m| ≤ 2^(m_width−1)−1` (`m_width == 1` admits
@@ -833,26 +647,6 @@ fn cmp_scaled(a: u128, ea: i32, b: u128, eb: i32) -> Option<i32> {
     Some(x.cmp(&y) as i32)
 }
 
-/// `truth == centre` を exact に検査。`None` はオーバーフロー。
-pub fn verify(v: &RealCenter, t: Rat) -> Option<bool> {
-    // t.num/t.den == m * 2^e ⟺ t.num == m * t.den * 2^e (e >= 0)
-    // または t.num * 2^-e == m * t.den (e < 0)。
-    if v.m == 0 {
-        return Some(t.num == 0);
-    }
-    if v.e >= 0 {
-        let rhs = v
-            .m
-            .checked_mul(t.den)?
-            .checked_mul(1i128.checked_shl(v.e as u32)?)?;
-        Some(t.num == rhs)
-    } else {
-        let lhs = t.num.checked_mul(1i128.checked_shl((-v.e) as u32)?)?;
-        let rhs = v.m.checked_mul(t.den)?;
-        Some(lhs == rhs)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,23 +692,6 @@ mod tests {
         );
         assert!(decimal_to_real("0.1", None).is_none());
         assert!(decimal_to_real("3", None).is_none());
-    }
-
-    #[test]
-    fn expr_verify() {
-        // (1/2 + 1/4) * 4 = 3.
-        let e = RealExpr::bin(
-            RealOp::Mul,
-            RealExpr::bin(
-                RealOp::Add,
-                RealExpr::leaf(1, 2),
-                RealExpr::leaf(1, 4),
-            ),
-            RealExpr::leaf(4, 1),
-        );
-        let v = evaluate(&e).unwrap();
-        assert_eq!(v, RealCenter { m: 3, e: 0 });
-        assert_eq!(verify(&v, true_value(&e).unwrap()), Some(true));
     }
 
     /// 符号付き比較 `a ? b` (i128 範囲内の小さな値用): `-1/0/1`。
@@ -1131,6 +908,5 @@ mod tests {
         // Zero steps to ±(1, emin).
         assert_eq!(next_up(&RealCenter { m: 0, e: 0 }, mw, ew), RealCenter::new(1, emin));
         assert_eq!(next_down(&RealCenter { m: 0, e: 0 }, mw, ew), RealCenter::new(-1, emin));
-        let _ = emin;
     }
 }

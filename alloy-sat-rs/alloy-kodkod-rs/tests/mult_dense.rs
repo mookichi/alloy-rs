@@ -93,8 +93,7 @@ fn empty_bounds_make_some_always_false() {
 
 /// KNOWN-BUG regression test (currently expected to PASS because it uses
 /// RecordingSolver, which bails out on >22 variables; see sat.rs). The real
-/// engine reproduces the bug via the facade: see
-/// alloy-engine-rs/examples/repro_spurious_sat.rs and the differential test.
+/// engine exercises the same shape via the facade in `spurious_sat.rs`.
 ///
 /// Original discovery: the assertion
 ///   all b,b',b'',n,t | (noImg /\ addEq /\ delEq) -> concl

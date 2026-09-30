@@ -711,7 +711,7 @@ fn sig_tuples(src: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let m = parse_module(src).expect("parse");
     let cnf = run(&m, 0).expect("run");
     let inst = solve(&cnf).expect("solve").expect("SAT");
-    let mut get = |want: &str| {
+    let get = |want: &str| {
         let mut out = Vec::new();
         for (r, ts) in inst.relation_tuples() {
             if inst.pool().name(r).as_ref() == want {

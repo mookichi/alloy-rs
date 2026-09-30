@@ -1,8 +1,8 @@
 //! Pardinus decomposition (Iter 8) — serial subset.
 //!
 //! * [`PardinusBounds`] — immutable decoration of [`Bounds`] with stage-1
-//!   (*partial*) relation marks, targets, weights and symbolic
-//!   (expression-valued) bounds resolved against an [`Instance`].
+//!   (*partial*) relation marks and symbolic (expression-valued) bounds
+//!   resolved against an [`Instance`].
 //! * [`slice_formula`] — port of `DecompFormulaSlicer`: partitions top-level
 //!   conjuncts into (partial-only, remainder).
 //! * [`solve_dynamic`] — two-stage serial executor: stage 1 solves the
@@ -20,7 +20,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::ast::{AstArena, ExprId, FormulaBinOp, FormulaId, IntId};
+use crate::ast::{AstArena, ExprId, FormulaId, IntId};
 use crate::bounds::Bounds;
 use crate::eval::Evaluator;
 use crate::instance::Instance;
@@ -50,10 +50,6 @@ pub struct PardinusBounds {
     base: Bounds,
     /// relations selected for the stage-1 (partial) problem
     partials: BTreeSet<RelationId>,
-    /// preferred values for variable relations (hints for stage 2)
-    targets: HashMap<RelationId, TupleSet>,
-    /// optimization weights (recorded; unused by the SAT layer)
-    weights: HashMap<RelationId, i64>,
     /// symbolic bounds: relation -> bounding expression
     symb_lower: HashMap<RelationId, ExprId>,
     symb_upper: HashMap<RelationId, ExprId>,
@@ -64,8 +60,6 @@ impl PardinusBounds {
         PardinusBounds {
             base,
             partials: BTreeSet::new(),
-            targets: HashMap::new(),
-            weights: HashMap::new(),
             symb_lower: HashMap::new(),
             symb_upper: HashMap::new(),
         }
@@ -79,27 +73,9 @@ impl PardinusBounds {
         &self.partials
     }
 
-    pub fn targets(&self) -> &HashMap<RelationId, TupleSet> {
-        &self.targets
-    }
-
-    pub fn weights(&self) -> &HashMap<RelationId, i64> {
-        &self.weights
-    }
-
     /// Marks a VARIABLE relation as belonging to the stage-1 problem.
     pub fn with_partial(mut self, r: RelationId) -> Self {
         self.partials.insert(r);
-        self
-    }
-
-    pub fn with_target(mut self, r: RelationId, ts: TupleSet) -> Self {
-        self.targets.insert(r, ts);
-        self
-    }
-
-    pub fn with_weight(mut self, r: RelationId, weight: i64) -> Self {
-        self.weights.insert(r, weight);
         self
     }
 
@@ -261,22 +237,6 @@ pub fn collect_formula_relations(arena: &AstArena, f: FormulaId, out: &mut BTree
     }
 }
 
-fn flatten_ands(arena: &AstArena, f: FormulaId, out: &mut Vec<FormulaId>) {
-    if let crate::ast::FormulaNode::Nary {
-        op: FormulaBinOp::And,
-        children,
-    } = arena.formula(f).clone()
-    {
-        for c in children {
-            flatten_ands(arena, c, out);
-        }
-    } else if let crate::ast::FormulaNode::Nary { .. } = arena.formula(f).clone() {
-        unreachable!()
-    } else {
-        out.push(f);
-    }
-}
-
 /// Partitions the TOP-LEVEL conjunctions of `f` into conjuncts whose
 /// relations are all within `partials` (first element) and the rest.
 pub fn slice_formula(
@@ -284,8 +244,7 @@ pub fn slice_formula(
     f: FormulaId,
     partials: &BTreeSet<RelationId>,
 ) -> Result<(FormulaId, FormulaId), crate::ast::AstError> {
-    let mut conjuncts = Vec::new();
-    flatten_ands(arena, f, &mut conjuncts);
+    let conjuncts = arena.conjuncts(f);
     let mut f1 = Vec::new();
     let mut f2 = Vec::new();
     for c in conjuncts {
@@ -693,8 +652,7 @@ pub struct ComponentGroup {
 /// Splits top-level conjuncts into connected components over shared
 /// relations. Returns the groups (order-stable by first appearance).
 pub fn component_groups(arena: &AstArena, formula: FormulaId) -> Vec<ComponentGroup> {
-    let mut conjuncts = Vec::new();
-    flatten_ands(arena, formula, &mut conjuncts);
+    let conjuncts = arena.conjuncts(formula);
 
     let rels_per: Vec<BTreeSet<RelationId>> = conjuncts
         .iter()

@@ -6,9 +6,9 @@
 //!
 //! Usage:
 //! ```text
-//! :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <n>]
+//! :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <dec>) (<m,e,p,k>|lit <dec>) [p <maxp>] [n <intcount>]
 //! :mepk [-v] lit <decimal> [p <maxp>] [n <intcount>]
-//! :mepk widths [n]
+//! :mepk widths [n <intcount>]
 //! ```
 //! Normal output is one guarantee line per result (`7 ± 1 (tau=2)`);
 //! `-v` adds widths, raw tuples, full digits, and symbolic detail.
@@ -26,7 +26,7 @@ use alloy_kodkod_rs::mepk::{
 use alloy_kodkod_rs::mepk_tree::{cegar_evaluate, evaluate, true_value, verify, CegarError, MepkExpr, MepkOp};
 use alloy_kodkod_rs::BoolCtx;
 
-pub const USAGE: &str = "usage: :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <decimal>) (<m,e,p,k>|lit <decimal>) [p <maxp>] [n <intcount>] | :mepk [-v] lit <decimal> [p <maxp>] [n <intcount>] | :mepk widths [n]";
+pub const USAGE: &str = "usage: :mepk [-v] add|sub|mul|div (<m,e,p,k>|lit <decimal>) (<m,e,p,k>|lit <decimal>) [p <maxp>] [n <intcount>] | :mepk [-v] lit <decimal> [p <maxp>] [n <intcount>] | :mepk widths [n <intcount>]";
 pub const SENS_USAGE: &str = "usage: :sens [-v] add|sub|mul|div (<m,e,p,k>|lit <decimal>) (<m,e,p,k>|lit <decimal>) [p <maxp>] [n <intcount>]";
 
 fn parse_tuple(s: &str) -> Option<Mepk> {
