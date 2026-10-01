@@ -196,3 +196,67 @@ cardinality 式、`var_roots`、reified lane 関係 4 本、`decode_ereal` と
   （`S.x.m = 1` のみ SAT）。値は `x: set EReal` か `sig X in EReal` で
   保持する。
 - `R.p` の lane ラベルのみの言及は P lane を確保しない。
+
+### 5.5. 保留結合 `..` と、翻訳スタック深度
+
+#### `..` (retain-join)
+
+`R .. S` は `.` と同じ列規約で結合し共有列を残す (arity `n+m-1`)。
+含意 `{a, b, c | a->b in R and b->c in S}` の sugar なので新しい表現力は
+なく、構文を短くするための演算子。`tests/retain_join.rs` が等価性を
+この含意と直接突き合わせる。
+
+**デシュガー方式を選んだ理由**。backend に本物の `TauJoin` を入れると
+`alloy-kodkod-rs` の 6 箇所 (ast/fol/bmatrix/eval/skolem + nary) と、
+**`alloy-engine-rs` の wire opcode (0–5 固定)** が必要になる。Java 側に
+未知の opcode は parity テストを壊す。デシュガーならフロント 1 ファイルで
+済み、協約は無傷。
+
+**実測 (3 方式、同じ意味の式)**: 定義式 (comprehension) / デシュガー /
+native join を `= A->B->C` として n=5/8/12 で比較。
+
+| n | comprehension | desugar | native join |
+|---|---:|---:|---:|
+| 5 (vars) | 1 064 | **814** | 839 |
+| 12 (vars) | 14 147 | **10 691** | 10 835 |
+| 12 (solve) | 26.9 ms | 16.7 ms | 13.7 ms |
+| 12 (maxRSS) | 13.1 MB | 9.6 MB | 9.1 MB |
+| 16 (maxRSS) | 36.5 MB | 21.9 MB | 21.9 MB |
+
+desugar と native は primary vars / 時間 / メモリとも 3% 以内。comprehension
+は 3 個の fresh variable をスコーレム化するので 30% 余分に食う (これが `..`
+の動機)。native の 3% の time 差は univ パディング由来で、実利用では露出し
+ない。**native を実装する根拠にならない**と判断。
+
+#### 翻訳のスタック深度 (別問題、別途修正)
+
+この比較の途中で、native join が n=22 でスタックオーバーフローし desugar は
+n=32 まで動くという差が見えたが、**原因は `..`  Neither 方式でもあった**。
+切り分けの結果:
+
+| 試行 | n | 結果 |
+|---|---:|---|
+| `A->B->C != none` (join なし) | 40 | **overflow** |
+| `A->univ != none` (arity 2) | 40 | SAT |
+| `A->univ->univ` (arity 3) | 22 | **overflow** |
+| 和集合チェーン 400 個 | — | SAT |
+| `A->B->C != none` + `ulimit -s unlimited` | 80 | SAT |
+
+**積の連鎖が左ネスト** (`A->B->C` = `Product(Product(A,B),C)`) で AST 深さが
+arity に比例して増え、`fol::expr_matrix_uncached` がその深さを再帰下降する。
+`cnf.rs` の `visit` も Boolean ゲート深さに比例して再帰する。join か desugar
+かは無関係で、比較対象に高 arity の積を置けば必ず落ちる。
+
+対策: `alloy-front-rs` の `with_deep_stack` (`lib.rs`) が
+`build_cnf` / `run_command` / `run_opt_command_with` を 256 MiB スタックの
+worker スレッド上で実行する。再帰を反復化的是一个別案だが、`fol` は
+free-variable の `env` と memo テーブルを、永続化オブジェクトで持ち回る
+ので明示スタックはそれらを実装する必要がある。`ulimit -s unlimited` が
+効く = 深さ起因、というのが対策選択の根拠。
+
+効果: `A->B->C` が n=40 で overflow → n=80 で SAT。
+
+**残る制約 (未修正、副作用ではない)**: n≧120 では依然 overflow するが、これは
+スタックではなく**メモリ**である。`A->B->C` の n³ タプルを materialize するため
+(n=100 で 1.7 GB, `ulimit -s unlimited` でも落ちる)。タプル数が支配的なので
+スタック stigma ではなく、モデルサイズの限界として扱う。

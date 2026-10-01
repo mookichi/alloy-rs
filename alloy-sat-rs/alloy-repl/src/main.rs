@@ -2193,6 +2193,11 @@ fn print_help() {
     println!("  :help               this help");
     println!("  :quit               exit (Ctrl-D also exits)");
     println!("notes: `let` works inside pred/fun bodies and :eval/:query expressions.");
+    println!("notes: `R .. S` joins like `.` but keeps the joined column, so the");
+    println!("  arity is one wider: `(a->b)..(b->c)` is `a->b->c` where `.` gives");
+    println!("  `a->c`. A `..` chain keeps every intermediate node, which `^r`");
+    println!("  cannot do (it reports only whether a path exists). Equivalent to");
+    println!("  `{{a, b, c | a->b in R and b->c in S}}`.");
     println!("notes: integers are bitvectors: `for W Int` gives W atoms");
     println!("  {{0, .., W-1}} (bare `Int` = command default, else 4) with");
     println!("  (W+1)-bit circuits capped at 30. Sets read as bitmask values");

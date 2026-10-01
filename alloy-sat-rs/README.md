@@ -70,7 +70,7 @@ alloy-engine-rs (Java↔Rust 直列化 ARE1/ARE2 + C ABI/JNI)
 
 ## 意味論の要点 (Java との差異)
 詳細は `docs/java-divergences.md` (§1–§8)。概要:
-* **構文拡張**: 逆積 `<->`/`-<`、`for Int 8` 等の語順緩和、`{A,B}` 集合リテラル。
+* **構文拡張**: 逆積 `<->`/`-<`、`for Int 8` 等の語順緩和、`{A,B}` 集合リテラル、保留結合 `..` (`(a->b)..(b->c)` = `a->b->c`。`.` と違い結合列を残すので `r..r..r` が中間ノードを含む経路を返す。`^r` は経路の存在しか与えない)。
 * **bitmask統一Int** (§3): `for W Int` で原子 `{0..W-1}`、回路幅 `E=min(W+1,30)`。
   int位置の集合は bitmask 値 (`X = 5` ⟺ `X = {0,2}`)。`Signed` ビュー、`MSB`、intアトム遅延割当。
 * **partial/pin/avoid** (§5): ASTレベル部分インスタンス (`Sig$tag` ラベルは定義内局所)。
