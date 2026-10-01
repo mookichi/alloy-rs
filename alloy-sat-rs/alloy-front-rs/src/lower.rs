@@ -2913,11 +2913,16 @@ impl<'a> Ctx<'a> {
     /// `EReal` sig itself, an `extends`-descendant, or a join/bracket
     /// built on one). Used to pick the `setEReal` literal reading.
     fn expr_is_ereal_rooted(&self, e: &Expr) -> bool {
-        // A holder field's *declared* range decides before the owner is
-        // consulted: `S.x` on `x: one EReal` is `EReal`-rooted even
-        // though `S` itself is not. Recursing into the join's left side
-        // alone would read such a field as a `Real` and pin only `m`/`e`,
-        // leaving `p`/`k` free — a silently wrong literal reading.
+        // A holder field's *declared* range decides, not the owner: `S.x`
+        // on `x: set EReal` is `EReal`-rooted even though `S` is not, and
+        // recursing into the join's left side would read it as a `Real`,
+        // pinning only `m`/`e` and leaving `p`/`k` free. The lane reads
+        // themselves are unaffected — they go through
+        // `lane_partition_read`, which already reads the value column of
+        // an arity-N join correctly (`a.h.r.m` works).
+        if let Expr::Bin(BinOp::Join, _, _) = e {
+            return self.value_root(e) == Some(ValueRoot::EReal);
+        }
         match e {
             Expr::Name(n, _) => self.sig_root(n).as_deref() == Some("EReal"),
             Expr::Bin(_, a, _) => self.expr_is_ereal_rooted(a),

@@ -175,15 +175,22 @@ cardinality 式、`var_roots`、reified lane 関係 4 本、`decode_ereal` と
 
 ### 5.4. 確認した挙動（誤読しやすい点）
 
-- **`EReal` holder フィールド**: `x: set EReal` への `S.x = 3.0` は
-  `m`/`e` を束縛し、`p`/`k` は残りを pinning する（`m=3 e=0` と表示）。
-  `S.x = 3.0 and S.x.p = 5` は `m=3 e=0 p=5` に落ち、明示レーン形の
-  `S.x.m = 3 and S.x.e = 0 and S.x.p = 5 and S.x.k = 0` と**同一**の解に
-  束縛される。owner を限量した `all o: S | o.x = 3.0` も同じ。
-  `expr_is_ereal_rooted` を field join に対応させて `p`/`k` も outright に
-  pin する改造は試みたが**回帰を生む**（arity-2 の whole-relation 形
-  `S.x = 3.0` が `m=12 e=1` に化ける）ので採用せず、現状（m/e 束縛＋
-  p/k は残り）に戻した。
+- **`EReal` holder フィールドは 4 lane とも pin する**: `x: set EReal` への
+  `S.x = 3.0` は `m`/`e`/`p`/`k` をすべて束縛し、`EReal` sig と同じ読みに
+  なる。owner を限量した `all o: S | o.x = 3.0`、join が 2 段の
+  `a.h.r = 3.0`、whole-relation 形のいずれも同じ。
+  **2026-09-30 訂正**: 以前は `expr_is_ereal_rooted` が field join で owner
+  側へ再帰していたため、フィールドが一律 `Real` 読み（`m`/`e` のみ）に落ち、
+  `p`/`k` が**未束縛**になっていた。join が深いほど見えにくく
+  （`a.h.r` は arity 3、`S.x` は arity 2）、`S.x.p = 5` が「通ってしまう」
+  ため潜在的な弱_constraints になっていた。フィールドの宣言範囲を
+  優先する形に修正済み（`value_root` 経由）。
+  当初この修正を「回帰」として取り下げていたが、その際の
+  「`S.x = 3.0` が `m=12 e=1` に化ける → 24 になる」という判断は誤りで、
+  `Mepk::new(12, 1, 4, 0)` の `lsb = e - p + 1 = -2` より
+  `12·2⁻² = 3`（表示の `m=12 e=1` は正しい）だった。レーン読み自体
+  （`flat_partition_read`/`lane_partition_read`）は元から健全で、
+  問題だったのは sort 判定だけ。
 - **`x: one EReal` は値を保持できない**。値は最低 2 bit（`m` と `e`）を
   要するが `one` は 1 atom しか許さないため `S.x = 3.0` は UNSAT
   （`S.x.m = 1` のみ SAT）。値は `x: set EReal` か `sig X in EReal` で

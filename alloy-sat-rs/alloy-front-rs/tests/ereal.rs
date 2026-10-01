@@ -552,3 +552,32 @@ fn compose_ereal_binds_lanes() {
         "outside the p lane range",
     );
 }
+
+/// A holder field's *declared* range decides the literal reading, not
+/// the sig that owns it: `x: set EReal` must pin `m`/`e`/`p`/`k` just
+/// like an `EReal` sig does, while `x: set Real` keeps pinning only
+/// `m`/`e`. Previously the read fell back to the owner (`S`, `A`), so
+/// every field was treated as a `Real` and `p`/`k` were left free — a
+/// silently weaker constraint, and one that read worse the deeper the
+/// join went (`a.h.r` is arity 3, `S.x` arity 2).
+#[test]
+fn ereal_holder_field_pins_all_four_lanes() {
+    // Arity 2: `o.x` (owner quantified).
+    sat("sig S { x: set EReal }\nfact { all o: S | o.x = 3.0 }\nrun {} for exactly 1 S");
+    // Arity 3: `a.h.r` (two joins deep). This is the shape that made the
+    // bug obvious: `m`/`e` landed but `p`/`k` read back unconstrained.
+    sat("sig H { r: set EReal }\nsig A { h: one H }\nfact { all a: A | a.h.r = 3.0 }\nrun {} for exactly 1 A");
+    // Whole-relation form pins every row to the same lanes.
+    sat("sig S { x: set EReal }\nfact { S.x = 3.0 }\nrun {} for exactly 2 S");
+    // The `p` the literal pins is now visible to the solver: a
+    // conflicting `p` is UNSAT rather than silently satisfiable.
+    unsat("sig S { x: set EReal }\nfact { S.x = 3.0 and S.x.p = 5 }\nrun {} for exactly 1 S");
+    unsat("sig H { r: set EReal }\nsig A { h: one H }\nfact { all a: A | a.h.r = 3.0 and a.h.r.p = 5 }\nrun {} for exactly 1 A");
+    // The agreeing explicit form stays SAT, so the two spellings agree.
+    sat("sig S { x: set EReal }\nfact { S.x = 3.0 and S.x.p = 4 }\nrun {} for exactly 1 S");
+
+    // A `Real` holder still carries no error bits, so it keeps the
+    // exact-centre reading and does not pin `p`/`k`.
+    sat("sig S { x: set Real }\nfact { all o: S | o.x = 3.0 }\nrun {} for exactly 1 S");
+    sat("sig S { x: set Real }\nfact { all o: S | o.x = 3.0 and o.x.p = 0 }\nrun {} for 2 $P");
+}
