@@ -46,6 +46,16 @@ pub enum BinOp {
     Override,
     Product,
     Join,
+    /// `..` — retain-join. Joins on the same columns as [`BinOp::Join`]
+    /// (left's last column against right's first) but *keeps* the joined
+    /// column in the result, so the arity is `l + r - 1` instead of
+    /// `l + r - 2`. `a->b .. b->c` is `a->b->c`, where `a->b . b->c`
+    /// collapses to `a->c`. This is the relational product
+    /// `{a, b, c | a->b in R and b->c in S}`, so a chain
+    /// `r .. r .. r` enumerates 3-hop paths keeping every intermediate
+    /// node — what `^r` (transitive closure) cannot express, since it
+    /// reports only reachability.
+    RetainJoin,
     DomainRestrict,
     RangeRestrict,
 }
@@ -997,6 +1007,12 @@ pub struct PartialDef {
     pub pos: usize,
 }
 
+/// A parsed `.als` module.
+///
+/// `Clone` is derived so a build can move an owned copy onto a worker
+/// thread (`cnf::build_cnf` does that to give the translation a deep
+/// stack); every field is already plain owned data.
+#[derive(Debug, Clone)]
 pub struct Module {
     pub header: String,
     pub sigs: Vec<SigDecl>,

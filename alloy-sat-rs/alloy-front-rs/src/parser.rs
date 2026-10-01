@@ -1023,7 +1023,13 @@ impl Parser {
     ///
     /// Alloy6 precedence, loosest first: `+ -`, then `++`, then `&`, then
     /// `->` (and the reverse products `<->`, `-<`), then `<:`,
-    /// then unary/`'`/`.`/`[]`. All binary operators are left-associative.
+    /// then unary/`'`/`.`/`..`/`[]`. All binary operators are
+    /// left-associative.
+    ///
+    /// `..` (retain-join) sits at `.`'s level: both are joins and differ
+    /// only in whether the joined column survives, so mixing them without
+    /// parentheses needs no precedence rule of its own
+    /// (`a.b .. c.d` is `(a.b) .. (c.d)`).
     fn rel_expr_top(&mut self, in_sig: bool) -> PResult<Expr> {
         let e = self.parse_plusminus(in_sig)?;
         Ok(e)
@@ -1167,6 +1173,15 @@ impl Parser {
                     let r = self.parse_unary(in_sig)?;
                     let r = if at { Expr::AtExpr(Box::new(r)) } else { r };
                     l = Expr::Bin(BinOp::Join, Box::new(l), Box::new(r));
+                }
+                Tok::DotDot => {
+                    // `..` joins like `.` but keeps the joined column, so
+                    // the right side takes a prefix closure the same way
+                    // (`r .. ^next`). Left-associative like every other
+                    // operator here, so `a .. b .. c` is `(a .. b) .. c`.
+                    self.bump();
+                    let r = self.parse_unary(in_sig)?;
+                    l = Expr::Bin(BinOp::RetainJoin, Box::new(l), Box::new(r));
                 }
                 Tok::LBracket => {
                     self.bump();

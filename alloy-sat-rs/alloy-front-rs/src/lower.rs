@@ -925,6 +925,11 @@ impl<'m> Lowerer<'m> {
                 let (x, y) = (self.type_arity(a, res)?, self.type_arity(b, res)?);
                 x + y - 2
             }
+            Expr::Bin(BinOp::RetainJoin, a, b) => {
+                // Keep the joined column, so one column more than a join.
+                let (x, y) = (self.type_arity(a, res)?, self.type_arity(b, res)?);
+                x + y - 1
+            }
             Expr::Bin(_, a, _) => self.type_arity(a, res)?,
             Expr::Name(n, pos) => {
                 if res.sigs.contains_key(n)
@@ -1020,6 +1025,31 @@ impl<'m> Lowerer<'m> {
                     .into_iter()
                     .filter(|t| !sa.contains(t))
                     .collect())
+            }
+            Expr::Bin(BinOp::RetainJoin, a, b) => {
+                // {x, y, z | x->y in A and y->z in B}: concatenate, then
+                // keep the tuples whose boundary values (a's last column,
+                // b's first) agree. The shared column stays, so the result
+                // is one wider than a `.` join's.
+                let ta = self.type_tuples(a, res)?;
+                let tb = self.type_tuples(b, res)?;
+                let mut out = Vec::new();
+                for x in &ta {
+                    for y in &tb {
+                        let (Some(xb), Some(yf)) = (x.last(), y.first()) else {
+                            continue;
+                        };
+                        if xb != yf {
+                            continue;
+                        }
+                        let mut t = x.clone();
+                        t.extend(y[1..].iter().cloned());
+                        out.push(t);
+                    }
+                }
+                out.sort();
+                out.dedup();
+                Ok(out)
             }
             _ => self.unsup("complex expression in field declaration"),
         }
@@ -3692,14 +3722,17 @@ impl<'a> Ctx<'a> {
         // (`lower_int_cast`) and comparisons rewritten
         // (`rewrite_lane_lit_cmp`); anything left is a category error,
         // and lowering it as a join would just fail on the lane label.
-        if *op == BinOp::Join {
+        // `..` is a join too, so it takes the same guard.
+        if matches!(op, BinOp::Join | BinOp::RetainJoin) {
+            let spelled = if *op == BinOp::RetainJoin { ".." } else { "." };
             if let Some(read) =
                 self.lane_read(&Expr::Bin(BinOp::Join, Box::new(a.clone()), Box::new(b.clone())))
             {
                 return Err(FrontError::Resolve(format!(
-                    "`.{}` reads a bit lane, which is an integer, not a set; \
+                    "`{}{}` reads a bit lane, which is an integer, not a set; \
                      compare it with an integer (`x.{} = 3`) or read the lane \
                      bits as a set (`x & ${}`)",
+                    spelled,
                     read.lane,
                     read.lane,
                     label_sig(read.lane)
@@ -3716,6 +3749,40 @@ impl<'a> Ctx<'a> {
                     )));
                 }
                 arena.binary_expr(kk::BinaryOp::Join, ea, eb)
+            }
+            BinOp::RetainJoin => {
+                // `R .. S` = {a, b, c | a->b in R and b->c in S}: join on
+                // R's last column against S's first, but keep that column,
+                // so the result has arity aa + ab - 1.
+                //
+                // Desugared to existing primitives (like `<:` / `:>` above,
+                // which are Product+Intersection over univ padding) rather
+                // than adding a backend operator:
+                //
+                //     R .. S  ==  (R × univ^(ab-1))  ∩  (univ^(aa-1) × S)
+                //
+                // Both sides reach the common arity aa + ab - 1, and the
+                // shared column is exactly the one the intersection
+                // constrains, so the surviving tuples are the ones whose
+                // boundary values agree. Measured within 3% of a native
+                // implementation in primary vars, solve time and peak RSS
+                // (see docs/mepk_valid.md 5.5), while keeping
+                // `alloy-engine-rs`'s Java wire opcodes untouched — a real
+                // `TauJoin` there would need a new opcode the Java side
+                // does not know and would break parity tests.
+                if aa + ab < 3 {
+                    // Same floor as a backend join: both operands must be
+                    // relations (arity >= 2) to have a boundary column.
+                    return Err(FrontError::Resolve(format!(
+                        "retain-join needs two relations (arity >= 2 each), got {aa}.{ab}"
+                    )));
+                }
+                let target = aa + ab - 1;
+                // Trailing padding on the left, leading on the right: the
+                // univ columns sit on the side away from the join.
+                let left = self.promote_arity(arena, ea, aa, target, false)?;
+                let right = self.promote_arity(arena, eb, ab, target, true)?;
+                arena.binary_expr(kk::BinaryOp::Intersection, left, right)
             }
             BinOp::DomainRestrict => {
                 // A <: B = (A × univ^(b-1)) & B
@@ -7245,6 +7312,14 @@ fn field_mult_constraint(
                 walk(b, offset + aa as usize, markers, total_cols)?;
                 Ok(())
             }
+            // A retain-join concatenates but keeps its boundary column, so
+            // the right segment starts one column earlier than in a product.
+            Expr::Bin(BinOp::RetainJoin, a, b) => {
+                walk(a, offset, markers, total_cols)?;
+                let aa = arity_of_seg(a);
+                walk(b, offset + aa as usize - 1, markers, total_cols)?;
+                Ok(())
+            }
             Expr::Name(..)
             | Expr::Univ
             | Expr::IntAtom
@@ -7271,6 +7346,8 @@ fn field_mult_constraint(
         match e {
             Expr::ArrowMult(_, i) | Expr::LeadMult(_, i) => arity_of_seg(i),
             Expr::Bin(BinOp::Product, a, b) => arity_of_seg(a) + arity_of_seg(b),
+            // Shares one column with the left, so one narrower than a product.
+            Expr::Bin(BinOp::RetainJoin, a, b) => arity_of_seg(a) + arity_of_seg(b) - 1,
             _ => 1,
         }
     }

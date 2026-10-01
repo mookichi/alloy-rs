@@ -86,6 +86,9 @@ pub enum Tok {
     Colon,
     Comma,
     Dot,
+    /// `..` — retain-join: like `.`, but the joined column stays in the
+    /// result (`a->b .. b->c` is `a->b->c`, not `a->c`).
+    DotDot,
     Arrow,
     Bar,
     Semi,
@@ -197,6 +200,7 @@ impl Tok {
             Tok::Colon => "':'",
             Tok::Comma => "','",
             Tok::Dot => "'.'",
+            Tok::DotDot => "'..'",
             Tok::Arrow => "'->'",
             Tok::Bar => "'|'",
             Tok::Semi => "';'",
@@ -314,7 +318,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, crate::FrontError> {
         let three = &b[i..];
         let two = |a: u8, bb: u8| three.len() >= 2 && three[0] == a && three[1] == bb;
         let sym: Option<(Tok, &'static str)> =
-            if two(b'<', b'=') && three.len() >= 3 && three[2] == b'>' {
+            if two(b'.', b'.') {
+                // `..` must win over the `.` single-char case below. It is
+                // checked before the single-char table, so `a..b` lexes as
+                // one operator rather than two joins. A `.` followed by a
+                // digit still starts a decimal (`.5`), handled below, so
+                // this never swallows a fractional literal.
+                i += 2;
+                Some((Tok::DotDot, ".."))
+            } else if two(b'<', b'=') && three.len() >= 3 && three[2] == b'>' {
                 i += 3;
                 Some((Tok::Iff, "<=>"))
             } else if two(b'<', b':') {
