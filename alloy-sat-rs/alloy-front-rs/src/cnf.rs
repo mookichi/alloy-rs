@@ -24,6 +24,7 @@ use alloy_kodkod_rs::temporal::{TemporalExpansion, TemporalInstance};
 use alloy_kodkod_rs::{AstArena, BoolCtx};
 
 use crate::ast::{CommandKind, Module, OverflowMode};
+use crate::with_deep_stack;
 use crate::lower::Lowerer;
 use crate::FrontError;
 
@@ -320,6 +321,26 @@ pub fn unconstrained_warning(name: &str, free_tuples: usize) -> String {
 /// Shared builder: lower, optionally skolemize (Run only), then
 /// FOL -> bool circuit -> CNF, capturing origins for later materialize.
 fn build_cnf(
+    module: &Module,
+    index: usize,
+    kind: CnfKind,
+    no_overflow: bool,
+) -> Result<Cnf, FrontError> {
+    // Own the module for the worker. `Module` is plain owned data and
+    // derives `Clone`, and the copy is what lets the closure satisfy the
+    // `'static` bound a spawned thread requires. Two copies because the
+    // spawn attempt consumes one and the inline fallback needs its own.
+    let for_worker = module.clone();
+    let for_inline = module.clone();
+    let name = kind.to_string();
+    with_deep_stack(
+        name,
+        move || build_cnf_inner(&for_worker, index, kind, no_overflow),
+        move || build_cnf_inner(&for_inline, index, kind, no_overflow),
+    )
+}
+
+fn build_cnf_inner(
     module: &Module,
     index: usize,
     kind: CnfKind,

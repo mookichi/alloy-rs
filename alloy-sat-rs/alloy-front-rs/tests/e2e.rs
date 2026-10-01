@@ -824,3 +824,43 @@ fn find_form_solver_path() {
         "unexpected error: {err:?}"
     );
 }
+
+/// Translation recurses in two places whose depth is a function of model
+/// size: `fol` descends the expression AST and `cnf` descends the Boolean
+/// gate DAG it builds. A product chain nests left-deep, so arity alone can
+/// exhaust the default 8 MiB main-thread stack — this model overflowed on
+/// the main thread and now runs on a worker with room to spare.
+///
+/// The scope is deliberately small: the point is that a *large* arity
+/// translates, not that a large universe is tractable. `A->B->C` over 40
+/// atoms is 64 000 tuples, which is fine, but the same product over 160
+/// atoms is 4 million and exhausts memory — a separate limit (see
+/// `docs/mepk_valid.md` 5.5).
+#[test]
+fn deep_product_chain_translates_without_stack_overflow() {
+    let src = "sig A, B, C {}\npred p { A->B->C != none }\nrun p for 40 A, 40 B, 40 C";
+    let m = parse_module(src).expect("parse");
+    let sol = run_command(&m, 0).expect("run");
+    assert!(sol.satisfiable, "deep product chain must be SAT, not overflow");
+}
+
+/// The same depth reached through the Cnf-building entry point, which
+/// `run`/`check` use and which is a separate translation path from
+/// `run_command`.
+#[test]
+fn deep_chain_over_cnf_entry_does_not_overflow() {
+    let src = "sig A, B, C {}\nrun { A->B->C != none } for 40 A, 40 B, 40 C";
+    let m = parse_module(src).expect("parse");
+    let cnf = run(&m, 0).expect("build cnf");
+    assert!(solve(&cnf).expect("solve").is_some());
+}
+
+/// A long union chain is iterative (`fold` in `bool.rs`), so it was never
+/// the problem — kept as a guard that the deep-stack path did not change
+/// results for shapes that already worked.
+#[test]
+fn long_union_chain_still_translates() {
+    let src = "sig A {}\npred p { A = A + A }\nrun p for 2 A";
+    let m = parse_module(src).expect("parse");
+    assert!(run_command(&m, 0).expect("run").satisfiable);
+}

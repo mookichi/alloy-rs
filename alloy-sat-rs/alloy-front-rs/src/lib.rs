@@ -84,6 +84,56 @@ impl std::fmt::Display for FrontError {
 
 impl std::error::Error for FrontError {}
 
+/// Stack headroom for the CNF-building worker.
+///
+/// Translation is recursive in two places whose depth is a function of
+/// model size, not of user input: `fol::expr_matrix_uncached` descends the
+/// expression AST (`cnf.rs`'s `visit` then descends the Boolean gate DAG
+/// it builds). A long product chain nests left-deep — `A->B->C->D` is
+/// `Product(Product(Product(A,B),C),D)` — so arity alone can overflow an
+/// 8 MiB main-thread stack: measured with `A->B->C` against 40-atom sigs,
+/// before any join or retain-join is involved. `ulimit -s unlimited` makes
+/// the same model solve, which is what identifies this as depth rather
+/// than memory or an exponential blowup.
+///
+/// Rather than rewrite those traversals as iterative (they carry an
+/// `env` of free-variable bindings and a memo table, so the explicit stack
+/// would have to model both), the whole build runs on a thread with room
+/// to spare. 256 MiB is virtual reservation, only touched pages commit.
+pub(crate) const CNF_STACK_BYTES: usize = 256 * 1024 * 1024;
+
+/// Run `f` on a worker thread with [`CNF_STACK_BYTES`] of stack.
+///
+/// Only the owning thread's stack size is configurable in Rust, so the
+/// work has to happen on a thread we create. The closure is consumed by
+/// the spawn attempt, so a fallback re-runs it inline only when the spawn
+/// itself failed (before `f` was ever called); that path needs its own
+/// closure, which is why it is a separate `F2` generic.
+pub(crate) fn with_deep_stack<T, F, F2>(what: String, f: F, inline: F2) -> Result<T, FrontError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, FrontError> + Send + 'static,
+    F2: FnOnce() -> Result<T, FrontError>,
+{
+    match std::thread::Builder::new()
+        .name(format!("alloy-cnf-{what}"))
+        .stack_size(CNF_STACK_BYTES)
+        .spawn(f)
+    {
+        Ok(handle) => match handle.join() {
+            Ok(res) => res,
+            Err(_) => Err(FrontError::Resolve(format!(
+                "internal error while building the {what} command (worker thread panicked)"
+            ))),
+        },
+        // The thread never started, so `f` was not consumed: safe to run
+        // inline. Small models still fit the default stack, and refusing to
+        // run at all would be worse than the overflow we are avoiding.
+        Err(_) => inline(),
+    }
+}
+
+
 /// Parses a module source text.
 pub fn parse_module(src: &str) -> Result<Module, FrontError> {
     let tokens = lex::lex(src)?;
@@ -157,6 +207,25 @@ pub fn run_opt_command(module: &Module, index: usize) -> Result<OptSolution, Fro
 /// first, wrapping fallback). A `some Overflow` marker forces wrapping;
 /// `some Overflow` on a temporal command is rejected (no CEGAR there).
 pub fn run_opt_command_with(
+    module: &Module,
+    index: usize,
+    no_overflow: bool,
+) -> Result<OptSolution, FrontError> {
+    // Same deep-stack rationale as `run_command`: the optimizer lowers the
+    // same AST before it scores anything.
+    let for_worker = module.clone();
+    let for_inline = module.clone();
+    with_deep_stack(
+        format!("optimize#{index}"),
+        {
+            let module = for_worker;
+            move || run_opt_command_with_inner(&module, index, no_overflow)
+        },
+        move || run_opt_command_with_inner(&for_inline, index, no_overflow),
+    )
+}
+
+fn run_opt_command_with_inner(
     module: &Module,
     index: usize,
     no_overflow: bool,
@@ -728,7 +797,23 @@ pub fn optimize_with(
 }
 
 /// Runs one command of a parsed module end-to-end (translate + solve).
+///
+/// Runs on a worker thread with a deep stack: see [`with_deep_stack`] for
+/// why translation depth, not memory, is the binding constraint here.
 pub fn run_command(module: &Module, index: usize) -> Result<Solution, FrontError> {
+    let for_worker = module.clone();
+    let for_inline = module.clone();
+    with_deep_stack(
+        format!("command#{index}"),
+        {
+            let module = for_worker;
+            move || run_command_inner(&module, index)
+        },
+        move || run_command_inner(&for_inline, index),
+    )
+}
+
+fn run_command_inner(module: &Module, index: usize) -> Result<Solution, FrontError> {
     let cmd = module
         .commands
         .get(index)
